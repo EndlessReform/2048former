@@ -1,0 +1,8 @@
+.env
+wandb
+# Python build artifacts
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+*.pyc
