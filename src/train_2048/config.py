@@ -9,6 +9,34 @@ import tomllib
 from pydantic import BaseModel, Field, field_validator
 from safetensors.torch import load_file as safe_load_file
 from .model import Encoder, EncoderConfig
+from .binning import BinningConfig
+def _find_repo_root() -> Path:
+    # Heuristic: repo root is the parent of 'src'
+    here = Path(__file__).resolve()
+    # e.g., .../repo/src/train_2048/config.py -> repo
+    src_dir = here.parent.parent  # .../repo/src
+    root = src_dir.parent
+    return root
+
+
+class DatasetConfig(BaseModel):
+    packfile: str = "./datasets/dsv1.a2pack"
+    # Choose either fixed steps or epochs. If both provided, steps takes priority.
+    num_steps: Optional[int] = 100
+    num_epochs: Optional[int] = None
+
+    @field_validator("num_steps", "num_epochs")
+    @classmethod
+    def _non_negative(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError("num_steps/num_epochs must be >= 0")
+        return v
+
+    def resolved_packfile(self) -> str:
+        p = Path(self.packfile)
+        if not p.is_absolute():
+            p = _find_repo_root() / p
+        return str(p)
 
 
 class WandbConfig(BaseModel):
@@ -112,6 +140,10 @@ class TrainingConfig(BaseModel):
     hyperparameters: HyperParams = Field(default_factory=HyperParams)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     dropout: DropoutConfig = Field(default_factory=DropoutConfig)
+    # Discretization for EV heads
+    binning: BinningConfig = Field(default_factory=BinningConfig)
+    # Dataset input
+    dataset: DatasetConfig = Field(default_factory=DatasetConfig)
 
     # Misc
     seed: int = 0

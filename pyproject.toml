@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>=2.11.7",
     "safetensors>=0.6.2",
     "torch>=2.8.0",
+    "tqdm>=4.67.1",
     "wandb>=0.21.3",
 ]
 
