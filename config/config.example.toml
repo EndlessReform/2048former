@@ -1,0 +1,35 @@
+init_dir = "inits/v1"
+checkpoint_dir = "checkpoints"
+seed = 0
+
+[wandb]
+enabled = false
+project = "train-2048"
+entity = ""
+run_name = ""
+tags = []
+mode = "disabled"      # online | offline | disabled
+
+[hyperparameters]
+learning_rate = 3e-4
+
+[hyperparameters.lr_schedule]
+name = "constant"  # constant | warmup-stable-decay
+warmup_steps = 0
+decay_steps = 0
+min_lr_ratio = 0.1
+
+[hyperparameters.optimizer]
+name = "adamw"      # adamw | muon
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.95
+eps = 1e-8
+
+[batch]
+batch_size = 1024
+micro_batch_size = 256
+
+[dropout]
+dropout_prob = 0.1
+attention_dropout_prob = 0.0

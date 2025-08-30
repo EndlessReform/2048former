@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class EncoderConfig(BaseModel):
-    input_vocab_size: int
+    input_vocab_size: int = 16
     output_n_bins: int
     hidden_size: int
     num_hidden_layers: int
@@ -18,7 +18,6 @@ class EncoderConfig(BaseModel):
     # Attention dropout (used by scaled_dot_product_attention during training)
     attention_dropout_prob: float = 0.0
     # Absolute positional embeddings length
-    max_position_embeddings: int = 2048
     max_position_embeddings: int = 16
 
 

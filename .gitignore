@@ -6,3 +6,9 @@ __pycache__/
 *.pyo
 *.pyd
 *.pyc
+
+# Training artifacts
+datasets
+inits
+output
+*.a2pack
