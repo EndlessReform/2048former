@@ -15,9 +15,11 @@ learning_rate = 3e-4
 muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
-name = "constant"  # constant | warmup-stable-decay
-warmup_steps = 0
-decay_steps = 0
+name = "warmup-stable-decay" # constant | warmup-stable-decay
+warmup_steps = 1000
+# decay_steps = 0
+# Alternatively, specify a percentage of total steps for cooldown/decay
+cooldown_pct = 0.10 # e.g., last 10% of steps
 min_lr_ratio = 0.1
 
 [hyperparameters.optimizer]
@@ -47,6 +49,6 @@ edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 # Path is resolved relative to the repo root when not absolute
 packfile = "./datasets/dsv3.a2pack"
 # For quick validation, run a fixed number of steps
-num_steps = 10_000
+num_steps = 25_000
 # Or drive by epochs instead (steps takes priority if both set)
 # num_epochs = 1

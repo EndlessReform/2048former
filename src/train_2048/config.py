@@ -64,6 +64,10 @@ class LRScheduleConfig(BaseModel):
     # Only used for warmup-stable-decay
     warmup_steps: int = 0
     decay_steps: int = 0
+    # Optional: percent of total steps used for cooldown/decay (0..1).
+    # If provided (>0), takes precedence over decay_steps and is computed
+    # once total training steps are known.
+    cooldown_pct: float | None = None
     min_lr_ratio: float = 0.1  # final_lr = base_lr * min_lr_ratio
 
     @field_validator("warmup_steps", "decay_steps")
@@ -78,6 +82,15 @@ class LRScheduleConfig(BaseModel):
     def _ratio_range(cls, v: float) -> float:
         if not (0.0 <= v <= 1.0):
             raise ValueError("min_lr_ratio must be between 0 and 1")
+        return v
+
+    @field_validator("cooldown_pct")
+    @classmethod
+    def _pct_range(cls, v: float | None) -> float | None:
+        if v is None:
+            return v
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("cooldown_pct must be between 0 and 1")
         return v
 
 

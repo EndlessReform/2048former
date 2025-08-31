@@ -3,13 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+from safetensors.torch import save_file as safe_save_file
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from safetensors.torch import save_file as safe_save_file
 import os, tempfile, torch
 import torch.distributed as dist
+import time, json, math
 
 from .config import TrainingConfig, load_encoder_from_init
 from .binning import Binner
@@ -167,20 +168,79 @@ def train(
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Loaded Encoder on {device_str} with {n_params:,} params")
 
-    steps = cfg.dataset.num_steps or 0
-    global_step = 0
+    # Determine total steps for scheduler and progress bars
+    fixed_steps = cfg.dataset.num_steps or 0
+    epochs = cfg.dataset.num_epochs or 1
+    per_epoch_steps = getattr(ds, "total_steps", 0) or 0
+    total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
 
-    if steps > 0:
+    # LR scheduler setup (supports constant and warmup-stable-decay)
+    lr_cfg = cfg.hyperparameters.lr_schedule
+    base_lrs = [pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups]
+
+    def _compute_decay_steps(total: int) -> int:
+        if lr_cfg.name != "warmup-stable-decay":
+            return 0
+        if getattr(lr_cfg, "cooldown_pct", None):
+            return int(math.ceil(total * float(lr_cfg.cooldown_pct)))
+        return int(lr_cfg.decay_steps or 0)
+
+    decay_steps = _compute_decay_steps(total_steps)
+    warmup_steps = int(lr_cfg.warmup_steps or 0)
+    warmup_steps = max(0, min(warmup_steps, max(total_steps, 0)))
+    decay_steps = max(0, min(decay_steps, max(total_steps - warmup_steps, 0)))
+    stable_steps = max(0, total_steps - warmup_steps - decay_steps)
+    decay_start_step = warmup_steps + stable_steps
+
+    def _lr_scale_for_step(step_idx: int) -> float:
+        if lr_cfg.name == "constant" or total_steps <= 0:
+            return 1.0
+        if warmup_steps > 0 and step_idx < warmup_steps:
+            return float(step_idx + 1) / float(warmup_steps)
+        if step_idx < (warmup_steps + stable_steps):
+            return 1.0
+        if decay_steps <= 0:
+            return 1.0
+        pos = step_idx - decay_start_step + 1
+        pos = max(1, min(pos, decay_steps))
+        frac = float(pos) / float(decay_steps)
+        return 1.0 - (1.0 - lr_cfg.min_lr_ratio) * frac
+
+    def _apply_lr(scale: float) -> float:
+        for pg, base_lr in zip(optimizer.param_groups, base_lrs):
+            pg["lr"] = float(base_lr) * float(scale)
+        return optimizer.param_groups[0]["lr"]
+
+    # Create timestamped checkpoint directory and store config JSON
+    ckpt_root = Path(cfg.checkpoint_dir)
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    run_ckpt_dir = ckpt_root / run_id
+    run_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with (run_ckpt_dir / "config.json").open("w", encoding="utf-8") as f:
+            json.dump(cfg.model_dump(), f, indent=2)
+    except Exception:
+        pass
+
+    global_step = 0
+    pre_decay_ckpt_saved = False
+
+    if fixed_steps > 0:
         it = iter(dl)
-        pbar = tqdm(range(steps), desc="Train", dynamic_ncols=True)
+        pbar = tqdm(range(fixed_steps), desc="Train", dynamic_ncols=True, total=fixed_steps)
         for _ in pbar:
+            # Save stable checkpoint right before decay starts
+            if not pre_decay_ckpt_saved and decay_steps > 0 and global_step == decay_start_step:
+                _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
+                pre_decay_ckpt_saved = True
+
+            lr_now = _apply_lr(_lr_scale_for_step(global_step))
             batch = next(it)
             metrics = train_step(model, batch, optimizer, device)
             pbar.set_postfix_str(
                 _format_postfix(
-                    metrics["loss"],
-                    metrics["head_losses"],
-                    optimizer.param_groups[0]["lr"],
+                    metrics["loss"], metrics["head_losses"], lr_now
                 )
             )
             if wandb_run is not None:
@@ -191,22 +251,32 @@ def train(
                         "train/loss_d": metrics["head_losses"][1],
                         "train/loss_l": metrics["head_losses"][2],
                         "train/loss_r": metrics["head_losses"][3],
-                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/lr": lr_now,
                     },
                     step=global_step,
                 )
             global_step += 1
     else:
-        epochs = cfg.dataset.num_epochs or 1
         for epoch in range(epochs):
-            pbar = tqdm(dl, desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
+            if per_epoch_steps > 0:
+                pbar = tqdm(
+                    dl,
+                    desc=f"Epoch {epoch + 1}/{epochs}",
+                    dynamic_ncols=True,
+                    total=per_epoch_steps,
+                )
+            else:
+                pbar = tqdm(dl, desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
             for batch in pbar:
+                if not pre_decay_ckpt_saved and decay_steps > 0 and global_step == decay_start_step:
+                    _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
+                    pre_decay_ckpt_saved = True
+
+                lr_now = _apply_lr(_lr_scale_for_step(global_step))
                 metrics = train_step(model, batch, optimizer, device)
                 pbar.set_postfix_str(
                     _format_postfix(
-                        metrics["loss"],
-                        metrics["head_losses"],
-                        optimizer.param_groups[0]["lr"],
+                        metrics["loss"], metrics["head_losses"], lr_now
                     )
                 )
                 if wandb_run is not None:
@@ -217,19 +287,15 @@ def train(
                             "train/loss_d": metrics["head_losses"][1],
                             "train/loss_l": metrics["head_losses"][2],
                             "train/loss_r": metrics["head_losses"][3],
-                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/lr": lr_now,
                             "train/epoch": epoch,
                         },
                         step=global_step,
                     )
                 global_step += 1
 
-    # Save checkpoint
-    ckpt_dir = Path(cfg.checkpoint_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = ckpt_dir / "model-final.safetensors"
-    state_cpu = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
-    safe_save_file(state_cpu, str(ckpt_path), metadata={"format": "pt"})
+    # Save final checkpoint
+    ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model-final.safetensors")
     print(f"Saved final checkpoint: {ckpt_path}")
 
     # Wrap up W&B
@@ -239,6 +305,8 @@ def train(
 
             wandb.summary["final/global_step"] = global_step
             wandb.summary["final/checkpoint_path"] = str(ckpt_path)
+            if pre_decay_ckpt_saved:
+                wandb.summary["stable/checkpoint_path"] = str(run_ckpt_dir / "model-stable.safetensors")
             wandb.finish()
         except Exception:
             pass
@@ -310,6 +378,13 @@ def train_step(
     total_loss = loss.detach().item()
 
     return {"loss": total_loss, "head_losses": head_losses}
+
+
+def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state_cpu = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    safe_save_file(state_cpu, str(path), metadata={"format": "pt"})
+    return path
 
 
 __all__ = ["train", "train_step"]
