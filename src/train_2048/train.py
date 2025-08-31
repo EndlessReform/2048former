@@ -141,6 +141,18 @@ def train(
                 weight_decay=0.0,
             ),
         ]
+        print(
+            "Muon params:",
+            [name for name, p in model.named_parameters() if p in muon_params],
+        )
+        print(
+            "Adam decay params:",
+            [name for name, p in model.named_parameters() if p in adam_decay],
+        )
+        print(
+            "Adam no decay params:",
+            [name for name, p in model.named_parameters() if p in adam_no_decay],
+        )
 
         optimizer = MuonWithAuxAdam(param_groups)
     else:
@@ -176,7 +188,9 @@ def train(
 
     # LR scheduler setup (supports constant and warmup-stable-decay)
     lr_cfg = cfg.hyperparameters.lr_schedule
-    base_lrs = [pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups]
+    base_lrs = [
+        pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups
+    ]
 
     def _compute_decay_steps(total: int) -> int:
         if lr_cfg.name != "warmup-stable-decay":
@@ -228,20 +242,29 @@ def train(
 
     if fixed_steps > 0:
         it = iter(dl)
-        pbar = tqdm(range(fixed_steps), desc="Train", dynamic_ncols=True, total=fixed_steps)
+        pbar = tqdm(
+            range(fixed_steps), desc="Train", dynamic_ncols=True, total=fixed_steps
+        )
         for _ in pbar:
             # Save stable checkpoint right before decay starts
-            if not pre_decay_ckpt_saved and decay_steps > 0 and global_step == decay_start_step:
+            if (
+                not pre_decay_ckpt_saved
+                and decay_steps > 0
+                and global_step == decay_start_step
+            ):
                 _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
                 pre_decay_ckpt_saved = True
 
             lr_now = _apply_lr(_lr_scale_for_step(global_step))
-            batch = next(it)
+            # Rewind the dataloader if we exhaust it before reaching fixed_steps
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(dl)
+                batch = next(it)
             metrics = train_step(model, batch, optimizer, device)
             pbar.set_postfix_str(
-                _format_postfix(
-                    metrics["loss"], metrics["head_losses"], lr_now
-                )
+                _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
             )
             if wandb_run is not None:
                 _safe_wandb_log(
@@ -268,16 +291,18 @@ def train(
             else:
                 pbar = tqdm(dl, desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
             for batch in pbar:
-                if not pre_decay_ckpt_saved and decay_steps > 0 and global_step == decay_start_step:
+                if (
+                    not pre_decay_ckpt_saved
+                    and decay_steps > 0
+                    and global_step == decay_start_step
+                ):
                     _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
                     pre_decay_ckpt_saved = True
 
                 lr_now = _apply_lr(_lr_scale_for_step(global_step))
                 metrics = train_step(model, batch, optimizer, device)
                 pbar.set_postfix_str(
-                    _format_postfix(
-                        metrics["loss"], metrics["head_losses"], lr_now
-                    )
+                    _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
                 )
                 if wandb_run is not None:
                     _safe_wandb_log(
@@ -306,7 +331,9 @@ def train(
             wandb.summary["final/global_step"] = global_step
             wandb.summary["final/checkpoint_path"] = str(ckpt_path)
             if pre_decay_ckpt_saved:
-                wandb.summary["stable/checkpoint_path"] = str(run_ckpt_dir / "model-stable.safetensors")
+                wandb.summary["stable/checkpoint_path"] = str(
+                    run_ckpt_dir / "model-stable.safetensors"
+                )
             wandb.finish()
         except Exception:
             pass

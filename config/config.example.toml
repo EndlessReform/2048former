@@ -11,7 +11,7 @@ tags = []
 mode = "online"        # online | offline | disabled
 
 [hyperparameters]
-learning_rate = 3e-4
+learning_rate = 4e-4
 muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
@@ -30,8 +30,8 @@ beta2 = 0.95
 eps = 1e-8
 
 [batch]
-batch_size = 768
-micro_batch_size = 256
+batch_size = 1024
+# micro_batch_size = 256
 
 [dropout]
 dropout_prob = 0.1
@@ -49,6 +49,6 @@ edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 # Path is resolved relative to the repo root when not absolute
 packfile = "./datasets/dsv3.a2pack"
 # For quick validation, run a fixed number of steps
-num_steps = 25_000
+num_steps = 300_000
 # Or drive by epochs instead (steps takes priority if both set)
-# num_epochs = 1
+# num_epochs = 4
