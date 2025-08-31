@@ -260,9 +260,14 @@ def prepare_model_for_inference(
     compile_mode: Optional[str] = "reduce-overhead",
 ) -> Tuple[torch.nn.Module, Optional[torch.dtype]]:
     """
-    Move model to target device and compile it. Does not change dtype.
+    Move model to target device, optionally forcing bf16 on CUDA, then compile.
 
-    Returns (model, used_dtype) where used_dtype is the model's parameter dtype.
+    - On CUDA and when prefer_bf16 is True, parameters are moved to
+      torch.bfloat16 to leverage tensor cores during inference.
+    - On other platforms (CPU/MPS) the dtype is left unchanged.
+
+    Returns (model, used_dtype) where used_dtype is the model's parameter dtype
+    after any conversion.
     """
     # Resolve device
     if device is None:
@@ -272,8 +277,11 @@ def prepare_model_for_inference(
             device = torch.device("cpu")
     device = torch.device(device)
 
-    # Move to device only; keep current dtype unchanged
-    model = model.to(device)
+    # Move to device, forcing bf16 on CUDA if requested
+    if device.type == "cuda" and prefer_bf16:
+        model = model.to(device=device, dtype=torch.bfloat16)
+    else:
+        model = model.to(device)
 
     # Compile for inference (skip on CPU to avoid slowdown/unsupported cases)
     if compile_mode is not None and device.type != "cpu":
