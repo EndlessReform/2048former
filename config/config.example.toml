@@ -3,15 +3,16 @@ checkpoint_dir = "checkpoints"
 seed = 0
 
 [wandb]
-enabled = false
+enabled = true
 project = "train-2048"
 entity = ""
 run_name = ""
 tags = []
-mode = "disabled"      # online | offline | disabled
+mode = "online"        # online | offline | disabled
 
 [hyperparameters]
 learning_rate = 3e-4
+muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
 name = "constant"  # constant | warmup-stable-decay
@@ -46,6 +47,6 @@ edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 # Path is resolved relative to the repo root when not absolute
 packfile = "./datasets/dsv3.a2pack"
 # For quick validation, run a fixed number of steps
-# num_steps = 1000
+num_steps = 10_000
 # Or drive by epochs instead (steps takes priority if both set)
-num_epochs = 1
+# num_epochs = 1

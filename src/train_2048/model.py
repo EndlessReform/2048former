@@ -28,8 +28,9 @@ class EncoderAttention(nn.Module):
     Notes:
     - Absolute positional encoding is expected to be added outside this module.
     - Implements grouped-query attention (GQA): queries have `num_attention_heads`,
-      keys/values have `num_key_value_heads`. K/V are expanded across query groups
-      by repeat-interleave along the head dimension.
+      keys/values have `num_key_value_heads`. K/V are shared across groups without
+      explicit head-wise repeat-interleave; expansion is handled efficiently via
+      batch shaping before attention.
     """
 
     def __init__(self, config: EncoderConfig):
@@ -53,10 +54,12 @@ class EncoderAttention(nn.Module):
 
         self.head_dim = self.hidden_size // self.num_heads
 
-        # Single projection for QKV with GQA-compatible output size
+        # Separate projections for Q, K, V
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
-        self.wqkv = nn.Linear(self.hidden_size, q_size + 2 * kv_size, bias=False)
+        self.wq = nn.Linear(self.hidden_size, q_size, bias=False)
+        self.wk = nn.Linear(self.hidden_size, kv_size, bias=False)
+        self.wv = nn.Linear(self.hidden_size, kv_size, bias=False)
 
         self.wo = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
@@ -64,16 +67,14 @@ class EncoderAttention(nn.Module):
             getattr(config, "attention_dropout_prob", 0.0) or 0.0
         )
         self.resid_dropout = nn.Dropout(config.dropout_prob)
-        self.layer_norm = nn.LayerNorm(self.hidden_size, eps=config.layer_norm_eps)
 
     def _shape_qkv(self, x: torch.Tensor):
         # x: (B, S, H)
         B, S, _ = x.size()
-        qkv = self.wqkv(x)  # (B, S, q + k + v)
-        q_size = self.num_heads * self.head_dim
-        kv_size = self.num_kv_heads * self.head_dim
-
-        q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+        # Projections
+        q = self.wq(x)
+        k = self.wk(x)
+        v = self.wv(x)
 
         # Reshape to (B, S, n_heads, head_dim) for q
         q = q.view(B, S, self.num_heads, self.head_dim)
@@ -86,12 +87,9 @@ class EncoderAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Expand K/V across query groups by interleaving heads
-        if self.groups > 1:
-            k = k.repeat_interleave(self.groups, dim=1)
-            v = v.repeat_interleave(self.groups, dim=1)
-
-        return q, k, v  # shapes: (B, n_heads, S, head_dim)
+        # Do not repeat-interleave here; return:
+        # q: (B, n_heads, S, D), k/v: (B, n_kv_heads, S, D)
+        return q, k, v
 
     def forward(
         self,
@@ -99,20 +97,62 @@ class EncoderAttention(nn.Module):
         attn_mask: torch.Tensor | None = None,
         is_causal: bool = False,
     ):
-        # Expect x as (B, S, H)
-        residual = x
-
+        # Expect x as (B, S, H) — assumed pre-normalized by caller
         q, k, v = self._shape_qkv(x)
 
-        # Use PyTorch scaled dot-product attention
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout_p if self.training else 0.0,
-            is_causal=is_causal,
-        )  # (B, n_heads, S, head_dim)
+        # Compute attention. If using GQA (groups > 1), avoid head-wise repeats by
+        # reshaping into (B * groups, n_kv_heads, S, D) and sharing K/V across groups.
+        if self.groups > 1:
+            B, n_h, S, D = q.shape
+            n_kv = k.shape[1]
+            g = self.groups
+            # q -> (B, g, n_kv, S, D) -> (B*g, n_kv, S, D)
+            q_g = q.view(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
+            # k/v -> (B, 1, n_kv, S, D) expanded across groups, then merge batch
+            k_g = k.unsqueeze(1).expand(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
+            v_g = v.unsqueeze(1).expand(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
+
+            # Adjust mask if provided: expect broadcastable to (B, n_heads, S, S).
+            # We reshape to (B*g, n_kv, S, S) by similar expansion when needed.
+            if attn_mask is not None:
+                # Try to broadcast by expanding along group dimension if possible.
+                # Accept masks shaped (B, 1, S, S) or (B, n_h, S, S).
+                if attn_mask.dim() == 4 and attn_mask.size(0) == B:
+                    if attn_mask.size(1) == 1:
+                        # (B, 1, S, S) -> (B, g, 1, S, S) -> (B*g, 1, S, S) -> (B*g, n_kv, S, S)
+                        m = attn_mask.unsqueeze(1).expand(B, g, 1, S, S)
+                        attn_mask_g = m.reshape(B * g, 1, S, S)
+                    else:
+                        # (B, n_heads, S, S) -> (B, g, n_kv, S, S) -> (B*g, n_kv, S, S)
+                        m = attn_mask.view(B, g, n_kv, S, S)
+                        attn_mask_g = m.reshape(B * g, n_kv, S, S)
+                else:
+                    # Fallback: let PyTorch attempt broadcasting
+                    attn_mask_g = attn_mask
+            else:
+                attn_mask_g = None
+
+            attn_out_g = F.scaled_dot_product_attention(
+                q_g,
+                k_g,
+                v_g,
+                attn_mask=attn_mask_g,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
+                is_causal=is_causal,
+            )  # (B*g, n_kv, S, D)
+
+            # Reshape back to (B, n_heads, S, D)
+            attn_out = attn_out_g.view(B, g, n_kv, S, D).reshape(B, n_h, S, D)
+        else:
+            # Standard MHA case: heads match
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
+                is_causal=is_causal,
+            )  # (B, n_heads, S, D)
 
         # Merge heads back: (B, S, H)
         attn_out = (
@@ -123,12 +163,11 @@ class EncoderAttention(nn.Module):
 
         out = self.wo(attn_out)
         out = self.resid_dropout(out)
-        out = self.layer_norm(residual + out)
         return out
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU feed-forward: silu(Wg x) * (Wu x) -> Wd"""
+    """SwiGLU feed-forward: silu(Wg x) * (Wu x) -> Wd (no residual/norm)."""
 
     def __init__(
         self, hidden_size: int, intermediate_size: int, dropout_prob: float, eps: float
@@ -138,20 +177,18 @@ class SwiGLU(nn.Module):
         self.w_gate = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.w_down = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.dropout = nn.Dropout(dropout_prob)
-        self.layer_norm = nn.LayerNorm(hidden_size, eps=eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
         up = self.w_up(x)
         gate = self.w_gate(x)
         act = F.silu(gate) * up
         out = self.w_down(act)
         out = self.dropout(out)
-        return self.layer_norm(residual + out)
+        return out
 
 
 class EncoderBlock(nn.Module):
-    """Transformer encoder block: GQA attention + SwiGLU MLP (pre-existing absolute PE expected externally)."""
+    """Transformer encoder block: Pre-norm RMSNorm + GQA attention + SwiGLU MLP."""
 
     def __init__(self, config: EncoderConfig):
         super().__init__()
@@ -162,6 +199,9 @@ class EncoderBlock(nn.Module):
             dropout_prob=config.dropout_prob,
             eps=config.layer_norm_eps,
         )
+        # Pre-norm RMSNorms
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -169,8 +209,8 @@ class EncoderBlock(nn.Module):
         attn_mask: torch.Tensor | None = None,
     ):
         # Encoder uses non-causal (bidirectional) self-attention.
-        x = self.attn(x, attn_mask=attn_mask, is_causal=False)
-        x = self.mlp(x)
+        x = x + self.attn(self.attn_norm(x), attn_mask=attn_mask, is_causal=False)
+        x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -198,14 +238,13 @@ class Encoder(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             hidden_size=config.hidden_size,
         )
-        # Pre-norm right after embeddings (token + position)
-        self.emb_pre_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # No embedding pre-norm; blocks use pre-norm RMSNorm
 
         self.blocks = nn.ModuleList(
             [EncoderBlock(config) for _ in range(config.num_hidden_layers)]
         )
-        # Optional final LN (kept simple; can be removed if not desired)
-        self.final_ln = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Final RMSNorm
+        self.final_ln = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.ev_heads = nn.ModuleList(
             [nn.Linear(config.hidden_size, config.output_n_bins) for _ in range(4)]
         )
@@ -234,8 +273,7 @@ class Encoder(nn.Module):
         pe = self.pos_emb(S, device)  # (S, H)
         x = x + pe.unsqueeze(0)
 
-        # Pre-norm after embeddings as requested
-        x = self.emb_pre_ln(x)
+        # No embedding pre-norm; position added directly
 
         for blk in self.blocks:
             x = blk(x, attn_mask=attn_mask)

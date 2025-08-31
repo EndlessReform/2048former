@@ -433,6 +433,15 @@ wheels = [
 ]
 
 [[package]]
+name = "muon-optimizer"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/02/8e/753080860c9c0f5333bfe20ebb194f293af77274cfaf3f2bd999511ecf6e/muon_optimizer-0.1.0.tar.gz", hash = "sha256:65c50441f29b7248e586383d371262eb9062653e820b11143c81a7a10ba48da7", size = 6563, upload-time = "2025-05-25T23:27:40.518Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/e7/ae0b654bb12f7dfeb688852695e3c54d9ce0ac51e6fdcbeebe8b8d95c0f1/muon_optimizer-0.1.0-py3-none-any.whl", hash = "sha256:4b8e22e7c1a8e73c254c8f6941128ad490af1aba883d4eec0c7f0b8e2f330735", size = 7091, upload-time = "2025-05-25T23:27:39.039Z" },
+]
+
+[[package]]
 name = "nest-asyncio"
 version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1092,6 +1101,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ai-2048" },
+    { name = "muon-optimizer" },
     { name = "numpy" },
     { name = "pydantic" },
     { name = "safetensors" },
@@ -1108,6 +1118,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "ai-2048", git = "https://github.com/EndlessReform/2048_bench?subdirectory=py-ai-2048" },
+    { name = "muon-optimizer", specifier = ">=0.1.0" },
     { name = "numpy", specifier = ">=2.3.2" },
     { name = "pydantic", specifier = ">=2.11.7" },
     { name = "safetensors", specifier = ">=0.6.2" },
