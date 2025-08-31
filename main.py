@@ -1,8 +1,11 @@
 import argparse
+from pathlib import Path
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Optional
+from typing import Optional, Dict
+from safetensors.torch import save_file as safe_save_file
 
 from train_2048.config import load_config, load_encoder_from_init
 from train_2048.binning import Binner
@@ -42,6 +45,21 @@ def main(argv: Optional[list[str]] = None):
         model = model.to(device)
     # model = torch.compile(model, mode="reduce-overhead")
 
+    # Optimizer setup from config
+    opt_cfg = cfg.hyperparameters.optimizer
+    if opt_cfg.name == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=cfg.hyperparameters.learning_rate,
+            betas=(opt_cfg.beta1, opt_cfg.beta2),
+            eps=opt_cfg.eps,
+            weight_decay=opt_cfg.weight_decay,
+        )
+    elif opt_cfg.name == "muon":
+        raise NotImplementedError("'muon' optimizer not implemented; use adamw.")
+    else:
+        raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
+
     # Print a brief summary
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Loaded Encoder on {device_str} with {n_params:,} params")
@@ -64,37 +82,110 @@ def main(argv: Optional[list[str]] = None):
         pin_memory=True,
     )
 
-    # Stubbed training loop: microbatch over each dataloader batch, forward only
+    # Training loop: compute CE loss per head
     model.train()
     steps = cfg.dataset.num_steps or 0
     if steps > 0:
         it = iter(dl)
-        for step in tqdm(range(steps)):
+        pbar = tqdm(range(steps))
+        for _ in pbar:
             batch = next(it)
-            tokens = batch["tokens"].to(device, non_blocking=True)
-            N = tokens.size(0)
-            micro = cfg.batch.micro_batch_size or N
-            for start in range(0, N, micro):
-                end = min(start + micro, N)
-                mb_tokens = tokens[start:end]
-                _hs, ev_logits = model(mb_tokens)
-                # Optional: sanity check shapes
-                if step == 0 and start == 0:
-                    print(
-                        f"First forward: micro {mb_tokens.shape} -> logits {[t.shape for t in ev_logits]}"
-                    )
+            metrics = train_step(model, batch, optimizer, device)
+            pbar.set_postfix(
+                {
+                    "loss": f"{metrics['loss']:.4f}",
+                    "u": f"{metrics['head_losses'][0]:.3f}",
+                    "d": f"{metrics['head_losses'][1]:.3f}",
+                    "l": f"{metrics['head_losses'][2]:.3f}",
+                    "r": f"{metrics['head_losses'][3]:.3f}",
+                }
+            )
     else:
         epochs = cfg.dataset.num_epochs or 1
-        for epoch in tqdm(range(epochs)):
-            for batch in dl:
-                tokens = batch["tokens"].to(device, non_blocking=True)
-                N = tokens.size(0)
-                micro = cfg.batch.micro_batch_size or N
-                for start in range(0, N, micro):
-                    end = min(start + micro, N)
-                    mb_tokens = tokens[start:end]
-                    _hs, ev_logits = model(mb_tokens)
+        for epoch in range(epochs):
+            pbar = tqdm(dl)
+            for batch in pbar:
+                metrics = train_step(model, batch, optimizer, device)
+                pbar.set_postfix(
+                    {
+                        "loss": f"{metrics['loss']:.4f}",
+                        "u": f"{metrics['head_losses'][0]:.3f}",
+                        "d": f"{metrics['head_losses'][1]:.3f}",
+                        "l": f"{metrics['head_losses'][2]:.3f}",
+                        "r": f"{metrics['head_losses'][3]:.3f}",
+                    }
+                )
             print(f"Completed epoch {epoch + 1}/{epochs}")
+
+    # Save final checkpoint to safetensors
+    ckpt_dir = Path(cfg.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / "model-final.safetensors"
+    state_cpu = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    safe_save_file(state_cpu, str(ckpt_path), metadata={"format": "pt"})
+    print(f"Saved final checkpoint: {ckpt_path}")
+
+
+def train_step(
+    model,
+    batch: Dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+):
+    """
+    Single optimization step over one DataLoader batch (no micro-batching).
+
+    Batch must include:
+    - tokens: (N, S) int64
+    - branch_mask: (N, 4) bool
+    - branch_bin_targets: (N, 4) int64
+    """
+    tokens = batch["tokens"].to(device, non_blocking=True)
+    branch_mask = batch["branch_mask"].to(device, non_blocking=True)
+    targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    if device.type == "cuda":
+        autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+
+        class _NullCtx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        autocast = _NullCtx()
+
+    with autocast:
+        _hs, ev_logits = model(tokens)
+
+        per_head_losses = []
+        for h in range(4):
+            logits_h = ev_logits[h].float()  # compute loss in fp32 for stability
+            tgt_h = targets_bins[:, h]
+            mask_h = branch_mask[:, h]
+
+            # Cross-entropy per-sample
+            loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
+            # Mask illegal moves
+            if mask_h.any():
+                loss_h = loss_h[mask_h].mean()
+            else:
+                loss_h = torch.zeros((), device=logits_h.device, dtype=torch.float32)
+            per_head_losses.append(loss_h)
+
+        loss = sum(per_head_losses)
+
+    loss.backward()
+    optimizer.step()
+
+    head_losses = [lh.detach().item() for lh in per_head_losses]
+    total_loss = loss.detach().item()
+
+    return {"loss": total_loss, "head_losses": head_losses}
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, field_validator
 from safetensors.torch import load_file as safe_load_file
 from .model import Encoder, EncoderConfig
 from .binning import BinningConfig
+
+
 def _find_repo_root() -> Path:
     # Heuristic: repo root is the parent of 'src'
     here = Path(__file__).resolve()
@@ -22,7 +24,7 @@ def _find_repo_root() -> Path:
 class DatasetConfig(BaseModel):
     packfile: str = "./datasets/dsv1.a2pack"
     # Choose either fixed steps or epochs. If both provided, steps takes priority.
-    num_steps: Optional[int] = 100
+    num_steps: Optional[int] = None
     num_epochs: Optional[int] = None
 
     @field_validator("num_steps", "num_epochs")

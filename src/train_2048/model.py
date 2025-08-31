@@ -229,7 +229,8 @@ class Encoder(nn.Module):
         B, S = input_ids.shape
         device = input_ids.device
 
-        x = self.tok_emb(input_ids)  # (B, S, H)
+        # Clone to avoid potential CUDA Graphs output-buffer aliasing when compiled
+        x = self.tok_emb(input_ids).clone()  # (B, S, H)
         pe = self.pos_emb(S, device)  # (S, H)
         x = x + pe.unsqueeze(0)
 
