@@ -46,6 +46,25 @@ class StepBatchDataset(IterableDataset):
                 else:
                     yield batch  # expected: (pre_boards, branch_evs)
 
+    @property
+    def total_steps(self) -> int:
+        """Expose total number of step-batches in the packfile (one epoch).
+
+        Assumes the underlying pack reader provides `total_steps`.
+        Falls back to 0 if unavailable.
+        """
+        reader = a2.PackReader.open(self.pack_path)
+        try:
+            return int(getattr(reader, "total_steps", 0))
+        finally:
+            # Best-effort close if supported
+            close_fn = getattr(reader, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
 
 def collate_step_batches(batch_list):
     """
