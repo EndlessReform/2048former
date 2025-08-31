@@ -200,7 +200,17 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     weights_path = init_path / "model.safetensors"
     if weights_path.is_file():
         state = safe_load_file(str(weights_path))
-        model.load_state_dict(state, strict=True)
+        state = normalize_state_dict_keys(state)
+        try:
+            model.load_state_dict(state, strict=True)
+        except Exception as e:
+            # Fallback to non-strict if keys still mismatch after normalization
+            missing, unexpected = _compare_state_keys(model, state)
+            print(
+                "Warning: non-strict load due to key mismatch. "
+                f"missing={len(missing)} unexpected={len(unexpected)}"
+            )
+            model.load_state_dict(state, strict=False)
 
     return model
 
@@ -215,4 +225,34 @@ __all__ = [
     "TrainingConfig",
     "load_config",
     "load_encoder_from_init",
+    "normalize_state_dict_keys",
 ]
+
+
+def normalize_state_dict_keys(state: dict) -> dict:
+    """
+    Strip known wrapper prefixes from state_dict keys (e.g., `_orig_mod.`, `module.`).
+
+    Returns a new dict with normalized keys.
+    """
+    prefixes = ("_orig_mod.", "module.")
+    out = {}
+    for k, v in state.items():
+        nk = k
+        changed = True
+        while changed:
+            changed = False
+            for p in prefixes:
+                if nk.startswith(p):
+                    nk = nk[len(p) :]
+                    changed = True
+        out[nk] = v
+    return out
+
+
+def _compare_state_keys(model: Encoder, state: dict) -> tuple[list[str], list[str]]:
+    model_keys = set(model.state_dict().keys())
+    state_keys = set(state.keys())
+    missing = sorted(list(model_keys - state_keys))
+    unexpected = sorted(list(state_keys - model_keys))
+    return missing, unexpected

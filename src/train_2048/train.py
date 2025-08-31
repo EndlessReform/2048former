@@ -12,7 +12,7 @@ import os, tempfile, torch
 import torch.distributed as dist
 import time, json, math
 
-from .config import TrainingConfig, load_encoder_from_init
+from .config import TrainingConfig, load_encoder_from_init, normalize_state_dict_keys
 from .binning import Binner
 from .dataloader import StepBatchDataset, make_collate_step_batches
 
@@ -409,7 +409,9 @@ def train_step(
 
 def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    state_cpu = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    # Normalize keys to avoid wrappers like _orig_mod. or module.
+    raw_state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    state_cpu = normalize_state_dict_keys(raw_state)
     safe_save_file(state_cpu, str(path), metadata={"format": "pt"})
     return path
 
