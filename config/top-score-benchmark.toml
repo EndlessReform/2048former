@@ -1,6 +1,7 @@
-num_seeds = 250
+num_seeds = 8
 max_retries = 3
+max_concurrent_games = 8
 
 [strategy]
 type = "slm"
-init_folder = "inits/v1_10m"
+init_folder = "inits/v1_50m"
