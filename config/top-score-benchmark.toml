@@ -4,5 +4,5 @@ max_concurrent_games = 128
 
 [strategy]
 type = "slm"
-init_folder = "checkpoints/20250901_125803"
+init_folder = "checkpoints/20250901_143900"
 # init_folder = "checkpoints/20250901_111648"
