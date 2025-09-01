@@ -1,0 +1,6 @@
+num_seeds = 250
+max_retries = 3
+
+[strategy]
+type = "slm"
+init_folder = "inits/v1_10m"

@@ -4,11 +4,23 @@ from typing import Iterable, Literal, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
 try:
     # Optional: only used by adapter helpers
     from ai_2048 import Board, Move, Rng  # type: ignore
 except Exception:  # pragma: no cover - optional dependency for adapters
     Board = Move = Rng = None  # type: ignore
+
+
+def auto_device_name() -> str:
+    try:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
 
 
 @torch.inference_mode()
@@ -163,6 +175,7 @@ __all__ = ["forward_distributions", "select_move", "infer_move"]
 # ---------------------------
 # ai_2048 adapter conveniences
 # ---------------------------
+
 
 def _moves_order() -> list:
     if Move is None:

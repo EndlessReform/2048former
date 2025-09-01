@@ -9,22 +9,13 @@ from typing import Optional
 import torch
 
 from train_2048.config import load_encoder_from_init
-from train_2048.inference import ModelPolicy
-
-
-def _auto_device_name() -> str:
-    try:
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
-    except Exception:
-        pass
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+from train_2048.inference import ModelPolicy, auto_device_name
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Play one 2048 game with the model policy")
+    parser = argparse.ArgumentParser(
+        description="Play one 2048 game with the model policy"
+    )
     parser.add_argument(
         "--init",
         type=str,
@@ -53,7 +44,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     from ai_2048 import Board, Rng  # import lazily
 
-    device_str = args.device or _auto_device_name()
+    device_str = args.device or auto_device_name()
     seed = args.seed if args.seed is not None else random.randrange(2**31 - 1)
 
     print(f"Loading model from: {args.init}")

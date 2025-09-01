@@ -1,4 +1,4 @@
-init_dir = "inits/v1"
+init_dir = "inits/v1_10m"
 checkpoint_dir = "checkpoints"
 seed = 0
 
@@ -49,6 +49,6 @@ edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 # Path is resolved relative to the repo root when not absolute
 packfile = "./datasets/dsv3.a2pack"
 # For quick validation, run a fixed number of steps
-num_steps = 300_000
+num_steps = 100_000
 # Or drive by epochs instead (steps takes priority if both set)
 # num_epochs = 4
