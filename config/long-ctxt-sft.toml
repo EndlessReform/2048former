@@ -1,23 +1,23 @@
-init_dir = "inits/v1_10m"
+init_dir = "inits/v1_50m_20250830_stable"
 checkpoint_dir = "checkpoints"
 seed = 0
 
 [wandb]
 enabled = true
-project = "train-2048"
+project = "train-2048-long-ctxt"
 entity = ""
 run_name = ""
 tags = []
-mode = "online"        # online | offline | disabled
-report_every = 10       # log to W&B every N steps (>=1)
+mode = "online"                  # online | offline | disabled
+report_every = 50                # log to W&B every N steps (>=1)
 
 [hyperparameters]
-learning_rate = 4e-4
+learning_rate = 5e-5
 muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay
-warmup_steps = 1000
+warmup_steps = 100
 # decay_steps = 0
 # Alternatively, specify a percentage of total steps for cooldown/decay
 cooldown_pct = 0.10 # e.g., last 10% of steps
@@ -31,7 +31,7 @@ beta2 = 0.95
 eps = 1e-8
 
 [batch]
-batch_size = 1024
+batch_size = 128
 # micro_batch_size = 256
 
 [dropout]
@@ -48,8 +48,8 @@ edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 
 [dataset]
 # Path is resolved relative to the repo root when not absolute
-packfile = "./datasets/dsv3.a2pack"
+packfile = "./datasets/ds-long-context.a2pack"
 # For quick validation, run a fixed number of steps
-num_steps = 100_000
+#num_steps = 100_000
 # Or drive by epochs instead (steps takes priority if both set)
-# num_epochs = 4
+num_epochs = 3

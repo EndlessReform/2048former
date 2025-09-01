@@ -240,6 +240,14 @@ def train(
     global_step = 0
     pre_decay_ckpt_saved = False
 
+    # W&B logging cadence
+    wandb_report_every = 1
+    try:
+        if getattr(cfg, "wandb", None) is not None:
+            wandb_report_every = max(1, int(getattr(cfg.wandb, "report_every", 1)))
+    except Exception:
+        wandb_report_every = 1
+
     if fixed_steps > 0:
         it = iter(dl)
         pbar = tqdm(
@@ -266,7 +274,7 @@ def train(
             pbar.set_postfix_str(
                 _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
             )
-            if wandb_run is not None:
+            if wandb_run is not None and (global_step % wandb_report_every == 0):
                 _safe_wandb_log(
                     {
                         "train/loss": metrics["loss"],
@@ -304,7 +312,7 @@ def train(
                 pbar.set_postfix_str(
                     _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
                 )
-                if wandb_run is not None:
+                if wandb_run is not None and (global_step % wandb_report_every == 0):
                     _safe_wandb_log(
                         {
                             "train/loss": metrics["loss"],

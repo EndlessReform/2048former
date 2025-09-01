@@ -48,6 +48,8 @@ class WandbConfig(BaseModel):
     run_name: str | None = None
     tags: list[str] = Field(default_factory=list)
     mode: Literal["online", "offline", "disabled"] = "disabled"
+    # Log metrics to W&B every N steps (>=1). Defaults to every step.
+    report_every: int = 1
 
     @field_validator("mode")
     @classmethod
@@ -56,6 +58,13 @@ class WandbConfig(BaseModel):
         data = info.data or {}
         if not data.get("enabled", False):
             return "disabled"
+        return v
+
+    @field_validator("report_every")
+    @classmethod
+    def _report_every_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("wandb.report_every must be >= 1")
         return v
 
 
