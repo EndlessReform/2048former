@@ -56,6 +56,7 @@ def main(argv: Optional[list[str]] = None):
                 config={
                     "config_path": args.config,
                     "seed": cfg.seed,
+                    "wandb_report_every": getattr(cfg.wandb, "report_every", 1),
                     "optimizer": cfg.hyperparameters.optimizer.model_dump(),
                     "lr": cfg.hyperparameters.learning_rate,
                     "lr_schedule": cfg.hyperparameters.lr_schedule.model_dump(),

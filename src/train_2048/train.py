@@ -12,7 +12,7 @@ import os, tempfile, torch
 import torch.distributed as dist
 import time, json, math
 
-from .config import TrainingConfig, load_encoder_from_init
+from .config import TrainingConfig, load_encoder_from_init, normalize_state_dict_keys
 from .binning import Binner
 from .dataloader import StepBatchDataset, make_collate_step_batches
 
@@ -225,20 +225,37 @@ def train(
             pg["lr"] = float(base_lr) * float(scale)
         return optimizer.param_groups[0]["lr"]
 
-    # Create timestamped checkpoint directory and store config JSON
+    # Create timestamped checkpoint directory and store configs
     ckpt_root = Path(cfg.checkpoint_dir)
     ckpt_root.mkdir(parents=True, exist_ok=True)
     run_id = time.strftime("%Y%m%d_%H%M%S")
     run_ckpt_dir = ckpt_root / run_id
     run_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # - training-config.json: serialized training config used for the run
     try:
-        with (run_ckpt_dir / "config.json").open("w", encoding="utf-8") as f:
+        with (run_ckpt_dir / "training-config.json").open("w", encoding="utf-8") as f:
             json.dump(cfg.model_dump(), f, indent=2)
+    except Exception:
+        pass
+    # - config.json: serialize the model's EncoderConfig so the checkpoint is a valid init folder
+    try:
+        enc_cfg = getattr(model, "config", None)
+        if enc_cfg is not None:
+            with (run_ckpt_dir / "config.json").open("w", encoding="utf-8") as f:
+                json.dump(enc_cfg.model_dump(), f, indent=2)
     except Exception:
         pass
 
     global_step = 0
     pre_decay_ckpt_saved = False
+
+    # W&B logging cadence
+    wandb_report_every = 1
+    try:
+        if getattr(cfg, "wandb", None) is not None:
+            wandb_report_every = max(1, int(getattr(cfg.wandb, "report_every", 1)))
+    except Exception:
+        wandb_report_every = 1
 
     if fixed_steps > 0:
         it = iter(dl)
@@ -266,7 +283,7 @@ def train(
             pbar.set_postfix_str(
                 _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
             )
-            if wandb_run is not None:
+            if wandb_run is not None and (global_step % wandb_report_every == 0):
                 _safe_wandb_log(
                     {
                         "train/loss": metrics["loss"],
@@ -304,7 +321,7 @@ def train(
                 pbar.set_postfix_str(
                     _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
                 )
-                if wandb_run is not None:
+                if wandb_run is not None and (global_step % wandb_report_every == 0):
                     _safe_wandb_log(
                         {
                             "train/loss": metrics["loss"],
@@ -319,8 +336,8 @@ def train(
                     )
                 global_step += 1
 
-    # Save final checkpoint
-    ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model-final.safetensors")
+    # Save final checkpoint (canonical name expected by loaders)
+    ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model.safetensors")
     print(f"Saved final checkpoint: {ckpt_path}")
 
     # Wrap up W&B
@@ -409,7 +426,9 @@ def train_step(
 
 def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    state_cpu = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    # Normalize keys to avoid wrappers like _orig_mod. or module.
+    raw_state = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
+    state_cpu = normalize_state_dict_keys(raw_state)
     safe_save_file(state_cpu, str(path), metadata={"format": "pt"})
     return path
 

@@ -16,7 +16,10 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["ipykernel>=6.30.1"]
+dev = [
+    "ipykernel>=6.30.1",
+    "pytest>=8.4.1",
+]
 
 # This may need to be updated as uv gets new minor version
 [build-system]

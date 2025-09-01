@@ -1,0 +1,8 @@
+num_seeds = 256
+max_retries = 3
+max_concurrent_games = 128
+
+[strategy]
+type = "slm"
+init_folder = "inits/v1_pretrained_50m"
+# init_folder = "checkpoints/20250901_111648"
