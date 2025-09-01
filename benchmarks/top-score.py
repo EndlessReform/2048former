@@ -65,8 +65,15 @@ class SLMStrategyImpl(Strategy):
     def __init__(self, init_folder: str) -> None:
         device_str = auto_device_name()
         model = load_encoder_from_init(init_folder)
-        self.engine = InferenceEngine(model, device=device_str)
-        self.pool = AsyncBatchPool(self.engine, max_batch=256, flush_interval_ms=1.0)
+        # Disable compilation to isolate overhead; keep default dtype behavior
+        self.engine = InferenceEngine(model, device=device_str, compile_mode=None)
+        # Disable caching to avoid D2H copies and Python tuple keys during eval
+        self.pool = AsyncBatchPool(
+            self.engine,
+            max_batch=256,
+            flush_interval_ms=1.0,
+            enable_cache=False,
+        )
 
     async def start(self) -> None:
         await self.pool.start()
