@@ -225,15 +225,24 @@ def train(
             pg["lr"] = float(base_lr) * float(scale)
         return optimizer.param_groups[0]["lr"]
 
-    # Create timestamped checkpoint directory and store config JSON
+    # Create timestamped checkpoint directory and store configs
     ckpt_root = Path(cfg.checkpoint_dir)
     ckpt_root.mkdir(parents=True, exist_ok=True)
     run_id = time.strftime("%Y%m%d_%H%M%S")
     run_ckpt_dir = ckpt_root / run_id
     run_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # - training-config.json: serialized training config used for the run
     try:
-        with (run_ckpt_dir / "config.json").open("w", encoding="utf-8") as f:
+        with (run_ckpt_dir / "training-config.json").open("w", encoding="utf-8") as f:
             json.dump(cfg.model_dump(), f, indent=2)
+    except Exception:
+        pass
+    # - config.json: serialize the model's EncoderConfig so the checkpoint is a valid init folder
+    try:
+        enc_cfg = getattr(model, "config", None)
+        if enc_cfg is not None:
+            with (run_ckpt_dir / "config.json").open("w", encoding="utf-8") as f:
+                json.dump(enc_cfg.model_dump(), f, indent=2)
     except Exception:
         pass
 
@@ -327,8 +336,8 @@ def train(
                     )
                 global_step += 1
 
-    # Save final checkpoint
-    ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model-final.safetensors")
+    # Save final checkpoint (canonical name expected by loaders)
+    ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model.safetensors")
     print(f"Saved final checkpoint: {ckpt_path}")
 
     # Wrap up W&B
