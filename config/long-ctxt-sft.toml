@@ -12,15 +12,15 @@ mode = "online"                  # online | offline | disabled
 report_every = 50                # log to W&B every N steps (>=1)
 
 [hyperparameters]
-learning_rate = 5e-5
+learning_rate = 2e-5
 muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay
-warmup_steps = 100
+warmup_steps = 200
 # decay_steps = 0
 # Alternatively, specify a percentage of total steps for cooldown/decay
-cooldown_pct = 0.10 # e.g., last 10% of steps
+cooldown_pct = 0.1 # e.g., last 10% of steps
 min_lr_ratio = 0.1
 
 [hyperparameters.optimizer]
