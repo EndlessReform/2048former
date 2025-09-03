@@ -158,22 +158,59 @@ def train(
     else:
         raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
-    # Data
+    # Data: build train (and optional val) views using ai_2048 split
     binner = Binner.from_config(cfg.binning)
-    ds = StepBatchDataset(
+    split_enabled = (getattr(cfg.dataset, "val_steps", 0) or 0) > 0 or (
+        getattr(cfg.dataset, "val_pct", 0.0) or 0.0
+    ) > 0.0
+    # Split settings
+    split_unit = "step" if (cfg.dataset.val_steps or 0) > 0 else "run"
+    split_test_size = int(cfg.dataset.val_steps or 0) if split_unit == "step" else None
+    split_test_pct = float(cfg.dataset.val_pct or 0.0) if split_unit == "run" else None
+
+    collate_fn = make_collate_step_batches(binner)
+
+    # Train dataset/dataloader
+    ds_train = StepBatchDataset(
         pack_path=cfg.dataset.resolved_packfile(),
         batch_size=cfg.batch.batch_size,
         shuffle=True,
         seed=cfg.seed,
+        split_role=("train" if split_enabled else "none"),
+        split_unit=split_unit,
+        split_test_size=split_test_size,
+        split_test_pct=split_test_pct,
+        split_seed=42,
     )
-    collate_fn = make_collate_step_batches(binner)
-    dl = DataLoader(
-        ds,
+    dl_train = DataLoader(
+        ds_train,
         batch_size=None,
         num_workers=4,
         collate_fn=collate_fn,
         pin_memory=True,
     )
+
+    # Optional validation dataset/dataloader
+    dl_val = None
+    if split_enabled:
+        ds_val = StepBatchDataset(
+            pack_path=cfg.dataset.resolved_packfile(),
+            batch_size=cfg.batch.batch_size,
+            shuffle=False,
+            seed=cfg.seed,
+            split_role="val",
+            split_unit=split_unit,
+            split_test_size=split_test_size,
+            split_test_pct=split_test_pct,
+            split_seed=42,
+        )
+        dl_val = DataLoader(
+            ds_val,
+            batch_size=None,
+            num_workers=2,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
 
     # Training
     model.train()
@@ -183,7 +220,7 @@ def train(
     # Determine total steps for scheduler and progress bars
     fixed_steps = cfg.dataset.num_steps or 0
     epochs = cfg.dataset.num_epochs or 1
-    per_epoch_steps = getattr(ds, "total_steps", 0) or 0
+    per_epoch_steps = getattr(ds_train, "total_steps", 0) or 0
     total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
 
     # LR scheduler setup (supports constant and warmup-stable-decay)
@@ -258,7 +295,7 @@ def train(
         wandb_report_every = 1
 
     if fixed_steps > 0:
-        it = iter(dl)
+        it = iter(dl_train)
         pbar = tqdm(
             range(fixed_steps), desc="Train", dynamic_ncols=True, total=fixed_steps
         )
@@ -277,7 +314,7 @@ def train(
             try:
                 batch = next(it)
             except StopIteration:
-                it = iter(dl)
+                it = iter(dl_train)
                 batch = next(it)
             metrics = train_step(model, batch, optimizer, device)
             pbar.set_postfix_str(
@@ -295,18 +332,36 @@ def train(
                     },
                     step=global_step,
                 )
+            # Periodic validation
+            if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
+                global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
+            ):
+                val_metrics = evaluate(model, dl_val, device)
+                if wandb_run is not None:
+                    _safe_wandb_log(
+                        {
+                            "val/loss": val_metrics["loss"],
+                            "val/loss_u": val_metrics["head_losses"][0],
+                            "val/loss_d": val_metrics["head_losses"][1],
+                            "val/loss_l": val_metrics["head_losses"][2],
+                            "val/loss_r": val_metrics["head_losses"][3],
+                        },
+                        step=global_step,
+                    )
             global_step += 1
     else:
         for epoch in range(epochs):
             if per_epoch_steps > 0:
                 pbar = tqdm(
-                    dl,
+                    dl_train,
                     desc=f"Epoch {epoch + 1}/{epochs}",
                     dynamic_ncols=True,
                     total=per_epoch_steps,
                 )
             else:
-                pbar = tqdm(dl, desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
+                pbar = tqdm(
+                    dl_train, desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True
+                )
             for batch in pbar:
                 if (
                     not pre_decay_ckpt_saved
@@ -334,6 +389,23 @@ def train(
                         },
                         step=global_step,
                     )
+                # Periodic validation
+                if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
+                    global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
+                ):
+                    val_metrics = evaluate(model, dl_val, device)
+                    if wandb_run is not None:
+                        _safe_wandb_log(
+                            {
+                                "val/loss": val_metrics["loss"],
+                                "val/loss_u": val_metrics["head_losses"][0],
+                                "val/loss_d": val_metrics["head_losses"][1],
+                                "val/loss_l": val_metrics["head_losses"][2],
+                                "val/loss_r": val_metrics["head_losses"][3],
+                                "train/epoch": epoch,
+                            },
+                            step=global_step,
+                        )
                 global_step += 1
 
     # Save final checkpoint (canonical name expected by loaders)
@@ -422,6 +494,65 @@ def train_step(
     total_loss = loss.detach().item()
 
     return {"loss": total_loss, "head_losses": head_losses}
+
+
+@torch.no_grad()
+def evaluate(model: torch.nn.Module, dl_val: DataLoader, device: torch.device):
+    was_training = model.training
+    model.eval()
+
+    total_loss = 0.0
+    total_heads = torch.zeros(4, dtype=torch.float64)
+    n_batches = 0
+
+    if device.type == "cuda":
+        autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        class _NullCtx:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        autocast = _NullCtx()
+
+    for batch in dl_val:
+        tokens = batch["tokens"].to(device, non_blocking=True)
+        branch_mask = batch["branch_mask"].to(device, non_blocking=True)
+        targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
+
+        with autocast:
+            _hs, ev_logits = model(tokens)
+            per_head_losses = []
+            for h in range(4):
+                logits_h = ev_logits[h].float()
+                tgt_h = targets_bins[:, h]
+                mask_h = branch_mask[:, h]
+                loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
+                if mask_h.any():
+                    loss_h = loss_h[mask_h].mean()
+                else:
+                    loss_h = torch.zeros((), device=logits_h.device, dtype=torch.float32)
+                per_head_losses.append(loss_h)
+
+            loss = sum(per_head_losses)
+
+        total_loss += float(loss.detach().item())
+        total_heads += torch.tensor(
+            [lh.detach().item() for lh in per_head_losses], dtype=torch.float64
+        )
+        n_batches += 1
+
+    if was_training:
+        model.train()
+
+    if n_batches == 0:
+        return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0]}
+
+    avg_loss = float(total_loss / n_batches)
+    avg_heads = (total_heads / n_batches).tolist()
+    return {"loss": avg_loss, "head_losses": avg_heads}
 
 
 def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:

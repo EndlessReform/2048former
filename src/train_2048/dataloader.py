@@ -13,11 +13,25 @@ class StepBatchDataset(IterableDataset):
         batch_size: int = 1024,
         shuffle: bool = True,
         seed: int | None = 0,
+        *,
+        # Optional deterministic split parameters (to regenerate per-worker).
+        # When split_role is "train" or "val", a split is created using the
+        # provided parameters. If "none" (default), the full pack is used.
+        split_role: str = "none",  # "none" | "train" | "val"
+        split_unit: str = "run",  # "run" | "step"
+        split_test_pct: float | None = None,
+        split_test_size: int | None = None,
+        split_seed: int = 42,
     ):
         self.pack_path = pack_path
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = 0 if seed is None else int(seed)
+        self.split_role = split_role
+        self.split_unit = split_unit
+        self.split_test_pct = split_test_pct
+        self.split_test_size = split_test_size
+        self.split_seed = int(split_seed)
 
     def __iter__(self):
         info = get_worker_info()
@@ -29,9 +43,27 @@ class StepBatchDataset(IterableDataset):
         # Open the packfile in this process
         reader = a2.PackReader.open(self.pack_path)
 
+        # Optionally derive a split view
+        view = reader
+        if self.split_role in ("train", "val"):
+            unit = self.split_unit or "run"
+            # Prefer explicit size over pct when provided
+            if unit == "step" and (self.split_test_size or 0) > 0:
+                train_v, val_v = reader.split(
+                    unit="step", test_size=int(self.split_test_size), seed=int(self.split_seed)
+                )
+            elif (self.split_test_pct or 0.0) > 0.0:
+                train_v, val_v = reader.split(
+                    unit=unit, test_pct=float(self.split_test_pct), seed=int(self.split_seed)
+                )
+            else:
+                # Split requested but no size -> fall back to no split
+                train_v, val_v = reader, reader
+            view = train_v if self.split_role == "train" else val_v
+
         # Derive a per-worker seed for deterministic but distinct shuffles
         worker_seed = (self.seed or 0) + worker_id
-        it = reader.iter_step_batches(
+        it = view.iter_step_batches(
             self.batch_size, shuffle=self.shuffle, seed=worker_seed
         )
 
@@ -48,16 +80,32 @@ class StepBatchDataset(IterableDataset):
 
     @property
     def total_steps(self) -> int:
-        """Expose total number of step-batches in the packfile (one epoch).
+        """Expose total number of steps in the current view (not batches).
 
-        Assumes the underlying pack reader provides `total_steps`.
-        Falls back to 0 if unavailable.
+        Assumes the underlying reader/view provides `total_steps`. Falls back to 0.
         """
         reader = a2.PackReader.open(self.pack_path)
         try:
+            if self.split_role in ("train", "val"):
+                unit = self.split_unit or "run"
+                if unit == "step" and (self.split_test_size or 0) > 0:
+                    train_v, val_v = reader.split(
+                        unit="step",
+                        test_size=int(self.split_test_size),
+                        seed=int(self.split_seed),
+                    )
+                elif (self.split_test_pct or 0.0) > 0.0:
+                    train_v, val_v = reader.split(
+                        unit=unit,
+                        test_pct=float(self.split_test_pct),
+                        seed=int(self.split_seed),
+                    )
+                else:
+                    train_v, val_v = reader, reader
+                view = train_v if self.split_role == "train" else val_v
+                return int(getattr(view, "total_steps", 0))
             return int(getattr(reader, "total_steps", 0))
         finally:
-            # Best-effort close if supported
             close_fn = getattr(reader, "close", None)
             if callable(close_fn):
                 try:

@@ -26,12 +26,41 @@ class DatasetConfig(BaseModel):
     # Choose either fixed steps or epochs. If both provided, steps takes priority.
     num_steps: Optional[int] = None
     num_epochs: Optional[int] = None
+    # Validation split options (default: disabled)
+    # Provide either a percentage of data (0..1) or a fixed number of steps.
+    # If both are provided (>0), val_steps takes precedence and uses unit="step".
+    val_pct: float = 0.0
+    val_steps: int = 0
+    # Run validation every N training steps (when >0)
+    val_every: int = 1000
 
     @field_validator("num_steps", "num_epochs")
     @classmethod
     def _non_negative(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v < 0:
             raise ValueError("num_steps/num_epochs must be >= 0")
+        return v
+
+    @field_validator("val_pct")
+    @classmethod
+    def _pct_range(cls, v: float) -> float:
+        if v < 0.0 or v >= 1.0:
+            if v != 0.0:
+                raise ValueError("dataset.val_pct must be in [0,1) (0 disables)")
+        return v
+
+    @field_validator("val_steps")
+    @classmethod
+    def _val_steps_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("dataset.val_steps must be >= 0")
+        return v
+
+    @field_validator("val_every")
+    @classmethod
+    def _val_every_positive(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("dataset.val_every must be >= 0 (0 disables)")
         return v
 
     def resolved_packfile(self) -> str:
