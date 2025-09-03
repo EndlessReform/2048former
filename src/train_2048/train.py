@@ -14,12 +14,17 @@ import time, json, math
 
 from .config import TrainingConfig, load_encoder_from_init, normalize_state_dict_keys
 from .binning import Binner
-from .dataloader import StepBatchDataset, make_collate_step_batches
+from .dataloader import build_dataloaders
 
 
-def _format_postfix(loss: float, head_losses: list[float], lr: float) -> str:
+def _format_postfix(
+    loss: float, head_losses: list[float], lr: float, dt_data_ms: float | None = None, dt_comp_ms: float | None = None
+) -> str:
     u, d, l, r = head_losses
-    return f"loss={loss:.4f}  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}  lr={lr:.2e}"
+    base = f"loss={loss:.4f}  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}  lr={lr:.2e}"
+    if dt_data_ms is not None and dt_comp_ms is not None:
+        base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
+    return base
 
 
 def train(
@@ -158,59 +163,12 @@ def train(
     else:
         raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
-    # Data: build train (and optional val) views using ai_2048 split
+    # Data: build train (and optional val) views via dataloader module
     binner = Binner.from_config(cfg.binning)
-    split_enabled = (getattr(cfg.dataset, "val_steps", 0) or 0) > 0 or (
-        getattr(cfg.dataset, "val_pct", 0.0) or 0.0
-    ) > 0.0
-    # Split settings
-    split_unit = "step" if (cfg.dataset.val_steps or 0) > 0 else "run"
-    split_test_size = int(cfg.dataset.val_steps or 0) if split_unit == "step" else None
-    split_test_pct = float(cfg.dataset.val_pct or 0.0) if split_unit == "run" else None
-
-    collate_fn = make_collate_step_batches(binner)
-
-    # Train dataset/dataloader
-    ds_train = StepBatchDataset(
-        pack_path=cfg.dataset.resolved_packfile(),
-        batch_size=cfg.batch.batch_size,
-        shuffle=True,
-        seed=cfg.seed,
-        split_role=("train" if split_enabled else "none"),
-        split_unit=split_unit,
-        split_test_size=split_test_size,
-        split_test_pct=split_test_pct,
-        split_seed=42,
+    num_workers_train = 12  # quick knob for throughput
+    dl_train, dl_val, per_epoch_steps = build_dataloaders(
+        cfg, binner, num_workers_train=num_workers_train
     )
-    dl_train = DataLoader(
-        ds_train,
-        batch_size=None,
-        num_workers=4,
-        collate_fn=collate_fn,
-        pin_memory=True,
-    )
-
-    # Optional validation dataset/dataloader
-    dl_val = None
-    if split_enabled:
-        ds_val = StepBatchDataset(
-            pack_path=cfg.dataset.resolved_packfile(),
-            batch_size=cfg.batch.batch_size,
-            shuffle=False,
-            seed=cfg.seed,
-            split_role="val",
-            split_unit=split_unit,
-            split_test_size=split_test_size,
-            split_test_pct=split_test_pct,
-            split_seed=42,
-        )
-        dl_val = DataLoader(
-            ds_val,
-            batch_size=None,
-            num_workers=2,
-            collate_fn=collate_fn,
-            pin_memory=True,
-        )
 
     # Training
     model.train()
@@ -220,7 +178,6 @@ def train(
     # Determine total steps for scheduler and progress bars
     fixed_steps = cfg.dataset.num_steps or 0
     epochs = cfg.dataset.num_epochs or 1
-    per_epoch_steps = getattr(ds_train, "total_steps", 0) or 0
     total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
 
     # LR scheduler setup (supports constant and warmup-stable-decay)
@@ -311,14 +268,22 @@ def train(
 
             lr_now = _apply_lr(_lr_scale_for_step(global_step))
             # Rewind the dataloader if we exhaust it before reaching fixed_steps
+            # Timing: data vs compute
+            t0 = time.perf_counter()
             try:
                 batch = next(it)
             except StopIteration:
                 it = iter(dl_train)
                 batch = next(it)
+            t1 = time.perf_counter()
             metrics = train_step(model, batch, optimizer, device)
+            t2 = time.perf_counter()
+            dt_data_ms = (t1 - t0) * 1e3
+            dt_comp_ms = (t2 - t1) * 1e3
             pbar.set_postfix_str(
-                _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
+                _format_postfix(
+                    metrics["loss"], metrics["head_losses"], lr_now, dt_data_ms, dt_comp_ms
+                )
             )
             if wandb_run is not None and (global_step % wandb_report_every == 0):
                 _safe_wandb_log(
@@ -329,6 +294,8 @@ def train(
                         "train/loss_l": metrics["head_losses"][2],
                         "train/loss_r": metrics["head_losses"][3],
                         "train/lr": lr_now,
+                        "train/data_time_ms": dt_data_ms,
+                        "train/compute_time_ms": dt_comp_ms,
                     },
                     step=global_step,
                 )
@@ -353,60 +320,135 @@ def train(
         for epoch in range(epochs):
             if per_epoch_steps > 0:
                 pbar = tqdm(
-                    dl_train,
+                    range(per_epoch_steps),
                     desc=f"Epoch {epoch + 1}/{epochs}",
                     dynamic_ncols=True,
                     total=per_epoch_steps,
                 )
-            else:
-                pbar = tqdm(
-                    dl_train, desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True
-                )
-            for batch in pbar:
-                if (
-                    not pre_decay_ckpt_saved
-                    and decay_steps > 0
-                    and global_step == decay_start_step
-                ):
-                    _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
-                    pre_decay_ckpt_saved = True
+                it = iter(dl_train)
+                for _ in pbar:
+                    # Fetch with timing
+                    t_fetch0 = time.perf_counter()
+                    try:
+                        batch = next(it)
+                    except StopIteration:
+                        break
+                    t_fetch1 = time.perf_counter()
+                    # Compute
+                    lr_now = _apply_lr(_lr_scale_for_step(global_step))
+                    metrics = train_step(model, batch, optimizer, device)
+                    t_comp1 = time.perf_counter()
+                    dt_data_ms = (t_fetch1 - t_fetch0) * 1e3
+                    dt_comp_ms = (t_comp1 - t_fetch1) * 1e3
+                    if (
+                        not pre_decay_ckpt_saved
+                        and decay_steps > 0
+                        and global_step == decay_start_step
+                    ):
+                        _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
+                        pre_decay_ckpt_saved = True
 
-                lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                metrics = train_step(model, batch, optimizer, device)
-                pbar.set_postfix_str(
-                    _format_postfix(metrics["loss"], metrics["head_losses"], lr_now)
-                )
-                if wandb_run is not None and (global_step % wandb_report_every == 0):
-                    _safe_wandb_log(
-                        {
-                            "train/loss": metrics["loss"],
-                            "train/loss_u": metrics["head_losses"][0],
-                            "train/loss_d": metrics["head_losses"][1],
-                            "train/loss_l": metrics["head_losses"][2],
-                            "train/loss_r": metrics["head_losses"][3],
-                            "train/lr": lr_now,
-                            "train/epoch": epoch,
-                        },
-                        step=global_step,
+                    pbar.set_postfix_str(
+                        _format_postfix(
+                            metrics["loss"], metrics["head_losses"], lr_now, dt_data_ms, dt_comp_ms
+                        )
                     )
-                # Periodic validation
-                if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
-                    global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
-                ):
-                    val_metrics = evaluate(model, dl_val, device)
-                    if wandb_run is not None:
+                    if wandb_run is not None and (global_step % wandb_report_every == 0):
                         _safe_wandb_log(
                             {
-                                "val/loss": val_metrics["loss"],
-                                "val/loss_u": val_metrics["head_losses"][0],
-                                "val/loss_d": val_metrics["head_losses"][1],
-                                "val/loss_l": val_metrics["head_losses"][2],
-                                "val/loss_r": val_metrics["head_losses"][3],
+                                "train/loss": metrics["loss"],
+                                "train/loss_u": metrics["head_losses"][0],
+                                "train/loss_d": metrics["head_losses"][1],
+                                "train/loss_l": metrics["head_losses"][2],
+                                "train/loss_r": metrics["head_losses"][3],
+                                "train/lr": lr_now,
                                 "train/epoch": epoch,
+                                "train/data_time_ms": dt_data_ms,
+                                "train/compute_time_ms": dt_comp_ms,
                             },
                             step=global_step,
                         )
-                global_step += 1
+                    # Periodic validation
+                    if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
+                        global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
+                    ):
+                        val_metrics = evaluate(model, dl_val, device)
+                        if wandb_run is not None:
+                            _safe_wandb_log(
+                                {
+                                    "val/loss": val_metrics["loss"],
+                                    "val/loss_u": val_metrics["head_losses"][0],
+                                    "val/loss_d": val_metrics["head_losses"][1],
+                                    "val/loss_l": val_metrics["head_losses"][2],
+                                    "val/loss_r": val_metrics["head_losses"][3],
+                                    "train/epoch": epoch,
+                                },
+                                step=global_step,
+                            )
+                    global_step += 1
+            else:
+                pbar = tqdm(desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
+                it = iter(dl_train)
+                while True:
+                    # Fetch with timing
+                    t_fetch0 = time.perf_counter()
+                    try:
+                        batch = next(it)
+                    except StopIteration:
+                        break
+                    t_fetch1 = time.perf_counter()
+                    # Compute
+                    lr_now = _apply_lr(_lr_scale_for_step(global_step))
+                    metrics = train_step(model, batch, optimizer, device)
+                    t_comp1 = time.perf_counter()
+                    dt_data_ms = (t_fetch1 - t_fetch0) * 1e3
+                    dt_comp_ms = (t_comp1 - t_fetch1) * 1e3
+                    if (
+                        not pre_decay_ckpt_saved
+                        and decay_steps > 0
+                        and global_step == decay_start_step
+                    ):
+                        _save_checkpoint(model, run_ckpt_dir / "model-stable.safetensors")
+                        pre_decay_ckpt_saved = True
+
+                    pbar.set_postfix_str(
+                        _format_postfix(
+                            metrics["loss"], metrics["head_losses"], lr_now, dt_data_ms, dt_comp_ms
+                        )
+                    )
+                    if wandb_run is not None and (global_step % wandb_report_every == 0):
+                        _safe_wandb_log(
+                            {
+                                "train/loss": metrics["loss"],
+                                "train/loss_u": metrics["head_losses"][0],
+                                "train/loss_d": metrics["head_losses"][1],
+                                "train/loss_l": metrics["head_losses"][2],
+                                "train/loss_r": metrics["head_losses"][3],
+                                "train/lr": lr_now,
+                                "train/epoch": epoch,
+                                "train/data_time_ms": dt_data_ms,
+                                "train/compute_time_ms": dt_comp_ms,
+                            },
+                            step=global_step,
+                        )
+                    # Periodic validation
+                    if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
+                        global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
+                    ):
+                        val_metrics = evaluate(model, dl_val, device)
+                        if wandb_run is not None:
+                            _safe_wandb_log(
+                                {
+                                    "val/loss": val_metrics["loss"],
+                                    "val/loss_u": val_metrics["head_losses"][0],
+                                    "val/loss_d": val_metrics["head_losses"][1],
+                                    "val/loss_l": val_metrics["head_losses"][2],
+                                    "val/loss_r": val_metrics["head_losses"][3],
+                                    "train/epoch": epoch,
+                                },
+                                step=global_step,
+                            )
+                    global_step += 1
 
     # Save final checkpoint (canonical name expected by loaders)
     ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model.safetensors")
