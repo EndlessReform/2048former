@@ -47,16 +47,26 @@ special_zero_one = true
 edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 
 [dataset]
-# Path is resolved relative to the repo root when not absolute
-packfile = "./datasets/dsv3.a2pack"
+# Root directory containing steps.npy and metadata.db (resolved relative to repo root)
+dataset_dir = "./dataset_dir"
+
+# Universe selection via SQL (optional). When omitted, uses all runs.
+# Example filter: only runs with score between [50k, 500k]
+run_sql = "SELECT id FROM runs WHERE max_score BETWEEN ? AND ?"
+sql_params = [50_000, 500_000]
+
 # For quick validation, run a fixed number of steps
 num_steps = 100_000
 # Or drive by epochs instead (steps takes priority if both set)
 # num_epochs = 4
- # Validation split (optional, default disabled)
- # Provide either a percentage (0..1) or a fixed number of steps.
- # If both are provided (>0), val_steps takes precedence and uses unit="step".
- val_pct = 0.10
- # val_steps = 50_000
- # Validate every N training steps (0 disables)
- val_every = 1000
+
+# Validation: choose disjoint runs for val
+# Option A: random run split (percentage of unique runs)
+val_run_pct = 0.10
+val_split_seed = 42
+# Option B: explicit validation SQL (takes precedence if set)
+# val_run_sql = "SELECT id FROM runs WHERE ..."
+# val_sql_params = []
+
+# Validate every N training steps (0 disables)
+val_every = 1000

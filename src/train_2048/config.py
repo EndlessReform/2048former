@@ -22,15 +22,23 @@ def _find_repo_root() -> Path:
 
 
 class DatasetConfig(BaseModel):
-    packfile: str = "./datasets/dsv1.a2pack"
+    # Root directory containing steps.npy and metadata.db
+    dataset_dir: str = "./dataset"
+    # Optional: SQL to define the universe of runs (training+validation)
+    run_sql: Optional[str] = None
+    sql_params: list[object] = Field(default_factory=list)
+
+    # Validation split options (by run to avoid leakage)
+    # Option A: explicit SQL for validation runs
+    val_run_sql: Optional[str] = None
+    val_sql_params: list[object] = Field(default_factory=list)
+    # Option B: random run split when >0; ignored if val_run_sql provided
+    val_run_pct: float = 0.0
+    val_split_seed: int = 42
+
     # Choose either fixed steps or epochs. If both provided, steps takes priority.
     num_steps: Optional[int] = None
     num_epochs: Optional[int] = None
-    # Validation split options (default: disabled)
-    # Provide either a percentage of data (0..1) or a fixed number of steps.
-    # If both are provided (>0), val_steps takes precedence and uses unit="step".
-    val_pct: float = 0.0
-    val_steps: int = 0
     # Run validation every N training steps (when >0)
     val_every: int = 1000
 
@@ -41,19 +49,12 @@ class DatasetConfig(BaseModel):
             raise ValueError("num_steps/num_epochs must be >= 0")
         return v
 
-    @field_validator("val_pct")
+    @field_validator("val_run_pct")
     @classmethod
     def _pct_range(cls, v: float) -> float:
         if v < 0.0 or v >= 1.0:
             if v != 0.0:
-                raise ValueError("dataset.val_pct must be in [0,1) (0 disables)")
-        return v
-
-    @field_validator("val_steps")
-    @classmethod
-    def _val_steps_non_negative(cls, v: int) -> int:
-        if v < 0:
-            raise ValueError("dataset.val_steps must be >= 0")
+                raise ValueError("dataset.val_run_pct must be in [0,1) (0 disables)")
         return v
 
     @field_validator("val_every")
@@ -63,8 +64,8 @@ class DatasetConfig(BaseModel):
             raise ValueError("dataset.val_every must be >= 0 (0 disables)")
         return v
 
-    def resolved_packfile(self) -> str:
-        p = Path(self.packfile)
+    def resolved_dataset_dir(self) -> str:
+        p = Path(self.dataset_dir)
         if not p.is_absolute():
             p = _find_repo_root() / p
         return str(p)
