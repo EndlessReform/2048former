@@ -1,8 +1,8 @@
 num_seeds = 256
 max_retries = 3
-max_concurrent_games = 128
+max_concurrent_games = 256
 
 [strategy]
 type = "slm"
-init_folder = "checkpoints/20250901_151718"
+init_folder = "checkpoints/20250902_225430"
 # init_folder = "checkpoints/20250901_111648"
