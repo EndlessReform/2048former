@@ -17,3 +17,6 @@ infer-2048 = "infer_2048.main:main"
 
 [tool.uv.sources]
 core_2048 = { workspace = true }
+
+[tool.uv.build-backend]
+module-name = ["infer_2048"]

@@ -3,12 +3,14 @@ Inference server for the 2048 EV model (Torch). Thin gRPC wrapper around a singl
 Quick start
 
 - Install deps:
-- uv sync
-- If not already present, generate protobuf stubs:
-  uv run python -m grpc_tools.protoc -I proto \
-    --python_out=packages/infer_2048/src/infer_2048/proto \
-    --grpc_python_out=packages/infer_2048/src/infer_2048/proto \
-    proto/train_2048/inference/v1/inference.proto
+  - uv sync
+  - If not already present, generate protobuf stubs into src/ so that
+    Python can import `train_2048.inference.v1` directly:
+    uv run --project packages/infer_2048 \
+      python -m grpc_tools.protoc -I proto \
+      --python_out=packages/infer_2048/src \
+      --grpc_python_out=packages/infer_2048/src \
+      proto/train_2048/inference/v1/inference.proto
 
 - Run server (module mode; works without installing console script):
   - UDS: uv run --project packages/infer_2048 python -m infer_2048.main --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
