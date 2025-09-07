@@ -5,8 +5,10 @@ Overview
 - The gRPC API returns per-head probabilities over bins (float32); the Rust side selects moves (max-p1) and applies them.
 
 Prereqs
-- A running inference server that implements proto `train_2048.inference.v1.Infer` over TCP.
-- Set the endpoint in your TOML at `[orchestrator.connection].tcp_addr`.
+- A running inference server that implements proto `train_2048.inference.v1.Infer`.
+- Connection options (choose one in your TOML under `[orchestrator.connection]`):
+  - UDS (recommended locally): `uds_path = "/tmp/2048_infer.sock"`
+  - TCP: `tcp_addr = "http://127.0.0.1:50051"`
 
 Build
 - cargo build -p game-engine
@@ -16,7 +18,8 @@ Run
 
 Config
 - See CONFIG.md for all keys. Minimal required fields:
-  - `[orchestrator.connection]`
+  - `[orchestrator.connection]` — set exactly one of:
+    - `uds_path = "/tmp/2048_infer.sock"`
     - `tcp_addr = "http://127.0.0.1:50051"`
   - `[orchestrator.batch]` (defaults are sensible; tune later)
 
@@ -29,6 +32,5 @@ What it does
   - Applies the move via `ai_2048` and continues until the game ends.
 
 Notes
-- The current build uses TCP only; UDS can be added with a small connector helper.
+- UDS and TCP are both supported. Prefer UDS for local single-node runs (lower overhead, no TCP stack).
 - The Feeder integrates the response router (per-item oneshots) to keep the design simple.
-

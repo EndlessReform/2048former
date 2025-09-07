@@ -1,3 +1,23 @@
+gRPC Inference (Server + Client)
+--------------------------------
+
+- Python server (Torch):
+  - Generate stubs once:
+    - uv run python -m grpc_tools.protoc -I proto --python_out=packages/infer_2048/src/infer_2048/proto --grpc_python_out=packages/infer_2048/src/infer_2048/proto proto/train_2048/inference/v1/inference.proto
+  - Start:
+    - UDS (recommended local): uv run infer-2048 --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
+    - TCP: uv run infer-2048 --init inits/v1_50m --tcp 127.0.0.1:50051 --device cpu
+
+- Rust orchestrator client (game-engine):
+  - Configure one of:
+    - In config TOML: [orchestrator.connection] uds_path = "/tmp/2048_infer.sock"
+    - Or TCP: tcp_addr = "http://127.0.0.1:50051"
+  - Build/run: cargo run -p game-engine -- --config config/inference/top-score.toml
+
+Notes
+- UDS and TCP are both supported; UDS avoids TCP overhead on a single node.
+- The wire format returns per-head probability distributions over bins; selection happens in Rust.
+
 Inference
 ---------
 

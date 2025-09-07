@@ -65,7 +65,7 @@ Key invariants:
 - `evs: bytes` — flat `[B,4]` floats (fp16/bf16/fp32 per hint)
 - `aux_json: string` (optional, small; for debug/telemetry)
 
-Transport: **UDS** (`/tmp/2048_infer.sock`) in development; TCP only if you later remote it.
+Transport: **UDS** (`/tmp/2048_infer.sock`) in development; TCP if you remote it. The Rust client supports both.
 
 ---
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["train_2048"]
+dependencies = ["train_2048", "infer-2048"]
 
 [tool.uv.workspace]
 members = [
@@ -13,3 +13,4 @@ members = [
 
 [tool.uv.sources]
 train_2048 = { workspace = true }
+infer-2048 = { workspace = true }

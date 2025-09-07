@@ -5,22 +5,20 @@ max_concurrent_games = 8
 [sampling]
 strategy = "argmax"
 
-[orchestrator]
+[orchestrator.connection]
+# One of uds_path or tcp_addr must be set for the Python server.
+uds_path = "/tmp/2048_infer.sock"
+# tcp_addr = "http://127.0.0.1:50051"
 
-  [orchestrator.connection]
-  # One of uds_path or tcp_addr must be set for the Python server.
-  # uds_path = "/tmp/2048_infer.sock"
-  # tcp_addr = "http://127.0.0.1:50051"
-
-  [orchestrator.batch]
-  # Time-based flush interval for micro-batches (microseconds)
-  flush_us = 250
-  # Target batch size; feeder bursts up to max_batch under load
-  target_batch = 512
-  max_batch = 1024
-  # Sliding window of batches in flight (credits)
-  inflight_batches = 2
-  # Per-game cap on in-flight items to maintain fairness
-  per_game_inflight = 16
-  # Capacity of the global request queue (bounded MPSC)
-  queue_cap = 65536
+[orchestrator.batch]
+# Time-based flush interval for micro-batches (microseconds)
+flush_us = 250
+# Target batch size; feeder bursts up to max_batch under load
+target_batch = 512
+max_batch = 1024
+# Sliding window of batches in flight (credits)
+inflight_batches = 2
+# Per-game cap on in-flight items to maintain fairness
+per_game_inflight = 16
+# Capacity of the global request queue (bounded MPSC)
+queue_cap = 65536
