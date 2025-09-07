@@ -12,10 +12,37 @@ from core_2048 import load_encoder_from_init, prepare_model_for_inference, forwa
 
 
 # Expect stubs under package-local path: src/infer_2048/proto/train_2048/inference/v1
-from infer_2048.proto.train_2048.inference.v1 import (
-    inference_pb2,
-    inference_pb2_grpc,
-)
+import importlib
+import sys
+
+# Resolve generated stubs from the package-local path, and alias them to the
+# absolute import names that grpc_tools emits (train_2048.inference.v1.*).
+# This avoids collisions with the real training package and keeps console
+# scripts working reliably.
+try:
+    # Import local package modules
+    _pkg_v1 = importlib.import_module("infer_2048.proto.train_2048.inference.v1")
+    _pb2 = importlib.import_module("infer_2048.proto.train_2048.inference.v1.inference_pb2")
+    # Preinstall alias chain so importing *_pb2_grpc (which imports absolute) succeeds
+    sys.modules.setdefault("train_2048", importlib.import_module("infer_2048.proto.train_2048"))
+    sys.modules.setdefault(
+        "train_2048.inference", importlib.import_module("infer_2048.proto.train_2048.inference")
+    )
+    sys.modules.setdefault("train_2048.inference.v1", _pkg_v1)
+    sys.modules["train_2048.inference.v1.inference_pb2"] = _pb2
+    # Now import grpc stubs (this will import train_2048.inference.v1.inference_pb2 via our alias)
+    _pb2_grpc = importlib.import_module(
+        "infer_2048.proto.train_2048.inference.v1.inference_pb2_grpc"
+    )
+    sys.modules["train_2048.inference.v1.inference_pb2_grpc"] = _pb2_grpc
+    # Finally, import using absolute names consistently
+    from train_2048.inference.v1 import inference_pb2, inference_pb2_grpc  # type: ignore
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        "Protobuf stubs not found under infer_2048/proto/train_2048/inference/v1.\n"
+        "Generate with:\n"
+        "  uv run --project packages/infer_2048 python -m grpc_tools.protoc -I proto --python_out=packages/infer_2048/src/infer_2048/proto --grpc_python_out=packages/infer_2048/src/infer_2048/proto proto/train_2048/inference/v1/inference.proto\n"
+    ) from e
 
 
 class InferenceService(inference_pb2_grpc.InferenceServicer):
