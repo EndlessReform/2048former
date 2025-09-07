@@ -1,0 +1,15 @@
+[project]
+name = "core_2048"
+version = "0.1.0"
+description = "Shared core for 2048 model: model defs, init IO, thin inference helpers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.11.7",
+    "safetensors>=0.6.2",
+    "torch>=2.8.0",
+]
+
+[tool.uv.build-backend]
+module-name = ["core_2048"]
+

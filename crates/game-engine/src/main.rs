@@ -34,18 +34,27 @@ async fn main() {
     // Initialize game engine tables if needed
     ai_2048::engine::new();
 
-    // Establish gRPC connection (TCP only for now)
+    // Establish gRPC connection (UDS preferred when set; else TCP)
     let conn = &config.orchestrator.connection;
-    let tcp = conn.tcp_addr.clone().unwrap_or_else(|| {
-        eprintln!("tcp_addr must be set under [orchestrator.connection] (UDS not wired yet)");
-        std::process::exit(2);
-    });
-    let client = match grpc::connect(&tcp).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to connect to inference server at {tcp}: {e}");
-            std::process::exit(2);
+    let client = if let Some(uds_path) = &conn.uds_path {
+        match grpc::connect_uds(uds_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to connect to inference server over UDS {}: {e}", uds_path.display());
+                std::process::exit(2);
+            }
         }
+    } else if let Some(tcp) = &conn.tcp_addr {
+        match grpc::connect(tcp).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to connect to inference server at {tcp}: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        eprintln!("Either uds_path or tcp_addr must be set under [orchestrator.connection]");
+        std::process::exit(2);
     };
 
     // Start feeder

@@ -284,3 +284,4 @@ class Encoder(nn.Module):
         board_repr = x.mean(dim=1)  # (B, H)
         ev_logits = [head(board_repr) for head in self.ev_heads]  # List of (B, n_bins)
         return x, ev_logits
+

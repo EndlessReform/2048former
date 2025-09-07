@@ -1,0 +1,19 @@
+[project]
+name = "infer-2048"
+version = "0.1.0"
+description = "gRPC inference server for 2048 EV model (Torch)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "core_2048",
+    "grpcio>=1.65.0",
+    "grpcio-tools>=1.65.0",
+    "protobuf>=5.28.0",
+    "torch>=2.8.0",
+]
+
+[project.scripts]
+infer-2048 = "infer_2048.main:main"
+
+[tool.uv.sources]
+core_2048 = { workspace = true }

@@ -13,7 +13,9 @@ pub mod api {
 pub use api::train_2048::inference::v1 as pb;
 
 use pb::inference_client::InferenceClient;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tokio::net::UnixStream;
+use tower::service_fn;
 
 // Public alias for the generated client type
 pub type Client = InferenceClient<Channel>;
@@ -22,6 +24,21 @@ pub type Client = InferenceClient<Channel>;
 /// For UDS support, add a separate helper using `connect_with_connector`.
 pub async fn connect<D: AsRef<str>>(dst: D) -> Result<Client, tonic::transport::Error> {
     InferenceClient::connect(dst.as_ref().to_string()).await
+}
+
+/// Connect to the inference endpoint over a Unix Domain Socket at `path`.
+/// Example path: "/tmp/2048_infer.sock".
+pub async fn connect_uds<P: AsRef<std::path::Path>>(path: P) -> Result<Client, tonic::transport::Error> {
+    // Hyper requires a valid URI even when using a custom connector; use a dummy.
+    let ep = Endpoint::try_from("http://[::]:50051")?;
+    let path_string = path.as_ref().to_path_buf();
+    let channel = ep
+        .connect_with_connector(service_fn(move |_uri: Uri| {
+            let p = path_string.clone();
+            async move { UnixStream::connect(p).await }
+        }))
+        .await?;
+    Ok(InferenceClient::new(channel))
 }
 
 /// Convenience call for the bins API (probabilities over bins).

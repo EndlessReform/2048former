@@ -7,8 +7,7 @@ from pathlib import Path
 
 import tomllib
 from pydantic import BaseModel, Field, field_validator
-from safetensors.torch import load_file as safe_load_file
-from .model import Encoder, EncoderConfig
+from core_2048 import Encoder, EncoderConfig, load_encoder_from_init, normalize_state_dict_keys
 from .binning import BinningConfig
 
 
@@ -215,45 +214,6 @@ def load_config(path: str) -> TrainingConfig:
     return TrainingConfig.from_toml(path)
 
 
-def load_encoder_from_init(init_dir: str) -> Encoder:
-    """
-    Construct an Encoder from an init folder.
-
-    Expects:
-    - `<init_dir>/config.json`: JSON matching EncoderConfig fields
-    - Optional `<init_dir>/model.safetensors`: weights to load
-
-    Returns a model on CPU with random weights if the safetensors file is absent.
-    """
-    init_path = Path(init_dir)
-    cfg_path = init_path / "config.json"
-    if not cfg_path.is_file():
-        raise FileNotFoundError(f"Missing init config: {cfg_path}")
-
-    with cfg_path.open("r", encoding="utf-8") as f:
-        enc_cfg_dict = json.load(f)
-
-    enc_cfg = EncoderConfig.model_validate(enc_cfg_dict)
-    model = Encoder(enc_cfg)
-
-    weights_path = init_path / "model.safetensors"
-    if weights_path.is_file():
-        state = safe_load_file(str(weights_path))
-        state = normalize_state_dict_keys(state)
-        try:
-            model.load_state_dict(state, strict=True)
-        except Exception as e:
-            # Fallback to non-strict if keys still mismatch after normalization
-            missing, unexpected = _compare_state_keys(model, state)
-            print(
-                "Warning: non-strict load due to key mismatch. "
-                f"missing={len(missing)} unexpected={len(unexpected)}"
-            )
-            model.load_state_dict(state, strict=False)
-
-    return model
-
-
 __all__ = [
     "WandbConfig",
     "LRScheduleConfig",
@@ -266,32 +226,3 @@ __all__ = [
     "load_encoder_from_init",
     "normalize_state_dict_keys",
 ]
-
-
-def normalize_state_dict_keys(state: dict) -> dict:
-    """
-    Strip known wrapper prefixes from state_dict keys (e.g., `_orig_mod.`, `module.`).
-
-    Returns a new dict with normalized keys.
-    """
-    prefixes = ("_orig_mod.", "module.")
-    out = {}
-    for k, v in state.items():
-        nk = k
-        changed = True
-        while changed:
-            changed = False
-            for p in prefixes:
-                if nk.startswith(p):
-                    nk = nk[len(p) :]
-                    changed = True
-        out[nk] = v
-    return out
-
-
-def _compare_state_keys(model: Encoder, state: dict) -> tuple[list[str], list[str]]:
-    model_keys = set(model.state_dict().keys())
-    state_keys = set(state.keys())
-    missing = sorted(list(model_keys - state_keys))
-    unexpected = sorted(list(state_keys - model_keys))
-    return missing, unexpected

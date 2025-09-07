@@ -18,3 +18,5 @@ checkpoints
 # Added by cargo
 
 /target
+# gRPC stubs
+packages/infer_2048/src/infer_2048/proto

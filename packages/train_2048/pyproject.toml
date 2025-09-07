@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "ai-2048",
+    "core_2048",
     "muon-optimizer>=0.1.0",
     "numpy>=2.3.2",
     "pydantic>=2.11.7",
@@ -31,3 +32,4 @@ train = "train_2048.main:main"
 
 [tool.uv.sources]
 ai-2048 = { git = "https://github.com/EndlessReform/2048_bench", subdirectory = "py-ai-2048" }
+core_2048 = { workspace = true }
