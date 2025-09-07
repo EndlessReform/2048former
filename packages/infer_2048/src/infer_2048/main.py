@@ -19,6 +19,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         default="reduce-overhead",
         help="Torch compile mode (e.g., reduce-overhead, max-autotune, or none to disable)",
     )
+    p.add_argument(
+        "--warmup-sizes",
+        default="",
+        help="Comma-separated batch sizes to warm up (e.g., 256,1024)",
+    )
+    p.add_argument(
+        "--dynamic-batch",
+        action="store_true",
+        help="Mark batch dimension dynamic during warmup to avoid later recompiles",
+    )
     args = p.parse_args(argv)
 
     bind: str
@@ -35,12 +45,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     else:
         compile_mode = str(args.compile_mode)
 
+    warmups: list[int] = []
+    if args.warmup_sizes:
+        try:
+            warmups = [int(x) for x in str(args.warmup_sizes).split(",") if x.strip()]
+        except Exception:
+            raise SystemExit("--warmup-sizes must be a comma-separated list of integers")
+
     asyncio.run(
         serve_async(
             init_dir=args.init,
             bind=bind,
             device=args.device,
             compile_mode=compile_mode,
+            warmup_sizes=warmups,
+            dynamic_batch=args.dynamic_batch,
         )
     )
 

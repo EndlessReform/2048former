@@ -56,6 +56,7 @@ async fn main() {
         eprintln!("Either uds_path or tcp_addr must be set under [orchestrator.connection]");
         std::process::exit(2);
     };
+    println!("Connected to inference server");
 
     // Start feeder
     let (feeder, handle) = Feeder::new(config.orchestrator.batch.clone());

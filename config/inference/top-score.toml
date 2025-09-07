@@ -1,6 +1,6 @@
-num_seeds = 32
-max_retries = 3
-max_concurrent_games = 16
+num_seeds = 4
+max_retries = 1
+max_concurrent_games = 4
 
 [sampling]
 strategy = "Argmax"
@@ -12,9 +12,13 @@ uds_path = "/tmp/2048_infer.sock"
 
 [orchestrator.batch]
 # Time-based flush interval for micro-batches (microseconds)
-flush_us = 200
-target_batch = 1024
-max_batch = 1024
-inflight_batches = 3
-per_game_inflight = 32
-queue_cap = 65536
+flush_us = 500
+target_batch = 64
+max_batch = 64
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+
+# Optional: client-side batching metrics (JSONL)
+# metrics_file = "profiles/client-metrics.jsonl"
+# metrics_interval_s = 5.0

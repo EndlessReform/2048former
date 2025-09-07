@@ -16,6 +16,9 @@ output
 checkpoints
 profiles
 
+# inference
+runs
+
 # Added by cargo
 
 /target

@@ -62,6 +62,10 @@ pub struct Batch {
     pub per_game_inflight: usize,
     #[serde(default = "defaults::queue_cap")]
     pub queue_cap: usize,
+    #[serde(default)]
+    pub metrics_file: Option<std::path::PathBuf>,
+    #[serde(default = "defaults::metrics_interval_s")]
+    pub metrics_interval_s: f64,
 }
 
 impl Default for Orchestrator {
@@ -79,6 +83,8 @@ impl Default for Batch {
             inflight_batches: defaults::inflight_batches(),
             per_game_inflight: defaults::per_game_inflight(),
             queue_cap: defaults::queue_cap(),
+            metrics_file: None,
+            metrics_interval_s: defaults::metrics_interval_s(),
         }
     }
 }
@@ -102,4 +108,5 @@ mod defaults {
     pub fn inflight_batches() -> usize { 2 }
     pub fn per_game_inflight() -> usize { 16 }
     pub fn queue_cap() -> usize { 65_536 }
+    pub fn metrics_interval_s() -> f64 { 5.0 }
 }

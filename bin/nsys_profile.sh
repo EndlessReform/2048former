@@ -30,7 +30,10 @@ CLIENT_CFG="config/inference/top-score.toml"
 OUTDIR=""
 RELEASE=0
 SLEEP_SECS=2
-SERVER_READY_TIMEOUT=60
+SERVER_READY_TIMEOUT=120
+SERVER_COMPILE_MODE="none"
+SERVER_WARMUP_SIZES=""   # no warmup by default
+SERVER_DYNAMIC_BATCH=0    # no dynamic-batch warmup
 
 die() { echo "[nsys_profile] $*" >&2; exit 2; }
 
@@ -44,6 +47,9 @@ while [[ $# -gt 0 ]]; do
     --tcp) TCP="$2"; shift 2 ;;
     --client-config) CLIENT_CFG="$2"; shift 2 ;;
     --sleep) SLEEP_SECS="$2"; shift 2 ;;
+    --server-compile-mode) SERVER_COMPILE_MODE="$2"; shift 2 ;;
+    --server-warmup) SERVER_WARMUP_SIZES="$2"; shift 2 ;;
+    --server-dynamic-batch) SERVER_DYNAMIC_BATCH=1; shift ;;
     --server-timeout) SERVER_READY_TIMEOUT="$2"; shift 2 ;;
     --outdir) OUTDIR="$2"; shift 2 ;;
     --release) RELEASE=1; shift ;;
@@ -73,8 +79,11 @@ mkdir -p "$OUTDIR"
 
 SRV_OUT="$OUTDIR/server"
 CLI_OUT="$OUTDIR/client"
+SRV_LOG="$OUTDIR/server.out.log"
 
 echo "[nsys_profile] writing traces under: $OUTDIR"
+echo "[nsys_profile] server compile-mode=$SERVER_COMPILE_MODE, dynamic-batch=$SERVER_DYNAMIC_BATCH, warmup-sizes=${SERVER_WARMUP_SIZES:-none}"
+echo "[nsys_profile] server compile-mode=$SERVER_COMPILE_MODE, dynamic-batch=$SERVER_DYNAMIC_BATCH, warmup-sizes=${SERVER_WARMUP_SIZES:-none}"
 
 SRV_ADDR_FLAG=()
 if [[ -n "$UDS" ]]; then
@@ -97,25 +106,38 @@ if [[ -n "$UDS" ]]; then
   fi
 fi
 
+# No automatic multi-size warmup. We do at most a single warmup to mark batch dynamic.
+
 # Start server under nsys in background
-echo "[nsys_profile] starting server under Nsight Systems..."
+echo "[nsys_profile] starting server under Nsight Systems... (log: $SRV_LOG)"
 set -x
+NSYS_ENV_VARS="PYTHONUNBUFFERED=1,INFER_2048_LOG=0,INFER_2048_NO_CUDAGRAPHS=1"
 nsys profile \
   --force-overwrite=true \
   --sample=cpu \
   --trace=cuda,osrt,nvtx \
   --cuda-event-trace=false \
+  --env-var="$NSYS_ENV_VARS" \
   -o "$SRV_OUT" \
-  uv run infer-2048 --init "$INIT_DIR" "${SRV_ADDR_FLAG[@]}" --device "$DEVICE" --compile-mode none &
+  uv run infer-2048 --init "$INIT_DIR" "${SRV_ADDR_FLAG[@]}" --device "$DEVICE" \
+    --compile-mode "$SERVER_COMPILE_MODE" \
+    ${SERVER_WARMUP_SIZES:+--warmup-sizes "$SERVER_WARMUP_SIZES"} \
+    $( [[ $SERVER_DYNAMIC_BATCH -eq 1 ]] && echo "--dynamic-batch" ) \
+    >"$SRV_LOG" 2>&1 &
 SRV_NSYS_PID=$!
 set +x
+
+# Stream server logs to console while it starts
+tail -n +1 -F "$SRV_LOG" &
+TAIL_PID=$!
 
 # Give server time to bind; for UDS, wait until socket exists
 if [[ -n "$UDS" ]]; then
   SOCK_PATH=${UDS#unix:}
-  echo "[nsys_profile] waiting for UDS socket: $SOCK_PATH"
+  echo "[nsys_profile] waiting for UDS socket: $SOCK_PATH (timeout=${SERVER_READY_TIMEOUT}s)"
   READY=0
-  for i in {1..100}; do
+  T0=$(date +%s)
+  while true; do
     if [[ -S "$SOCK_PATH" ]]; then
       READY=1
       break
@@ -123,9 +145,17 @@ if [[ -n "$UDS" ]]; then
     if ! kill -0 "$SRV_NSYS_PID" 2>/dev/null; then
       die "Server profiler process exited early before creating socket; check Nsight output above."
     fi
+    NOW=$(date +%s)
+    if (( NOW - T0 >= SERVER_READY_TIMEOUT )); then
+      break
+    fi
     sleep 0.1
   done
-  [[ $READY -eq 1 ]] || die "Timed out waiting for UDS socket: $SOCK_PATH"
+  if [[ $READY -ne 1 ]]; then
+    echo "[nsys_profile] Timed out waiting for UDS socket. Recent server log:" >&2
+    tail -n 200 "$SRV_LOG" >&2 || true
+    die "Timed out waiting for UDS socket: $SOCK_PATH"
+  fi
 else
   sleep "$SLEEP_SECS"
 fi
@@ -169,17 +199,13 @@ if [[ $RC -ne 0 ]]; then
   die "Server not ready within ${SERVER_READY_TIMEOUT}s at ${TARGET}"
 fi
 
-# Run client under nsys (CPU/OS trace)
-echo "[nsys_profile] starting client under Nsight Systems..."
+# Run client without Nsight (server-only profiling)
+echo "[nsys_profile] starting client (no Nsight)..."
 set -x
 if [[ $RELEASE -eq 1 ]]; then
-  nsys profile --force-overwrite=true --sample=cpu --trace=osrt,nvtx -o "$CLI_OUT" \
-    --cuda-event-trace=false \
-    cargo run -p game-engine --release -- --config "$CLIENT_CFG"
+  cargo run -p game-engine --release -- --config "$CLIENT_CFG"
 else
-  nsys profile --force-overwrite=true --sample=cpu --trace=osrt,nvtx -o "$CLI_OUT" \
-    --cuda-event-trace=false \
-    cargo run -p game-engine -- --config "$CLIENT_CFG"
+  cargo run -p game-engine -- --config "$CLIENT_CFG"
 fi
 set +x
 
@@ -188,6 +214,8 @@ echo "[nsys_profile] stopping server..."
 kill $SRV_NSYS_PID || true
 wait $SRV_NSYS_PID || true
 
-echo "[nsys_profile] done. Open traces in Nsight Systems (.nsys-rep):"
+# Stop log tailer
+kill $TAIL_PID 2>/dev/null || true
+
+echo "[nsys_profile] done. Open server trace in Nsight Systems (.nsys-rep):"
 echo "  $SRV_OUT.nsys-rep"
-echo "  $CLI_OUT.nsys-rep"
