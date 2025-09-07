@@ -38,6 +38,8 @@ pub struct Orchestrator {
     pub connection: Connection,
     #[serde(default)]
     pub batch: Batch,
+    #[serde(default)]
+    pub report: Report,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -70,7 +72,7 @@ pub struct Batch {
 
 impl Default for Orchestrator {
     fn default() -> Self {
-        Self { connection: Connection::default(), batch: Batch::default() }
+        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default() }
     }
 }
 
@@ -99,6 +101,12 @@ impl Config {
         let cfg: Self = toml::from_str(&contents)?;
         Ok(cfg)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
+pub struct Report {
+    #[serde(default)]
+    pub results_file: Option<std::path::PathBuf>,
 }
 
 mod defaults {

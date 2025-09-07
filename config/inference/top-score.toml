@@ -1,6 +1,6 @@
-num_seeds = 4
+num_seeds = 512
 max_retries = 1
-max_concurrent_games = 4
+max_concurrent_games = 512
 
 [sampling]
 strategy = "Argmax"
@@ -22,3 +22,7 @@ queue_cap = 8192
 # Optional: client-side batching metrics (JSONL)
 # metrics_file = "profiles/client-metrics.jsonl"
 # metrics_interval_s = 5.0
+
+# Optional: per-game results (JSONL)
+# [orchestrator.report]
+# results_file = "runs/results.jsonl"

@@ -10,10 +10,12 @@ pub struct GameActor {
     pub game_id: u32,
     pub handle: FeederHandle,
     pub board: Board,
+    pub seed: u64,
 }
 
 pub struct GameResult {
     pub game_id: u32,
+    pub seed: u64,
     pub steps: u64,
     pub score: u64,
     pub highest_tile: u32,
@@ -30,6 +32,7 @@ impl GameActor {
             game_id,
             handle,
             board,
+            seed,
         }
     }
 
@@ -68,6 +71,7 @@ impl GameActor {
 
         GameResult {
             game_id: self.game_id,
+            seed: self.seed,
             steps,
             score: self.board.score(),
             highest_tile: self.board.highest_tile() as u32,

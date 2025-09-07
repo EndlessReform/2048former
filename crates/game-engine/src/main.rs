@@ -6,6 +6,7 @@ mod actor;
 use clap::Parser;
 use std::path::PathBuf;
 use tokio::task::JoinSet;
+use tokio::sync::mpsc;
 
 use actor::GameActor;
 use feeder::Feeder;
@@ -62,6 +63,27 @@ async fn main() {
     let (feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
     let feeder_task = feeder.spawn(client);
 
+    // Optional results writer
+    let (res_tx, mut res_rx) = mpsc::channel::<actor::GameResult>(1024);
+    let writer_handle = if let Some(path) = &config.orchestrator.report.results_file {
+        let path = path.clone();
+        Some(tokio::spawn(async move {
+            let mut file = match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Failed to open results file {}: {}", path.display(), e);
+                    return;
+                }
+            };
+            while let Some(r) = res_rx.recv().await {
+                #[derive(serde::Serialize)]
+                struct Rec { game_id: u32, seed: u64, steps: u64, score: u64, highest_tile: u32 }
+                let rec = Rec { game_id: r.game_id, seed: r.seed, steps: r.steps, score: r.score, highest_tile: r.highest_tile };
+                if let Ok(line) = serde_json::to_string(&rec) { let _ = tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes()).await; let _ = tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await; let _ = tokio::io::AsyncWriteExt::flush(&mut file).await; }
+            }
+        }))
+    } else { None };
+
     // Spawn per-game actors up to max_concurrent_games, total num_seeds games
     let total = config.num_seeds as usize;
     let max_conc = config.max_concurrent_games as usize;
@@ -85,10 +107,7 @@ async fn main() {
         if let Some(res) = set.join_next().await {
             match res {
                 Ok(r) => {
-                    println!(
-                        "game {} done | steps={} score={} top_tile={}",
-                        r.game_id, r.steps, r.score, r.highest_tile
-                    );
+                    if res_tx.capacity() > 0 { let _ = res_tx.send(r).await; } else { /* drop if backpressured */ }
                 }
                 Err(e) => {
                     eprintln!("actor task failed: {e}");
@@ -107,4 +126,6 @@ async fn main() {
     // All actors done; drop the handle so feeder can exit, then wait for it
     drop(handle);
     let _ = feeder_task.await;
+    drop(res_tx);
+    if let Some(h) = writer_handle { let _ = h.await; }
 }

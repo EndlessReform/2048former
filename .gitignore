@@ -17,7 +17,7 @@ checkpoints
 profiles
 
 # inference
-runs
+bench_runs
 
 # Added by cargo
 
