@@ -11,19 +11,11 @@ import torch
 from core_2048 import load_encoder_from_init, prepare_model_for_inference, forward_distributions
 
 
-try:
-    # Generated code expected as top-level package per proto package name
-    # i.e., train_2048/inference/v1/inference_pb2(_grpc).py under src/
-    from train_2048.inference.v1 import inference_pb2, inference_pb2_grpc
-except Exception as e:  # pragma: no cover - better message for missing codegen
-    raise RuntimeError(
-        "Protobuf stubs not found. Generate them with:\n"
-        "  uv run --project packages/infer_2048 python -m grpc_tools.protoc -I proto "
-        "--python_out=packages/infer_2048/src "
-        "--grpc_python_out=packages/infer_2048/src "
-        "proto/train_2048/inference/v1/inference.proto\n"
-        "Then re-run this server."
-    ) from e
+# Expect stubs under package-local path: src/infer_2048/proto/train_2048/inference/v1
+from infer_2048.proto.train_2048.inference.v1 import (
+    inference_pb2,
+    inference_pb2_grpc,
+)
 
 
 class InferenceService(inference_pb2_grpc.InferenceServicer):

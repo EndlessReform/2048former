@@ -4,12 +4,11 @@ Quick start
 
 - Install deps:
   - uv sync
-  - If not already present, generate protobuf stubs into src/ so that
-    Python can import `train_2048.inference.v1` directly:
+  - Generate protobuf stubs into the package-local path (required by server imports):
     uv run --project packages/infer_2048 \
       python -m grpc_tools.protoc -I proto \
-      --python_out=packages/infer_2048/src \
-      --grpc_python_out=packages/infer_2048/src \
+      --python_out=packages/infer_2048/src/infer_2048/proto \
+      --grpc_python_out=packages/infer_2048/src/infer_2048/proto \
       proto/train_2048/inference/v1/inference.proto
 
 - Run server (module mode; works without installing console script):
