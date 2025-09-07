@@ -13,8 +13,8 @@ uds_path = "/tmp/2048_infer.sock"
 [orchestrator.batch]
 # Time-based flush interval for micro-batches (microseconds)
 flush_us = 500
-target_batch = 64
-max_batch = 64
+target_batch = 128
+max_batch = 256
 inflight_batches = 2
 per_game_inflight = 8
 queue_cap = 8192

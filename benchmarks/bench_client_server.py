@@ -157,7 +157,57 @@ def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cu
         cmd += ["--uds", "unix:" + bind]
     # Only surface stderr to the console; discard stdout to avoid clutter.
     devnull = subprocess.DEVNULL
-    return subprocess.Popen(cmd, stdout=devnull, stderr=None, env=env)
+    popen_kwargs: dict = {"stdout": devnull, "stderr": None, "env": env}
+    # Start server in its own process group so we can reliably terminate the whole tree.
+    if os.name == "posix":  # Linux/macOS
+        popen_kwargs["preexec_fn"] = os.setsid  # type: ignore[assignment]
+    elif os.name == "nt":  # Windows
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    return subprocess.Popen(cmd, **popen_kwargs)
+
+
+def terminate_server(proc: subprocess.Popen, uds_norm: Optional[str], timeout: float = 5.0) -> None:
+    try:
+        if proc.poll() is not None:
+            return
+        if os.name == "posix":
+            # Send SIGINT to the whole process group (uv + python child)
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except Exception:
+                proc.send_signal(signal.SIGINT)
+        else:
+            proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+                else:
+                    proc.kill()
+                _ = proc.wait(timeout=timeout)
+    finally:
+        # Cleanup UDS path if provided
+        if uds_norm:
+            sock_path = uds_norm[5:] if uds_norm.startswith("unix:") else uds_norm
+            try:
+                if sock_path and Path(sock_path).exists():
+                    Path(sock_path).unlink(missing_ok=True)  # type: ignore[arg-type]
+            except Exception:
+                pass
 
 
 def start_client(client_cfg: Path, release: bool) -> int:
@@ -284,15 +334,7 @@ def main() -> None:
         if rc != 0:
             print(f"[bench] client exited with code {rc}", file=sys.stderr)
     finally:
-        # Stop server
-        try:
-            srv.send_signal(signal.SIGINT)
-            try:
-                srv.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                srv.kill()
-        except Exception:
-            pass
+        terminate_server(srv, uds_norm, timeout=5.0)
 
     if not args.no_summary:
         summarize_results(rp.results_file)
