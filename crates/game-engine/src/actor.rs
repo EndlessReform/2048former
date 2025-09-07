@@ -76,11 +76,14 @@ impl GameActor {
 }
 
 fn board_to_exponents(b: Board) -> [u8; 16] {
-    // ai_2048 encodes 16 exponents in a u64 (4 bits per cell), row-major
+    // ai_2048 packs 16 nibbles in a u64. To match the Python `to_exponents()`
+    // row-major ordering expected by the model, map MSB-first to (row, col).
+    // That is, nibble 15 -> index 0 (top-left), ..., nibble 0 -> index 15 (bottom-right).
     let raw = b.raw();
     let mut out = [0u8; 16];
-    for i in 0..16 {
-        out[i] = ((raw >> (i * 4)) & 0xF) as u8;
+    for idx in 0..16 {
+        let nib = 15 - idx; // MSB-first
+        out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
     }
     out
 }
