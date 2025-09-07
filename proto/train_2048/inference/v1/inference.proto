@@ -1,9 +1,6 @@
 syntax = "proto3";
 
 package train_2048.inference.v1;
-// Avoid collision with the Python package named `train_2048` by directing
-// Python codegen to place modules under a different package path.
-option python_package = "infer_2048.proto.train_2048.inference.v1";
 
 // High-level contract for 2048 inference. Versioned under `v1` for evolvability.
 // This variant returns per-head probability distributions over bins and avoids

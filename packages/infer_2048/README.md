@@ -4,11 +4,11 @@ Quick start
 
 - Install deps:
   - uv sync
-  - Generate protobuf stubs (python_package is set in the proto to avoid conflicts):
+  - Generate protobuf stubs into the package-local path (matches server import shim):
     uv run --project packages/infer_2048 \
       python -m grpc_tools.protoc -I proto \
-      --python_out=packages/infer_2048/src \
-      --grpc_python_out=packages/infer_2048/src \
+      --python_out=packages/infer_2048/src/infer_2048/proto \
+      --grpc_python_out=packages/infer_2048/src/infer_2048/proto \
       proto/train_2048/inference/v1/inference.proto
     # Files will be created under packages/infer_2048/src/infer_2048/proto/train_2048/inference/v1/
 
