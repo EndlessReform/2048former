@@ -57,27 +57,39 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             return inference_pb2.InferResponse(batch_id=request.batch_id, item_ids=[], outputs=[], latency_ms=0)
 
         # Build tokens tensor (B,16) from bytes
-        tokens_list = []
-        item_ids = []
+        tokens_list: list[list[int]] = []
+        item_ids: list[int] = []
         for it in items:
             b = it.board
             if len(b) != 16:
-                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"Item {it.id} has invalid board length {len(b)} (expected 16)")
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"Item {it.id} has invalid board length {len(b)} (expected 16)",
+                )
+            # Copy once from bytes -> Python ints; we'll upload in one shot below
             tokens_list.append([x for x in b])
             item_ids.append(int(it.id))
-        tokens = torch.tensor(tokens_list, dtype=torch.long)
+        # Single async HtoD copy by using pinned host memory
+        model_device = next(self.model.parameters()).device
+        tokens = (
+            torch.as_tensor(tokens_list, dtype=torch.long)
+            .pin_memory()
+            .to(model_device, non_blocking=True)
+        )
 
         # Forward: per-head (B, n_bins)
         head_probs = forward_distributions(self.model, tokens, set_eval=True)
 
-        # Convert to response
-        outputs = []
-        for i in range(B):
-            heads = []
-            for h in range(4):
-                probs = head_probs[h][i].detach().to("cpu", copy=False).tolist()
-                heads.append(inference_pb2.HeadProbs(probs=probs))
-            outputs.append(inference_pb2.Output(heads=heads))
+        # Convert to response with a SINGLE DtoH copy: stack heads -> (B,4,n_bins) on CPU
+        probs_all = torch.stack(head_probs, dim=1)  # (B, 4, n_bins)
+        probs_cpu = probs_all.to("cpu", non_blocking=False)
+        probs_list: list[list[list[float]]] = probs_cpu.tolist()  # B x 4 x n_bins
+        outputs = [
+            inference_pb2.Output(
+                heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
+            )
+            for i in range(B)
+        ]
 
         t1 = time.perf_counter()
         latency_ms = int((t1 - t0) * 1000.0)
@@ -89,17 +101,22 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         )
 
 
-async def serve_async(*, init_dir: str, bind: str, device: Optional[str]) -> None:
+async def serve_async(*, init_dir: str, bind: str, device: Optional[str], compile_mode: Optional[str] = "reduce-overhead") -> None:
 
     model = load_encoder_from_init(init_dir)
-    model, _ = prepare_model_for_inference(model, device=device, prefer_bf16=True, compile_mode="reduce-overhead")
+    model, _ = prepare_model_for_inference(
+        model,
+        device=device,
+        prefer_bf16=True,
+        compile_mode=compile_mode,
+    )
     svc = InferenceService(model)
 
     server = grpc.aio.server()
     inference_pb2_grpc.add_InferenceServicer_to_server(svc, server)
     server.add_insecure_port(bind)
     await server.start()
-    print(f"Inference server listening on {bind} (device={device})")
+    print(f"Inference server listening on {bind} (device={device}, compile_mode={compile_mode})")
     try:
         await server.wait_for_termination()
     except asyncio.CancelledError:

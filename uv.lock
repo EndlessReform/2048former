@@ -331,7 +331,7 @@ wheels = [
 [[package]]
 name = "infer-2048"
 version = "0.1.0"
-source = { virtual = "packages/infer_2048" }
+source = { editable = "packages/infer_2048" }
 dependencies = [
     { name = "core-2048" },
     { name = "grpcio" },
@@ -1283,11 +1283,15 @@ name = "train-2048-workspace"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "infer-2048" },
     { name = "train-2048" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "train-2048", editable = "packages/train_2048" }]
+requires-dist = [
+    { name = "infer-2048", editable = "packages/infer_2048" },
+    { name = "train-2048", editable = "packages/train_2048" },
+]
 
 [[package]]
 name = "traitlets"

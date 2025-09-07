@@ -14,6 +14,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     g.add_argument("--uds", help="UDS address, e.g., unix:/tmp/2048_infer.sock")
     g.add_argument("--tcp", help="TCP host:port, e.g., 127.0.0.1:50051")
     p.add_argument("--device", default=None, help="Device override (cuda|mps|cpu)")
+    p.add_argument(
+        "--compile-mode",
+        default="reduce-overhead",
+        help="Torch compile mode (e.g., reduce-overhead, max-autotune, or none to disable)",
+    )
     args = p.parse_args(argv)
 
     bind: str
@@ -24,9 +29,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     else:
         bind = args.tcp or "127.0.0.1:50051"
 
-    asyncio.run(serve_async(init_dir=args.init, bind=bind, device=args.device))
+    compile_mode: str | None
+    if str(args.compile_mode).lower() in {"none", "off", "disable", "disabled"}:
+        compile_mode = None
+    else:
+        compile_mode = str(args.compile_mode)
+
+    asyncio.run(
+        serve_async(
+            init_dir=args.init,
+            bind=bind,
+            device=args.device,
+            compile_mode=compile_mode,
+        )
+    )
 
 
 if __name__ == "__main__":
     main()
-
