@@ -1,33 +1,15 @@
 [project]
-name = "train-2048-transformer"
+name = "train-2048-workspace"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "ai-2048",
-    "muon-optimizer>=0.1.0",
-    "numpy>=2.3.2",
-    "pydantic>=2.11.7",
-    "safetensors>=0.6.2",
-    "torch>=2.8.0",
-    "tqdm>=4.67.1",
-    "wandb>=0.21.3",
+dependencies = ["train_2048"]
+
+[tool.uv.workspace]
+members = [
+    "packages/*",
 ]
-
-[dependency-groups]
-dev = [
-    "ipykernel>=6.30.1",
-    "pytest>=8.4.1",
-]
-
-# This may need to be updated as uv gets new minor version
-[build-system]
-requires = ["uv_build>=0.8.0,<0.9.0"]
-build-backend = "uv_build"
-
-[tool.uv.build-backend]
-module-name = ["train_2048"]
 
 [tool.uv.sources]
-ai-2048 = { git = "https://github.com/EndlessReform/2048_bench", subdirectory = "py-ai-2048" }
+train_2048 = { workspace = true }
