@@ -6,6 +6,10 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tonic::Status;
 
+/// Single inference item sent to the micro-batcher.
+/// - `id` is a stable, caller-supplied identifier used for routing
+/// - `game_id` is used for fairness/token accounting (not enforced yet)
+/// - `board` is a 4x4 grid encoded as 16 exponents (0=empty, 1=2, 2=4, ...)
 #[derive(Debug, Clone)]
 pub struct InferenceItem {
     pub id: u64,
@@ -14,8 +18,13 @@ pub struct InferenceItem {
 }
 
 /// Per-item output: 4 heads, each with probabilities over bins.
+/// Per-item output: 4 heads × n_bins probabilities (float32).
+/// The outer dimension is heads in the fixed order [Up, Down, Left, Right].
 pub type Bins = Vec<Vec<f32>>; // heads x n_bins
 
+/// Micro-batching feeder. Builds batches from a bounded queue, submits RPCs,
+/// and routes responses to per-item oneshots. Backpressure is enforced via a
+/// sliding window of in-flight items.
 pub struct Feeder {
     batch_cfg: config::Batch,
     req_rx: mpsc::Receiver<InferenceItem>,
@@ -26,6 +35,10 @@ pub struct Feeder {
 }
 
 impl Feeder {
+    /// Create a feeder and its caller-facing handle.
+    ///
+    /// Usage: let (feeder, handle) = Feeder::new(cfg.orchestrator.batch.clone());
+    ///        let _task = feeder.spawn(client);
     pub fn new(batch_cfg: config::Batch) -> (Self, FeederHandle) {
         let (req_tx, req_rx) = mpsc::channel(batch_cfg.queue_cap);
         let (completion_tx, completion_rx) = mpsc::channel::<usize>(batch_cfg.inflight_batches * 2);
@@ -41,10 +54,15 @@ impl Feeder {
         (feeder, FeederHandle { tx: req_tx, pending })
     }
 
+    /// Sender used internally to return credits when a batch completes.
     pub fn completion_sender(&self) -> mpsc::Sender<usize> {
         self.completion_tx.clone()
     }
 
+    /// Start the feeder loop on a Tokio task. Non-blocking; returns a JoinHandle.
+    ///
+    /// The caller should hold onto the returned handle (or detach) for lifecycle
+    /// management. Items are submitted via `FeederHandle::submit`.
     pub fn spawn(mut self, client: grpc::Client) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let target = self.batch_cfg.target_batch;
@@ -127,6 +145,7 @@ impl Feeder {
     }
 }
 
+/// Lightweight, cloneable handle to submit items and await their results.
 #[derive(Clone)]
 pub struct FeederHandle {
     tx: mpsc::Sender<InferenceItem>,
@@ -135,6 +154,7 @@ pub struct FeederHandle {
 
 impl FeederHandle {
     /// Submit an inference item and receive a oneshot for its per-head probabilities.
+    /// The returned Receiver yields `Bins` on success or a gRPC `Status` on failure.
     pub async fn submit(
         &self,
         id: u64,

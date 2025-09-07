@@ -1,9 +1,14 @@
 mod config;
 mod grpc;
 mod feeder;
+mod actor;
 
 use clap::Parser;
 use std::path::PathBuf;
+use tokio::task::JoinSet;
+
+use actor::GameActor;
+use feeder::Feeder;
 
 use config::Config;
 
@@ -14,12 +19,82 @@ struct Args {
     config: PathBuf,
 }
 
-fn main() {
-    println!("Hello, world!");
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args = Args::parse();
     println!("Using configuration file: {}", args.config.display());
-    let config = Config::from_toml(&args.config).unwrap();
-    // gRPC server bootstrap will be added once backend is implemented.
-    // For now, we just ensure the gRPC module compiles and is linkable.
-    let _ = config;
+    let config = match Config::from_toml(&args.config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to read config: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Initialize game engine tables if needed
+    ai_2048::engine::new();
+
+    // Establish gRPC connection (TCP only for now)
+    let conn = &config.orchestrator.connection;
+    let tcp = conn.tcp_addr.clone().unwrap_or_else(|| {
+        eprintln!("tcp_addr must be set under [orchestrator.connection] (UDS not wired yet)");
+        std::process::exit(2);
+    });
+    let client = match grpc::connect(&tcp).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to connect to inference server at {tcp}: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Start feeder
+    let (feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
+    let feeder_task = feeder.spawn(client);
+
+    // Spawn per-game actors up to max_concurrent_games, total num_seeds games
+    let total = config.num_seeds as usize;
+    let max_conc = config.max_concurrent_games as usize;
+    let mut started: usize = 0;
+    let mut finished: usize = 0;
+    let mut set: JoinSet<actor::GameResult> = JoinSet::new();
+
+    // Seed base for reproducibility across runs
+    let base_seed = 0xC0FFEEu64;
+
+    // Prime concurrent actors
+    while started < total && set.len() < max_conc {
+        let game_id = started as u32;
+        let actor = GameActor::new(game_id, handle.clone(), base_seed.wrapping_add(started as u64));
+        set.spawn(actor.run());
+        started += 1;
+    }
+
+    // Keep the pipeline full until all games complete
+    while finished < total {
+        if let Some(res) = set.join_next().await {
+            match res {
+                Ok(r) => {
+                    println!(
+                        "game {} done | steps={} score={} top_tile={}",
+                        r.game_id, r.steps, r.score, r.highest_tile
+                    );
+                }
+                Err(e) => {
+                    eprintln!("actor task failed: {e}");
+                }
+            }
+            finished += 1;
+            if started < total {
+                let game_id = started as u32;
+                let actor = GameActor::new(game_id, handle.clone(), base_seed.wrapping_add(started as u64));
+                set.spawn(actor.run());
+                started += 1;
+            }
+        }
+    }
+
+    // All actors done; drop the handle so feeder can exit, then wait for it
+    drop(handle);
+    let _ = feeder_task.await;
 }

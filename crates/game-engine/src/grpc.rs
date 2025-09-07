@@ -18,12 +18,14 @@ use tonic::transport::Channel;
 // Public alias for the generated client type
 pub type Client = InferenceClient<Channel>;
 
-/// Connect to the inference endpoint, e.g. "http://127.0.0.1:50051" or "https://…".
+/// Connect to the inference endpoint over TCP, e.g. "http://127.0.0.1:50051".
+/// For UDS support, add a separate helper using `connect_with_connector`.
 pub async fn connect<D: AsRef<str>>(dst: D) -> Result<Client, tonic::transport::Error> {
     InferenceClient::connect(dst.as_ref().to_string()).await
 }
 
-/// Example convenience call for the bins API (probabilities over bins).
+/// Convenience call for the bins API (probabilities over bins).
+/// Use this for quick tests; production code should batch via the Feeder.
 pub async fn infer_once(
     client: &mut Client,
     batch_id: Option<u64>,
