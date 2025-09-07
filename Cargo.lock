@@ -551,6 +551,7 @@ dependencies = [
  "ai-2048",
  "anyhow",
  "clap",
+ "hyper-util",
  "prost",
  "rand",
  "rayon",
@@ -560,6 +561,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
 ]
 
 [[package]]

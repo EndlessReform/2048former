@@ -16,6 +16,7 @@ tonic = "0.14.2"
 tonic-prost = "0.14.2"
 rand = { version = "0.8.5", features = ["std_rng"] }
 tower = "0.5.2"
+hyper-util = { version = "0.1.7", features = ["tokio"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

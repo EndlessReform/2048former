@@ -16,6 +16,8 @@ use pb::inference_client::InferenceClient;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tokio::net::UnixStream;
 use tower::service_fn;
+use hyper_util::rt::tokio::TokioIo;
+use std::io;
 
 // Public alias for the generated client type
 pub type Client = InferenceClient<Channel>;
@@ -35,7 +37,10 @@ pub async fn connect_uds<P: AsRef<std::path::Path>>(path: P) -> Result<Client, t
     let channel = ep
         .connect_with_connector(service_fn(move |_uri: Uri| {
             let p = path_string.clone();
-            async move { UnixStream::connect(p).await }
+            async move {
+                let stream = UnixStream::connect(p).await?;
+                Ok::<_, io::Error>(TokioIo::new(stream))
+            }
         }))
         .await?;
     Ok(InferenceClient::new(channel))
