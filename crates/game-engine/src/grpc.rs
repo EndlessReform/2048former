@@ -23,17 +23,21 @@ pub async fn connect<D: AsRef<str>>(dst: D) -> Result<Client, tonic::transport::
     InferenceClient::connect(dst.as_ref().to_string()).await
 }
 
-// Example convenience call
+/// Example convenience call for the bins API (probabilities over bins).
 pub async fn infer_once(
     client: &mut Client,
-    items: Vec<Vec<u32>>, // each is a flattened 4x4 board (len 16)
-    model_id: impl Into<String>,
-    request_id: impl Into<String>,
+    batch_id: Option<u64>,
+    model_id: Option<String>,
+    items: impl IntoIterator<Item = (u64, [u8; 16])>,
 ) -> Result<pb::InferResponse, tonic::Status> {
+    let items_pb: Vec<pb::Item> = items
+        .into_iter()
+        .map(|(id, board)| pb::Item { id, board: board.to_vec() })
+        .collect();
     let req = pb::InferRequest {
-        model_id: model_id.into(),
-        items: items.into_iter().map(|ids| pb::Tokens { ids }).collect(),
-        request_id: request_id.into(),
+        model_id: model_id.unwrap_or_default(),
+        items: items_pb,
+        batch_id: batch_id.unwrap_or_default(),
     };
     let resp = client.infer(req).await?.into_inner();
     Ok(resp)

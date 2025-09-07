@@ -1,5 +1,6 @@
 mod config;
 mod grpc;
+mod feeder;
 
 use clap::Parser;
 use std::path::PathBuf;

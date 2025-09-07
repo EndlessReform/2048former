@@ -3,12 +3,16 @@ syntax = "proto3";
 package train_2048.inference.v1;
 
 // High-level contract for 2048 inference. Versioned under `v1` for evolvability.
+// This variant returns per-head probability distributions over bins and avoids
+// leaking backend/dtype/padding details into the wire format.
 
-// A single model input sequence, flattened 1D tokens matching the encoder input.
-// For the 2048 board this is typically 16 exponents in row-major order
-// (0 = empty, 1 = 2, 2 = 4, ...), but the length may vary with future models.
-message Tokens {
-  repeated uint32 ids = 1; // len usually == 16 for 4x4 boards
+// A single inference item: caller-provided id and a compact board encoding.
+message Item {
+  // Stable, caller-supplied identifier for routing results.
+  uint64 id = 1;
+  // Board exponents in row-major order. Exactly 16 bytes for a 4x4 board.
+  // 0 = empty, 1 = 2, 2 = 4, ...
+  bytes board = 2; // len == 16
 }
 
 // Request a batched inference over one or more boards.
@@ -16,41 +20,42 @@ message InferRequest {
   // Optional logical identifier of the model or init to route against.
   string model_id = 1;
 
-  // Batch of inputs to evaluate, each is a flattened token sequence.
-  repeated Tokens items = 2;
+  // Batch of inputs to evaluate.
+  repeated Item items = 2;
 
-  // Client-provided correlation identifier echoed in the response.
-  string request_id = 3;
+  // Optional batch identifier for telemetry/correlation.
+  uint64 batch_id = 3;
 }
 
-// Per-board output: policy logits and optional scalar value.
-// Per-item output: per-head log probabilities over bins.
+// A single head's distribution as probabilities over bins.
+message HeadProbs {
+  // Probabilities (sum ~ 1.0). len == n_bins, shared across heads.
+  repeated float probs = 1;
+}
+
+// Per-board output: per-head probability distributions.
 // Heads are ordered [Up, Down, Left, Right] to match dataset order.
 message Output {
-  // For each of the 4 heads, a vector of log-probabilities (natural log)
-  // over the model's n_bins for that head. All heads share the same n_bins.
   // Shape conceptually: (4, n_bins)
-  repeated HeadLogProbs heads = 1;
-}
-
-// A single head's distribution as log-probabilities over bins.
-message HeadLogProbs {
-  repeated float logprobs = 1; // len == n_bins
+  repeated HeadProbs heads = 1;
 }
 
 // Batched inference response.
 message InferResponse {
-  // One output per input board (same order as request).
-  repeated Output outputs = 1;
+  // Echoed from request if provided.
+  uint64 batch_id = 1;
 
-  // Echoed from request for correlation.
-  string request_id = 2;
+  // Item identifiers in the same order as outputs.
+  repeated uint64 item_ids = 2;
+
+  // One output per input board (same order as item_ids).
+  repeated Output outputs = 3;
 
   // Server-measured latency in milliseconds for the batch, if available.
-  uint64 latency_ms = 3;
+  uint64 latency_ms = 4;
 }
 
 service Inference {
-  // Compute per-head log-probability distributions over bins for each input.
+  // Compute per-head probability distributions over bins for each input.
   rpc Infer (InferRequest) returns (InferResponse);
 }
