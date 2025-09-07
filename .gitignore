@@ -13,3 +13,7 @@ inits
 output
 *.a2pack
 checkpoints
+
+# Added by cargo
+
+/target

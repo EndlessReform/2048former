@@ -1,0 +1,6 @@
+num_seeds = 256
+max_retries = 3
+max_concurrent_games = 8
+
+[sampling]
+strategy = "argmax"

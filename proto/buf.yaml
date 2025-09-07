@@ -1,0 +1,9 @@
+version: v1
+name: buf.build/local/train_2048
+lint:
+  use:
+    - DEFAULT
+breaking:
+  use:
+    - FILE
+

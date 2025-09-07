@@ -1,0 +1,4 @@
+[workspace]
+members=["crates/game-engine"]
+resolver = "3"
+
