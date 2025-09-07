@@ -4,12 +4,13 @@ Quick start
 
 - Install deps:
   - uv sync
-  - Generate protobuf stubs into the package-local path (required by server imports):
+  - Generate protobuf stubs (python_package is set in the proto to avoid conflicts):
     uv run --project packages/infer_2048 \
       python -m grpc_tools.protoc -I proto \
-      --python_out=packages/infer_2048/src/infer_2048/proto \
-      --grpc_python_out=packages/infer_2048/src/infer_2048/proto \
+      --python_out=packages/infer_2048/src \
+      --grpc_python_out=packages/infer_2048/src \
       proto/train_2048/inference/v1/inference.proto
+    # Files will be created under packages/infer_2048/src/infer_2048/proto/train_2048/inference/v1/
 
 - Run server (module mode; works without installing console script):
   - UDS: uv run --project packages/infer_2048 python -m infer_2048.main --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
