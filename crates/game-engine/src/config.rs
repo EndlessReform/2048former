@@ -3,8 +3,9 @@ use std::io::Read;
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub enum SamplingStrategyKind {
     Argmax,
-    // Future strategies can be added here, e.g.
-    // SoftMax { temperature: f64 },
+    /// Softmax over bin-1 values across heads
+    Softmax,
+    // Future strategies can be added here
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -17,6 +18,16 @@ pub struct SamplingStrategy {
     // and will default to `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+}
+
+impl SamplingStrategy {
+    /// Resolve temperature to a sane default (1.0) if not provided.
+    pub fn temperature_or_default(&self) -> f64 {
+        match self.temperature {
+            Some(t) if t.is_finite() && t > 0.0 => t,
+            _ => 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]

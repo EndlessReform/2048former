@@ -1,9 +1,12 @@
-num_seeds = 512
+num_seeds = 256
 max_retries = 1
-max_concurrent_games = 512
+max_concurrent_games = 256
 
 [sampling]
-strategy = "Argmax"
+# strategy = "Argmax"
+# To use softmax sampling instead, uncomment the following and adjust temperature as needed:
+strategy = "Softmax"
+temperature = 1
 
 [orchestrator.connection]
 # One of uds_path or tcp_addr must be set for the Python server.

@@ -1,7 +1,9 @@
 use crate::feeder::{Bins, FeederHandle};
+use crate::config;
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::SeedableRng;
+use rand::distributions::Distribution;
 use tokio::task::JoinHandle;
 
 /// Per-game actor that drives a single board to completion by
@@ -11,6 +13,7 @@ pub struct GameActor {
     pub handle: FeederHandle,
     pub board: Board,
     pub seed: u64,
+    pub sampling: config::SamplingStrategy,
 }
 
 pub struct GameResult {
@@ -22,7 +25,7 @@ pub struct GameResult {
 }
 
 impl GameActor {
-    pub fn new(game_id: u32, handle: FeederHandle, seed: u64) -> Self {
+    pub fn new(game_id: u32, handle: FeederHandle, seed: u64, sampling: config::SamplingStrategy) -> Self {
         // Initialize a fresh board with two random tiles
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut board: Board = Board::EMPTY;
@@ -33,6 +36,7 @@ impl GameActor {
             handle,
             board,
             seed,
+            sampling,
         }
     }
 
@@ -56,9 +60,9 @@ impl GameActor {
                     break;
                 }
             };
-            // Compute legal mask and select move according to model semantics (max-p1)
+            // Compute legal mask and select move according to configured sampling strategy
             let legal = legal_mask(self.board);
-            let mv = select_move_max_p1(&bins, &legal);
+            let mv = select_move(&bins, &legal, &self.sampling, &mut rng);
             if let Some(m) = mv {
                 // Apply move and spawn new tile using the Board API
                 self.board = self.board.make_move(m, &mut rng);
@@ -142,4 +146,61 @@ fn select_move_max_p1(bins: &Bins, legal: &[bool; 4]) -> Option<Move> {
         2 => Move::Left,
         _ => Move::Right,
     })
+}
+
+fn select_move_softmax(bins: &Bins, legal: &[bool; 4], temperature: f32, rng: &mut rand::rngs::StdRng) -> Option<Move> {
+    if bins.len() != 4 { return None; }
+    let n_bins = bins[0].len();
+    if n_bins == 0 { return None; }
+    let one_idx = n_bins - 1; // dedicated '1' bin at the end
+
+    // Collect p1 for legal moves only
+    let mut p1 = [0.0f32; 4];
+    let mut any_legal = false;
+    for (i, head) in bins.iter().enumerate() {
+        if !legal[i] { continue; }
+        any_legal = true;
+        p1[i] = *head.get(one_idx).unwrap_or(&0.0);
+    }
+
+    if !any_legal { return select_move_max_p1(bins, legal); }
+
+    let t = if temperature.is_finite() && temperature > 0.0 { temperature } else { 1.0 };
+
+    // Treat provided values as probabilities and apply temperature via log-probs:
+    // weights ∝ exp((ln p) / t) == p^(1/t). Use max ln for stability.
+    let mut max_ln = f32::NEG_INFINITY;
+    for &p in &p1 {
+        if p > 0.0 && p.is_finite() { let ln = p.ln(); if ln > max_ln { max_ln = ln; } }
+    }
+    let mut weights = [0.0f64; 4];
+    for (i, &p) in p1.iter().enumerate() {
+        if !legal[i] || !(p > 0.0) { continue; }
+        let ln = p.ln();
+        let z = ((ln - max_ln) / t) as f64;
+        weights[i] = z.exp();
+    }
+
+    // If all weights are zero (numeric underflow), fallback to argmax
+    if weights.iter().all(|&w| w == 0.0) {
+        return select_move_max_p1(bins, legal);
+    }
+
+    // Sample index according to weights
+    let dist = match rand::distributions::WeightedIndex::new(&weights) {
+        Ok(d) => d,
+        Err(_) => return select_move_max_p1(bins, legal),
+    };
+    let idx = dist.sample(rng);
+    Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
+}
+
+fn select_move(bins: &Bins, legal: &[bool; 4], sampling: &config::SamplingStrategy, rng: &mut rand::rngs::StdRng) -> Option<Move> {
+    match sampling.kind {
+        config::SamplingStrategyKind::Argmax => select_move_max_p1(bins, legal),
+        config::SamplingStrategyKind::Softmax => {
+            let t = sampling.temperature_or_default() as f32;
+            select_move_softmax(bins, legal, t, rng)
+        }
+    }
 }

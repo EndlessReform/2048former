@@ -97,7 +97,12 @@ async fn main() {
     // Prime concurrent actors
     while started < total && set.len() < max_conc {
         let game_id = started as u32;
-        let actor = GameActor::new(game_id, handle.clone(), base_seed.wrapping_add(started as u64));
+        let actor = GameActor::new(
+            game_id,
+            handle.clone(),
+            base_seed.wrapping_add(started as u64),
+            config.sampling.clone(),
+        );
         set.spawn(actor.run());
         started += 1;
     }
@@ -116,7 +121,12 @@ async fn main() {
             finished += 1;
             if started < total {
                 let game_id = started as u32;
-                let actor = GameActor::new(game_id, handle.clone(), base_seed.wrapping_add(started as u64));
+                let actor = GameActor::new(
+                    game_id,
+                    handle.clone(),
+                    base_seed.wrapping_add(started as u64),
+                    config.sampling.clone(),
+                );
                 set.spawn(actor.run());
                 started += 1;
             }
