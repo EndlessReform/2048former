@@ -4,9 +4,26 @@ max_concurrent_games = 256
 
 [sampling]
 # strategy = "Argmax"
-# To use softmax sampling instead, uncomment the following and adjust temperature as needed:
-strategy = "Softmax"
-temperature = 1
+
+## Alternative strategies:
+# Softmax over p1 across heads
+# strategy = "Softmax"
+# temperature = 0.25
+
+# Nucleus (top-p) with top-k cap (default k=2) over heads (uses p1 as score)
+# strategy = "TopPTopK"
+# top_p = 0.80
+# top_k = 2
+# temperature = 0.25
+
+# Tail aggregation: score = p1 + alpha_p2 * p2 + beta_p3 * p3
+# p1=exact-1 bin, p2=second-to-last bin, p3=third-to-last bin.
+strategy = "TailAgg"
+alpha_p2 = 0.20
+
+# Advanced tail aggregation (takes precedence over alpha/beta if set):
+tail_bins = 4    # number of extra bins to include below p1
+tail_decay = 0.2 # weight decay per bin: p2 weight=1.0, p3=0.5, p4=0.25, ...
 
 [orchestrator.connection]
 # One of uds_path or tcp_addr must be set for the Python server.

@@ -4,7 +4,7 @@ use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::SeedableRng;
 use rand::distributions::Distribution;
-use tokio::task::JoinHandle;
+// use tokio::task::JoinHandle;
 
 /// Per-game actor that drives a single board to completion by
 /// querying the model via the Feeder and applying selected moves.
@@ -195,12 +195,153 @@ fn select_move_softmax(bins: &Bins, legal: &[bool; 4], temperature: f32, rng: &m
     Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
 }
 
+fn select_move_top_p_top_k(bins: &Bins, legal: &[bool; 4], top_p: f32, top_k: usize, temperature: f32, rng: &mut rand::rngs::StdRng) -> Option<Move> {
+    if bins.len() != 4 { return None; }
+    let n_bins = bins[0].len();
+    if n_bins == 0 { return None; }
+    let one_idx = n_bins - 1;
+
+    // Collect p1 across legal heads
+    let mut scores = [0.0f64; 4];
+    let mut legal_count = 0usize;
+    for (i, head) in bins.iter().enumerate() {
+        if !legal[i] { continue; }
+        let p1 = *head.get(one_idx).unwrap_or(&0.0);
+        scores[i] = p1 as f64;
+        legal_count += 1;
+    }
+    if legal_count == 0 { return None; }
+
+    // If only one legal, take it
+    if legal_count == 1 {
+        let idx = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i)?;
+        return Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right });
+    }
+
+    // Normalize scores to distribution over legal heads
+    let sum_s: f64 = scores.iter().sum();
+    if sum_s <= 0.0 {
+        // degenerate: fallback to argmax p1
+        return select_move_max_p1(bins, legal);
+    }
+    let mut w: Vec<(usize, f64)> = (0..4).filter(|&i| legal[i]).map(|i| (i, scores[i] / sum_s)).collect();
+    // Sort descending by weight
+    w.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    // Build nucleus up to cumulative >= top_p
+    let p = top_p.clamp(0.0, 1.0) as f64;
+    let mut nucleus: Vec<(usize, f64)> = Vec::with_capacity(4);
+    let mut cum = 0.0f64;
+    for (i, wi) in w.into_iter() {
+        if wi <= 0.0 { continue; }
+        nucleus.push((i, wi));
+        cum += wi;
+        if cum >= p { break; }
+    }
+    if nucleus.is_empty() {
+        // Shouldn't happen if sum_s>0; fallback
+        return select_move_max_p1(bins, legal);
+    }
+
+    // Cap to top-k (default 2)
+    let k = top_k.max(1).min(nucleus.len());
+    nucleus.truncate(k);
+
+    // Temperature shaping: weights ∝ exp((ln w)/T)
+    let t = if temperature.is_finite() && temperature > 0.0 { temperature } else { 1.0 } as f64;
+    let mut max_ln = f64::NEG_INFINITY;
+    for &(_, wi) in &nucleus { let lnw = wi.ln(); if lnw > max_ln { max_ln = lnw; } }
+    let mut weights: Vec<f64> = Vec::with_capacity(nucleus.len());
+    for &(_, wi) in &nucleus {
+        let lnw = wi.ln();
+        let z = (lnw - max_ln) / t;
+        weights.push(z.exp());
+    }
+    // If all weights underflow, fallback to argmax p1
+    if weights.iter().all(|&x| x == 0.0) {
+        return select_move_max_p1(bins, legal);
+    }
+    let dist = match rand::distributions::WeightedIndex::new(&weights) {
+        Ok(d) => d,
+        Err(_) => return select_move_max_p1(bins, legal),
+    };
+    let pick = dist.sample(rng);
+    let idx = nucleus[pick].0;
+    Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
+}
+
+fn select_move_tail_agg_simple(bins: &Bins, legal: &[bool; 4], alpha_p2: f32, beta_p3: f32) -> Option<Move> {
+    if bins.len() != 4 { return None; }
+    let n_bins = bins[0].len();
+    if n_bins == 0 { return None; }
+    let one_idx = n_bins.saturating_sub(1);
+    let two_idx = n_bins.saturating_sub(2);
+    let three_idx = n_bins.saturating_sub(3);
+
+    let mut best_i: Option<usize> = None;
+    let mut best_s: f32 = f32::NEG_INFINITY;
+    for (i, head) in bins.iter().enumerate() {
+        if !legal[i] { continue; }
+        let p1 = *head.get(one_idx).unwrap_or(&0.0);
+        let p2 = if two_idx < n_bins { *head.get(two_idx).unwrap_or(&0.0) } else { 0.0 };
+        let p3 = if three_idx < n_bins { *head.get(three_idx).unwrap_or(&0.0) } else { 0.0 };
+        let s = p1 + alpha_p2 * p2 + beta_p3 * p3;
+        if s > best_s { best_s = s; best_i = Some(i); }
+    }
+    let idx = best_i?;
+    Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
+}
+
+fn select_move_tail_agg_adv(bins: &Bins, legal: &[bool; 4], extra_bins: usize, decay: f32) -> Option<Move> {
+    if bins.len() != 4 { return None; }
+    let n_bins = bins[0].len();
+    if n_bins == 0 { return None; }
+    let one_idx = n_bins - 1; // p1
+    let max_extra = extra_bins.min(one_idx); // cannot include below first bin
+
+    let mut best_i: Option<usize> = None;
+    let mut best_s: f32 = f32::NEG_INFINITY;
+    for (i, head) in bins.iter().enumerate() {
+        if !legal[i] { continue; }
+        let mut s = *head.get(one_idx).unwrap_or(&0.0); // always include p1 with weight 1
+        // Add p2.. with geometric decay: weight for p2 is 1.0, p3 is decay, p4 is decay^2, ...
+        let mut w = 1.0f32;
+        for j in 1..=max_extra { // j=1 -> p2
+            let idx = one_idx.saturating_sub(j);
+            let pj = *head.get(idx).unwrap_or(&0.0);
+            s += w * pj;
+            w *= decay.max(0.0).min(1.0);
+            if w == 0.0 { break; }
+        }
+        if s > best_s { best_s = s; best_i = Some(i); }
+    }
+    let idx = best_i?;
+    Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
+}
+
 fn select_move(bins: &Bins, legal: &[bool; 4], sampling: &config::SamplingStrategy, rng: &mut rand::rngs::StdRng) -> Option<Move> {
     match sampling.kind {
         config::SamplingStrategyKind::Argmax => select_move_max_p1(bins, legal),
         config::SamplingStrategyKind::Softmax => {
             let t = sampling.temperature_or_default() as f32;
             select_move_softmax(bins, legal, t, rng)
+        }
+        config::SamplingStrategyKind::TopPTopK => {
+            let p = sampling.top_p_or_default() as f32;
+            let k = sampling.top_k_or_default();
+            let t = sampling.temperature_or_default() as f32;
+            select_move_top_p_top_k(bins, legal, p, k, t, rng)
+        }
+        config::SamplingStrategyKind::TailAgg => {
+            let extra = sampling.tail_bins_or_zero();
+            if extra > 0 {
+                let decay = sampling.tail_decay_or_default() as f32;
+                select_move_tail_agg_adv(bins, legal, extra, decay)
+            } else {
+                let a = sampling.alpha_p2_or_default() as f32;
+                let b = sampling.beta_p3_or_default() as f32;
+                select_move_tail_agg_simple(bins, legal, a, b)
+            }
         }
     }
 }
