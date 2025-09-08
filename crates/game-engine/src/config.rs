@@ -9,6 +9,9 @@ pub enum SamplingStrategyKind {
     TopPTopK,
     /// Tail aggregation over near-1 bins: score = p1 + alpha_p2*p2 + beta_p3*p3 (argmax)
     TailAgg,
+    /// Tail aggregation with confidence-based weighting of p2 using margin (p1 - p2):
+    /// score = p1 + w(margin) * p2, where w(m) = alpha / (1 + beta*m)^gamma.
+    TailAggConf,
     // Future strategies can be added here
 }
 
@@ -58,6 +61,14 @@ pub struct SamplingStrategy {
     pub start_gate: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_gate: Option<u64>,
+
+    // Confidence-based tail aggregation parameters (TailAggConf)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conf_alpha: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conf_beta: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conf_gamma: Option<f64>,
 }
 
 impl SamplingStrategy {
@@ -106,6 +117,21 @@ impl SamplingStrategy {
 
     /// Optional step count at which to stop applying non-argmax sampling.
     pub fn stop_gate(&self) -> Option<u64> { self.stop_gate }
+
+    /// Max p2 weight at zero margin (TailAggConf). Defaults to 0.20.
+    pub fn conf_alpha_or_default(&self) -> f64 {
+        match self.conf_alpha { Some(a) if a.is_finite() && a >= 0.0 => a, _ => 0.20 }
+    }
+
+    /// Slope for margin-to-weight mapping (TailAggConf). Defaults to 10.0.
+    pub fn conf_beta_or_default(&self) -> f64 {
+        match self.conf_beta { Some(b) if b.is_finite() && b >= 0.0 => b, _ => 10.0 }
+    }
+
+    /// Exponent shaping for margin-to-weight mapping (TailAggConf). Defaults to 1.0.
+    pub fn conf_gamma_or_default(&self) -> f64 {
+        match self.conf_gamma { Some(g) if g.is_finite() && g > 0.0 => g, _ => 1.0 }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]

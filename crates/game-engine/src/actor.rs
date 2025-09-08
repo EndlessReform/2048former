@@ -333,6 +333,36 @@ fn select_move_tail_agg_adv(bins: &Bins, legal: &[bool; 4], extra_bins: usize, d
     Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
 }
 
+fn select_move_tail_agg_conf(bins: &Bins, legal: &[bool; 4], alpha: f32, beta: f32, gamma: f32) -> Option<Move> {
+    if bins.len() != 4 { return None; }
+    let n_bins = bins[0].len();
+    if n_bins < 2 { return select_move_max_p1(bins, legal); }
+    let one_idx = n_bins - 1; // p1
+    let two_idx = n_bins - 2; // p2
+
+    let mut best_i: Option<usize> = None;
+    let mut best_s: f32 = f32::NEG_INFINITY;
+    for (i, head) in bins.iter().enumerate() {
+        if !legal[i] { continue; }
+        let p1 = *head.get(one_idx).unwrap_or(&0.0);
+        let p2 = *head.get(two_idx).unwrap_or(&0.0);
+        // Margin between top bin and second bin (confidence proxy)
+        let mut m = p1 - p2;
+        if !m.is_finite() { m = 0.0; }
+        if m < 0.0 { m = 0.0; }
+        // w(m) = alpha / (1 + beta*m)^gamma
+        let a = if alpha.is_finite() && alpha >= 0.0 { alpha } else { 0.20 };
+        let b = if beta.is_finite() && beta >= 0.0 { beta } else { 10.0 };
+        let g = if gamma.is_finite() && gamma > 0.0 { gamma } else { 1.0 };
+        let denom = 1.0 + b * m;
+        let w = if denom > 0.0 { a / denom.powf(g) } else { a };
+        let s = p1 + w * p2;
+        if s > best_s { best_s = s; best_i = Some(i); }
+    }
+    let idx = best_i?;
+    Some(match idx { 0 => Move::Up, 1 => Move::Down, 2 => Move::Left, _ => Move::Right })
+}
+
 fn select_move(bins: &Bins, legal: &[bool; 4], sampling: &config::SamplingStrategy, rng: &mut rand::rngs::StdRng) -> Option<Move> {
     match sampling.kind {
         config::SamplingStrategyKind::Argmax => select_move_max_p1(bins, legal),
@@ -356,6 +386,12 @@ fn select_move(bins: &Bins, legal: &[bool; 4], sampling: &config::SamplingStrate
                 let b = sampling.beta_p3_or_default() as f32;
                 select_move_tail_agg_simple(bins, legal, a, b)
             }
+        }
+        config::SamplingStrategyKind::TailAggConf => {
+            let a = sampling.conf_alpha_or_default() as f32;
+            let b = sampling.conf_beta_or_default() as f32;
+            let g = sampling.conf_gamma_or_default() as f32;
+            select_move_tail_agg_conf(bins, legal, a, b, g)
         }
     }
 }

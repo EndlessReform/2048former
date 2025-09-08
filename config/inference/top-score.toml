@@ -18,9 +18,9 @@ max_concurrent_games = 256
 
 # Tail aggregation: score = p1 + alpha_p2 * p2 + beta_p3 * p3
 # p1=exact-1 bin, p2=second-to-last bin, p3=third-to-last bin.
-strategy = "TailAgg"
-alpha_p2 = 0.25
-beta_p2 = 0.025
+# strategy = "TailAgg"
+# alpha_p2 = 0.25
+# beta_p2 = 0.025
 
 # Advanced tail aggregation (takes precedence over alpha/beta if set):
 #tail_bins = 4    # number of extra bins to include below p1
@@ -28,8 +28,14 @@ beta_p2 = 0.025
 
 # Optional: gates for when to apply non-argmax sampling
 # Only relevant if strategy != "Argmax". Outside the window, fall back to argmax.
-start_gate = 10000 # default: 0 (enable from the first move)
+# start_gate = 10000 # default: 0 (enable from the first move)
 # stop_gate = 64   # default: unset (never stop)
+
+## Alternative: Tail aggregation with confidence-based p2 weighting (margin-based)
+strategy = "TailAggConf"
+conf_alpha = 0.25        # max p2 weight when margin (p1-p2) is near zero
+conf_beta = 12.0         # slope: larger -> faster decay of p2 weight as margin grows
+conf_gamma = 1.0         # curvature of decay (1.0=rational, >1 steeper, <1 flatter)
 
 [orchestrator.connection]
 # One of uds_path or tcp_addr must be set for the Python server.
