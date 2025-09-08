@@ -81,6 +81,108 @@ def write_toml(d: dict, path: Path) -> None:
                 emit_table(fp, "orchestrator.report", orch["report"])  # results_file
 
 
+def _sampling_grid_variants(base_cfg: dict) -> list[tuple[str, dict]]:
+    """Detect arrays under [sampling] and return (label, cfg_variant) for each Cartesian combo.
+
+    Supported array-eligible keys: any scalar field under [sampling], including strategy.
+    If no arrays are present, returns a single ("base", base_cfg) entry.
+    """
+    import itertools
+
+    def is_array(x) -> bool:
+        return isinstance(x, list) and len(x) > 0
+
+    cfg = json.loads(json.dumps(base_cfg))  # deep copy via JSON
+    s = cfg.get("sampling", {})
+    # Collect keys with array values (sorted for stable labeling)
+    keys: list[str] = []
+    values: list[list[object]] = []
+    for k in sorted(s.keys()):
+        v = s[k]
+        if is_array(v):
+            keys.append(k)
+            values.append(list(v))
+
+    if not keys:
+        return [("base", cfg)]
+
+    variants: list[tuple[str, dict]] = []
+    for combo in itertools.product(*values):
+        var = json.loads(json.dumps(cfg))
+        # Apply scalar choices
+        for k, val in zip(keys, combo):
+            var.setdefault("sampling", {})[k] = val
+        # Build stable, short-ish label
+        parts: list[str] = []
+        for k, val in zip(keys, combo):
+            sval = str(val)
+            sval = sval.replace("/", "_").replace(":", "_").replace(" ", "").replace(",", "-")
+            sval = sval.replace(".", "p")  # make FS friendly
+            parts.append(f"{k}-{sval}")
+        label = "_".join(parts)
+        variants.append((label, var))
+    return variants
+
+
+def _collect_run_metrics(results_file: Path) -> dict:
+    scores, steps, tops = [], [], []
+    if not results_file.exists():
+        return {"games": 0}
+    with open(results_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            scores.append(int(rec["score"]))
+            steps.append(int(rec["steps"]))
+            tops.append(int(rec["highest_tile"]))
+    import statistics
+    if not scores:
+        return {"games": 0}
+    thresholds = [1024, 2048, 4096, 8192, 16384, 32768]
+    reached_counts = {thr: sum(1 for t in tops if t >= thr) for thr in thresholds}
+    return {
+        "games": len(scores),
+        "score_mean": float(statistics.fmean(scores)),
+        "score_max": int(max(scores)),
+        "score_min": int(min(scores)),
+        "steps_mean": float(statistics.fmean(steps)),
+        "steps_max": int(max(steps)),
+        "steps_min": int(min(steps)),
+        "top_max": int(max(tops)),
+        **{f"reach_{thr}": reached_counts[thr] for thr in thresholds},
+    }
+
+
+def _write_grid_csv_summary(outdir: Path, rows: list[dict]) -> None:
+    if not rows:
+        return
+    # Determine columns
+    cols = [
+        "label",
+        "games",
+        "score_mean",
+        "score_max",
+        "score_min",
+        "steps_mean",
+        "steps_max",
+        "steps_min",
+        "top_max",
+        "reach_1024",
+        "reach_2048",
+        "reach_4096",
+        "reach_8192",
+        "reach_16384",
+        "reach_32768",
+    ]
+    path = outdir / "grid_summary.csv"
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(",".join(cols) + "\n")
+        for r in rows:
+            fp.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
+
+
 def make_client_cfg(base_cfg_path: Path, rp: RunPaths, uds: Optional[str], tcp: Optional[str]) -> Path:
     cfg = read_toml(base_cfg_path)
     # Ensure nested tables exist
@@ -101,6 +203,38 @@ def make_client_cfg(base_cfg_path: Path, rp: RunPaths, uds: Optional[str], tcp: 
     report.setdefault("results_file", str(rp.results_file))
     write_toml(cfg, rp.client_cfg)
     return rp.client_cfg
+
+
+def make_client_cfg_for_variant(
+    base_cfg: dict,
+    base_outdir: Path,
+    label: str,
+    uds: Optional[str],
+    tcp: Optional[str],
+) -> Path:
+    cfg = json.loads(json.dumps(base_cfg))  # deep copy
+    orch = cfg.setdefault("orchestrator", {})
+    conn = orch.setdefault("connection", {})
+    batch = orch.setdefault("batch", {})
+    report = orch.setdefault("report", {})
+
+    # Connection override
+    if uds:
+        conn["uds_path"] = uds
+        conn.pop("tcp_addr", None)
+    elif tcp:
+        conn["tcp_addr"] = tcp
+        conn.pop("uds_path", None)
+
+    subdir = base_outdir / label
+    subdir.mkdir(parents=True, exist_ok=True)
+    batch.setdefault("metrics_file", str(subdir / "client-metrics.jsonl"))
+    batch.setdefault("metrics_interval_s", 5.0)
+    report.setdefault("results_file", str(subdir / "results.jsonl"))
+
+    path = subdir / "client-config.toml"
+    write_toml(cfg, path)
+    return path
 
 
 def wait_for_socket(uds: Optional[str], pid: int, timeout_s: float) -> None:
@@ -266,6 +400,7 @@ def main() -> None:
     ap.add_argument("--no-summary", action="store_true", help="Skip printing summary at the end")
     ap.add_argument("--debug", action="store_true", help="Run client in debug (non-release) mode")
     ap.add_argument("--timeout", type=float, default=120.0, help="Server readiness timeout seconds")
+    ap.add_argument("--grid-resume", action="store_true", help="Skip variants with an existing results.jsonl")
 
     args = ap.parse_args()
     rp = ensure_outdir(args.outdir)
@@ -298,11 +433,20 @@ def main() -> None:
         else:
             tcp_norm = str(bind)
 
-    client_cfg = make_client_cfg(Path(args.config), rp, uds=uds_norm[5:] if uds_norm else None, tcp=tcp_norm)
+    base_cfg = read_toml(Path(args.config))
+    variants = _sampling_grid_variants(base_cfg)
 
-    print(f"[bench] output dir: {rp.outdir}")
-    print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
-    print(f"[bench] client config: {client_cfg}")
+    # If no grid present, behave like before with a single config.
+    single_cfg = None
+    if len(variants) == 1 and variants[0][0] == "base":
+        client_cfg = make_client_cfg(Path(args.config), rp, uds=uds_norm[5:] if uds_norm else None, tcp=tcp_norm)
+        single_cfg = client_cfg
+        print(f"[bench] output dir: {rp.outdir}")
+        print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
+        print(f"[bench] client config: {client_cfg}")
+    else:
+        print(f"[bench] output dir: {rp.outdir}  (grid {len(variants)} variants)")
+        print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
 
     # Persist run metadata for provenance
     meta = {
@@ -323,21 +467,54 @@ def main() -> None:
     with rp.meta_file.open("w", encoding="utf-8") as fp:
         json.dump(meta, fp, indent=2)
 
-    # Start server
+    # Start server (once for all variants)
     srv = start_server(args.init, uds_norm or tcp_norm, args.device, args.compile_mode, args.no_cudagraphs)
     try:
         # Wait for bind and readiness
         wait_for_socket(uds_norm, srv.pid, args.timeout)
         probe_grpc_ready(uds_norm or tcp_norm, args.timeout)
-        # Start client
-        rc = start_client(client_cfg, release=(not args.debug))
-        if rc != 0:
-            print(f"[bench] client exited with code {rc}", file=sys.stderr)
+        if single_cfg is not None:
+            # Single run
+            rc = start_client(single_cfg, release=(not args.debug))
+            if rc != 0:
+                print(f"[bench] client exited with code {rc}", file=sys.stderr)
+        else:
+            # Grid search: run each variant sequentially
+            grid_rows: list[dict] = []
+            for idx, (label, cfg_variant) in enumerate(variants):
+                cfg_path = make_client_cfg_for_variant(
+                    cfg_variant,
+                    rp.outdir,
+                    f"grid_{idx:03d}_" + label,
+                    uds=uds_norm[5:] if uds_norm else None,
+                    tcp=tcp_norm,
+                )
+                print(f"[bench] grid[{idx+1}/{len(variants)}] -> {cfg_path}")
+                res_file = cfg_path.parent / "results.jsonl"
+                if args.grid_resume and res_file.exists() and res_file.stat().st_size > 0:
+                    print("[bench] resume: results exist, skipping")
+                else:
+                    rc = start_client(cfg_path, release=(not args.debug))
+                    if rc != 0:
+                        print(f"[bench] client exited with code {rc}", file=sys.stderr)
+                # accumulate metrics row
+                row = {"label": label}
+                row.update(_collect_run_metrics(res_file))
+                grid_rows.append(row)
+            _write_grid_csv_summary(rp.outdir, grid_rows)
     finally:
         terminate_server(srv, uds_norm, timeout=5.0)
 
     if not args.no_summary:
-        summarize_results(rp.results_file)
+        if single_cfg is not None:
+            summarize_results(rp.results_file)
+        else:
+            # Summarize each variant's results
+            for idx, (label, _cfg_variant) in enumerate(variants):
+                res_file = rp.outdir / (f"grid_{idx:03d}_" + label) / "results.jsonl"
+                if res_file.exists():
+                    print(f"\n[bench] Summary for {label}")
+                    summarize_results(res_file)
 
 
 if __name__ == "__main__":

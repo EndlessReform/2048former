@@ -52,16 +52,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         except Exception:
             raise SystemExit("--warmup-sizes must be a comma-separated list of integers")
 
-    asyncio.run(
-        serve_async(
-            init_dir=args.init,
-            bind=bind,
-            device=args.device,
-            compile_mode=compile_mode,
-            warmup_sizes=warmups,
-            dynamic_batch=args.dynamic_batch,
+    try:
+        asyncio.run(
+            serve_async(
+                init_dir=args.init,
+                bind=bind,
+                device=args.device,
+                compile_mode=compile_mode,
+                warmup_sizes=warmups,
+                dynamic_batch=args.dynamic_batch,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        # Graceful shutdown path without noisy tracebacks
+        print("[server] Shutting down (KeyboardInterrupt)", flush=True)
 
 
 if __name__ == "__main__":
