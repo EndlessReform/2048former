@@ -7,7 +7,16 @@ Top-level keys
 - num_seeds (u32): Number of games to run in total (for benchmarks).
 - max_concurrent_games (u32): Max per-actor games scheduled concurrently.
 - max_retries (u32): Transient RPC retry attempts (batch-level).
-- sampling.strategy (string): Sampling strategy for bins (e.g., "argmax").
+- sampling (table): Strategy and parameters for move selection.
+  - strategy (string): One of "Argmax", "Softmax", "TopPTopK", "TailAgg".
+  - temperature (f64, optional): For Softmax/TopPTopK; default 1.0.
+  - top_p (f64, optional): For TopPTopK; default 0.8.
+  - top_k (usize, optional): For TopPTopK; default 2.
+  - alpha_p2, beta_p3 (f64, optional): For TailAgg simple; defaults 0.02 and 0.0.
+  - tail_bins (usize, optional): Advanced TailAgg extra bins; default 0 (disabled).
+  - tail_decay (f64, optional): Advanced TailAgg decay; default 0.5.
+  - start_gate (u64, optional): Step to start applying non-argmax sampling; default 0.
+  - stop_gate (u64, optional): Step to stop applying non-argmax sampling; default none.
 - orchestrator (table): Group for connection and batching settings.
 
 orchestrator.connection

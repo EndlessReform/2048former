@@ -49,6 +49,15 @@ pub struct SamplingStrategy {
     /// for p3 is decay, then decay^2, etc. Defaults to 0.5 if not set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tail_decay: Option<f64>,
+
+    /// Optional gates for when to apply non-argmax sampling.
+    /// If `start_gate` > 0, use pure argmax before this step count.
+    /// If `stop_gate` is set, revert to argmax at and after this step count.
+    /// Defaults: start_gate=0, stop_gate=None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_gate: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_gate: Option<u64>,
 }
 
 impl SamplingStrategy {
@@ -91,6 +100,12 @@ impl SamplingStrategy {
     pub fn tail_decay_or_default(&self) -> f64 {
         match self.tail_decay { Some(d) if d.is_finite() && d > 0.0 && d <= 1.0 => d, _ => 0.5 }
     }
+
+    /// Step count at which non-argmax sampling becomes enabled. Defaults to 0.
+    pub fn start_gate_or_default(&self) -> u64 { self.start_gate.unwrap_or(0) }
+
+    /// Optional step count at which to stop applying non-argmax sampling.
+    pub fn stop_gate(&self) -> Option<u64> { self.stop_gate }
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]

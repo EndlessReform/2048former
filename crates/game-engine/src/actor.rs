@@ -62,7 +62,21 @@ impl GameActor {
             };
             // Compute legal mask and select move according to configured sampling strategy
             let legal = legal_mask(self.board);
-            let mv = select_move(&bins, &legal, &self.sampling, &mut rng);
+            // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
+            let start_gate = self.sampling.start_gate_or_default();
+            let stop_gate = self.sampling.stop_gate();
+            let outside_window = (steps < start_gate)
+                || (stop_gate.map(|s| steps >= s).unwrap_or(false));
+            let mv = if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
+                // Strategy is argmax; no gating effect
+                select_move(&bins, &legal, &self.sampling, &mut rng)
+            } else if outside_window {
+                // Force argmax outside the sampling window
+                select_move_max_p1(&bins, &legal)
+            } else {
+                // Within window: apply configured non-argmax strategy
+                select_move(&bins, &legal, &self.sampling, &mut rng)
+            };
             if let Some(m) = mv {
                 // Apply move and spawn new tile using the Board API
                 self.board = self.board.make_move(m, &mut rng);
