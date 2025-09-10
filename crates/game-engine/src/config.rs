@@ -136,8 +136,15 @@ impl SamplingStrategy {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct Config {
-    pub num_seeds: u32,
+    /// Optional: number of games to run. If omitted, the orchestrator will run until `max_steps` is reached.
+    #[serde(default)]
+    pub num_seeds: Option<u32>,
+    /// Optional: total steps budget across all games. If set, the orchestrator stops once this is reached.
+    #[serde(default)]
+    pub max_steps: Option<u64>,
+    /// Max per-actor games scheduled concurrently.
     pub max_concurrent_games: u32,
+    /// Transient RPC retry attempts (batch-level).
     pub max_retries: u32,
 
     pub sampling: SamplingStrategy,
@@ -158,6 +165,12 @@ pub struct Orchestrator {
     /// If true, request embeddings from the server and write them to NPY shards.
     #[serde(default)]
     pub inline_embeddings: bool,
+    /// Optional: use this as a fixed base seed for reproducibility. If omitted, seeds are fully random.
+    #[serde(default)]
+    pub fixed_seed: Option<u64>,
+    /// Opt-out: when true, ignore fixed/default base seed and use full randomness.
+    #[serde(default)]
+    pub random_seeds: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -190,7 +203,7 @@ pub struct Batch {
 
 impl Default for Orchestrator {
     fn default() -> Self {
-        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default(), inline_embeddings: false }
+        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default(), inline_embeddings: false, fixed_seed: None, random_seeds: false }
     }
 }
 
@@ -227,6 +240,12 @@ pub struct Report {
     pub results_file: Option<std::path::PathBuf>,
     #[serde(default)]
     pub session_dir: Option<std::path::PathBuf>,
+    /// Optional: in-memory buffering cap to avoid OOM (approximate). If exceeded, stop collecting new rows.
+    #[serde(default)]
+    pub max_ram_mb: Option<usize>,
+    /// Optional: disk failsafe for dataset artifacts. If estimated size exceeds this many GB, skip writing.
+    #[serde(default)]
+    pub max_gb: Option<f64>,
 }
 
 mod defaults {

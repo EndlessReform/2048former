@@ -4,7 +4,8 @@ Overview
 - This config controls the orchestrator’s connection to the inference server and the micro-batching feeder behavior. It does not expose backend- or dtype-specific knobs; the wire/API remain backend-agnostic.
 
 Top-level keys
-- num_seeds (u32): Number of games to run in total (for benchmarks).
+- num_seeds (u32, optional): Number of games to run in total.
+- max_steps (u64, optional): Total step budget across all games. If both are set, stop when either is reached.
 - max_concurrent_games (u32): Max per-actor games scheduled concurrently.
 - max_retries (u32): Transient RPC retry attempts (batch-level).
 - sampling (table): Strategy and parameters for move selection.
@@ -20,7 +21,7 @@ Top-level keys
   - conf_gamma (f64, optional): For TailAggConf; exponent shaping for decay; default 1.0.
   - start_gate (u64, optional): Step to start applying non-argmax sampling; default 0.
   - stop_gate (u64, optional): Step to stop applying non-argmax sampling; default none.
-- orchestrator (table): Group for connection and batching settings.
+- orchestrator (table): Group for connection, batching, and recording settings.
 
 orchestrator.connection
 - uds_path (string, optional): Path to Unix domain socket (e.g., "/tmp/2048_infer.sock").
@@ -38,3 +39,17 @@ orchestrator.batch
 Notes
 - The server API returns per-head probabilities over bins. Sampling and tree/strategy logic stay on the Rust side.
 - No dtype/backend/cuda-graphs hints are present in this config or in the gRPC contract.
+orchestrator.inline_embeddings (bool, default false)
+- If true, request embeddings inline and write a single shard `embeddings-000001.npy` if complete.
+
+orchestrator.fixed_seed (u64, optional)
+- Base seed for deterministic runs (`base + i`). If omitted, a default constant base is used for reproducibility unless `random_seeds=true`.
+
+orchestrator.random_seeds (bool, default false)
+- Opt-out: when true, ignore fixed/default base seed and use full randomness (recommended for dataset collection).
+
+orchestrator.report
+- session_dir (string, optional): Directory for saving artifacts. If omitted, nothing is written.
+- results_file (string, optional): JSONL of per-game summaries.
+- max_ram_mb (usize, optional): Approximate in-memory buffer cap; stop collecting new rows if exceeded.
+- max_gb (float, optional): Approx disk failsafe per artifact; skip writing if estimated size exceeds this many GB.
