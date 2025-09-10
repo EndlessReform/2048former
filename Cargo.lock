@@ -550,8 +550,10 @@ version = "0.1.0"
 dependencies = [
  "ai-2048",
  "anyhow",
+ "bytemuck",
  "clap",
  "hyper-util",
+ "npyz",
  "prost",
  "rand",
  "rayon",

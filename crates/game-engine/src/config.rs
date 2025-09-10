@@ -155,6 +155,9 @@ pub struct Orchestrator {
     pub batch: Batch,
     #[serde(default)]
     pub report: Report,
+    /// If true, request embeddings from the server and write them to NPY shards.
+    #[serde(default)]
+    pub inline_embeddings: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -187,7 +190,7 @@ pub struct Batch {
 
 impl Default for Orchestrator {
     fn default() -> Self {
-        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default() }
+        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default(), inline_embeddings: false }
     }
 }
 

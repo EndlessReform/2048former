@@ -1,5 +1,7 @@
 use crate::config;
 use crate::feeder::FeederHandle;
+use crate::ds_writer::StepRow as DsStepRow;
+use tokio::sync::mpsc as tokio_mpsc;
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::distributions::Distribution;
@@ -15,6 +17,7 @@ pub struct GameActor {
     pub board: Board,
     pub seed: u64,
     pub sampling: config::SamplingStrategy,
+    pub step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
 }
 
 pub struct GameResult {
@@ -26,13 +29,19 @@ pub struct GameResult {
 }
 
 impl GameActor {
-    pub fn new(game_id: u32, handle: FeederHandle, seed: u64, sampling: config::SamplingStrategy) -> Self {
+    pub fn new(
+        game_id: u32,
+        handle: FeederHandle,
+        seed: u64,
+        sampling: config::SamplingStrategy,
+        step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
+    ) -> Self {
         // Initialize a fresh board with two random tiles
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut board: Board = Board::EMPTY;
         board = board.with_random_tile(&mut rng);
         board = board.with_random_tile(&mut rng);
-        Self { game_id, handle, board, seed, sampling }
+        Self { game_id, handle, board, seed, sampling, step_tx }
     }
 
     /// Run the actor loop to completion and return the result.
@@ -44,6 +53,10 @@ impl GameActor {
         while !self.board.is_game_over() {
             let id = ((self.game_id as u64) << 32) | seq;
             let board_bytes = board_to_exponents(self.board);
+            // Record step row (pre-move state) for dataset
+            if let Some(tx) = &self.step_tx {
+                let _ = tx.try_send(DsStepRow { run_id: self.game_id as u64, step_idx: steps as u32, exps: board_bytes });
+            }
             let rx = self.handle.submit(id, self.game_id, board_bytes).await;
             let bins = match rx.await {
                 Ok(Ok(b)) => b,

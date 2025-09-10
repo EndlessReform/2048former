@@ -1,5 +1,6 @@
 use crate::config;
 use crate::grpc::{self, pb};
+use tokio::sync::mpsc as tokio_mpsc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,7 @@ pub struct Feeder {
     inflight_items: usize,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Bins, Status>>>>>,
     metrics: Option<Arc<Metrics>>, // client-side batch metrics
+    emb_tx: Option<tokio_mpsc::Sender<EmbeddingRow>>, // optional inline embeddings
 }
 
 impl Feeder {
@@ -58,6 +60,7 @@ impl Feeder {
             inflight_items: 0,
             pending: pending.clone(),
             metrics: metrics.clone(),
+            emb_tx: None,
         };
         (feeder, FeederHandle { tx: req_tx, pending })
     }
@@ -131,18 +134,20 @@ impl Feeder {
                     model_id: String::new(),
                     items: items_pb,
                     batch_id: 0,
-                    return_embedding: false,
+                    return_embedding: self.emb_tx.is_some(),
                 };
                 let mut client_clone = client.clone();
                 let completion = self.completion_tx.clone();
                 let pending = self.pending.clone();
                 let metrics = self.metrics.clone();
+                let emb_tx = self.emb_tx.clone();
 
                 tokio::spawn(async move {
                     let res = client_clone.infer(req).await;
                     match res {
                         Ok(resp) => {
                             let resp = resp.into_inner();
+                            let embed_dim = resp.embed_dim as usize;
                             // Route per item
                             let mut map = pending.lock().await;
                             for (i, item_id) in resp.item_ids.iter().enumerate() {
@@ -153,6 +158,15 @@ impl Feeder {
                                         .map(|o| o.heads.iter().map(|h| h.probs.clone()).collect())
                                         .ok_or_else(|| Status::internal("missing output for item"));
                                     let _ = tx.send(bins);
+                                }
+                                // Emit embedding if present and channel configured
+                                if let (Some(ch), Some(out)) = (emb_tx.as_ref(), resp.outputs.get(i)) {
+                                    if !out.embedding.is_empty() && embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                                        if out.embedding.len() == embed_dim * 4 {
+                                            let v: Vec<f32> = bytemuck::cast_slice(&out.embedding).to_vec();
+                                            let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -199,6 +213,21 @@ impl FeederHandle {
         let _ = self.tx.send(InferenceItem { id, game_id, board }).await;
         rx
     }
+}
+
+impl Feeder {
+    /// Enable inline embeddings emission by providing a channel to receive them.
+    pub fn set_embeddings_channel(&mut self, ch: tokio_mpsc::Sender<EmbeddingRow>) {
+        self.emb_tx = Some(ch);
+    }
+}
+
+/// Inline embedding record for a single item
+#[derive(Clone, Debug)]
+pub struct EmbeddingRow {
+    pub id: u64,
+    pub dim: usize,
+    pub values: Vec<f32>,
 }
 
 // ---------------- Metrics -----------------

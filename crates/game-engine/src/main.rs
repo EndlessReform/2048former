@@ -3,6 +3,7 @@ mod grpc;
 mod feeder;
 mod actor;
 mod recorder;
+mod ds_writer;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -62,11 +63,18 @@ async fn main() {
     println!("Connected to inference server");
 
     // Start feeder
-    let (feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
+    let (mut feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
+    // Optional embeddings pipeline
+    let (emb_tx, mut emb_rx) = mpsc::channel::<feeder::EmbeddingRow>(65_536);
+    if config.orchestrator.inline_embeddings {
+        feeder.set_embeddings_channel(emb_tx.clone());
+    }
     let feeder_task = feeder.spawn(client);
 
     // Optional results writer and session recorder (metadata.db)
     let (res_tx, mut res_rx) = mpsc::channel::<actor::GameResult>(1024);
+    // Optional step recorder channel (structured steps -> steps.npy)
+    let (step_tx, mut step_rx) = mpsc::channel::<ds_writer::StepRow>(65_536);
     let writer_handle = {
         let results_path = config.orchestrator.report.results_file.clone();
         let session_dir = config.orchestrator.report.session_dir.clone();
@@ -128,6 +136,90 @@ async fn main() {
         }))
     };
 
+    // Optional step collector -> steps.npy
+    let step_writer_handle = {
+        let session_dir = config.orchestrator.report.session_dir.clone();
+        let inline_emb = config.orchestrator.inline_embeddings;
+        Some(tokio::spawn(async move {
+            if let Some(dir) = session_dir.as_ref() {
+                use std::collections::HashMap;
+                let mut steps: Vec<ds_writer::StepRow> = Vec::new();
+                let mut id_to_idx: HashMap<u64, usize> = HashMap::new();
+                let mut emb_map: HashMap<u64, (usize, Vec<f32>)> = HashMap::new();
+                let mut emb_dim_opt: Option<usize> = None;
+
+                // Drain both channels
+                let mut step_done = false;
+                let mut emb_done = !inline_emb; // if not enabled, consider done
+                loop {
+                    tokio::select! {
+                        biased;
+                        maybe_row = step_rx.recv(), if !step_done => {
+                            match maybe_row {
+                                Some(row) => {
+                                    let idx = steps.len();
+                                    let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
+                                    id_to_idx.insert(id, idx);
+                                    steps.push(row);
+                                }
+                                None => { step_done = true; }
+                            }
+                        }
+                        maybe_emb = emb_rx.recv(), if !emb_done => {
+                            match maybe_emb {
+                                Some(er) => {
+                                    if emb_dim_opt.is_none() { emb_dim_opt = Some(er.dim); }
+                                    if emb_dim_opt == Some(er.dim) {
+                                        emb_map.insert(er.id, (er.dim, er.values));
+                                    }
+                                }
+                                None => { emb_done = true; }
+                            }
+                        }
+                        else => { break; }
+                    }
+                }
+
+                // Write steps
+                if !steps.is_empty() {
+                    let path = dir.join("steps.npy");
+                    if let Err(e) = ds_writer::write_steps_npy(&steps, &path) {
+                        eprintln!("Failed to write steps.npy at {}: {}", path.display(), e);
+                    }
+                }
+
+                // If embeddings present and complete, write shard 000001
+                if inline_emb {
+                    if let Some(dim) = emb_dim_opt {
+                        if steps.len() == emb_map.len() {
+                            let mut floats = Vec::with_capacity(steps.len() * dim);
+                            for row in &steps {
+                                let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
+                                if let Some((_d, v)) = emb_map.remove(&id) {
+                                    floats.extend_from_slice(&v);
+                                } else {
+                                    // missing embedding; abort writing
+                                    floats.clear();
+                                    break;
+                                }
+                            }
+                            if floats.len() == steps.len() * dim {
+                                let path = dir.join("embeddings-000001.npy");
+                                if let Err(e) = ds_writer::write_embeddings_npy(&floats, steps.len(), dim, &path) {
+                                    eprintln!("Failed to write embeddings shard at {}: {}", path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Drain and drop
+                while step_rx.recv().await.is_some() {}
+                while emb_rx.recv().await.is_some() {}
+            }
+        }))
+    };
+
     // Spawn per-game actors up to max_concurrent_games, total num_seeds games
     let total = config.num_seeds as usize;
     let max_conc = config.max_concurrent_games as usize;
@@ -146,6 +238,7 @@ async fn main() {
             handle.clone(),
             base_seed.wrapping_add(started as u64),
             config.sampling.clone(),
+            Some(step_tx.clone()),
         );
         set.spawn(actor.run());
         started += 1;
@@ -170,6 +263,7 @@ async fn main() {
                     handle.clone(),
                     base_seed.wrapping_add(started as u64),
                     config.sampling.clone(),
+                    Some(step_tx.clone()),
                 );
                 set.spawn(actor.run());
                 started += 1;
@@ -181,5 +275,7 @@ async fn main() {
     drop(handle);
     let _ = feeder_task.await;
     drop(res_tx);
+    drop(step_tx);
     if let Some(h) = writer_handle { let _ = h.await; }
+    if let Some(h) = step_writer_handle { let _ = h.await; }
 }
