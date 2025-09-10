@@ -150,6 +150,26 @@ impl Feeder {
                             let embed_dim = resp.embed_dim as usize;
                             // Route per item
                             let mut map = pending.lock().await;
+                            // If embeddings are requested, prefer concatenated buffer when present
+                            let mut emitted_from_concat = false;
+                            if let (Some(ch), true) = (emb_tx.as_ref(), !resp.embeddings_concat.is_empty()) {
+                                if embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                                    // Safe cast: u8 bytes to f32 words
+                                    let floats: &[f32] = bytemuck::try_cast_slice(&resp.embeddings_concat)
+                                        .unwrap_or(&[]);
+                                    let n_items = resp.item_ids.len();
+                                    if floats.len() == n_items * embed_dim {
+                                        for (i, item_id) in resp.item_ids.iter().enumerate() {
+                                            let start = i * embed_dim;
+                                            let end = start + embed_dim;
+                                            let v: Vec<f32> = floats[start..end].to_vec();
+                                            let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                        }
+                                        emitted_from_concat = true;
+                                    }
+                                }
+                            }
+
                             for (i, item_id) in resp.item_ids.iter().enumerate() {
                                 if let Some(tx) = map.remove(item_id) {
                                     let bins: Result<Bins, Status> = resp
@@ -159,12 +179,14 @@ impl Feeder {
                                         .ok_or_else(|| Status::internal("missing output for item"));
                                     let _ = tx.send(bins);
                                 }
-                                // Emit embedding if present and channel configured
-                                if let (Some(ch), Some(out)) = (emb_tx.as_ref(), resp.outputs.get(i)) {
-                                    if !out.embedding.is_empty() && embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
-                                        if out.embedding.len() == embed_dim * 4 {
-                                            let v: Vec<f32> = bytemuck::cast_slice(&out.embedding).to_vec();
-                                            let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                // If not emitted via concatenated buffer, fall back to per-item field
+                                if !emitted_from_concat {
+                                    if let (Some(ch), Some(out)) = (emb_tx.as_ref(), resp.outputs.get(i)) {
+                                        if !out.embedding.is_empty() && embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                                            if out.embedding.len() == embed_dim * 4 {
+                                                let v: Vec<f32> = bytemuck::cast_slice(&out.embedding).to_vec();
+                                                let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                            }
                                         }
                                     }
                                 }

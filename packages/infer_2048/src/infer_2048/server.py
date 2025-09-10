@@ -109,24 +109,20 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
 
             outputs = []
             emb_dim: int = 0
+            embeddings_concat: Optional[bytes] = None
             if bool(getattr(request, "return_embedding", False)):
-                # Encode embeddings as FP32 bytes in a single contiguous buffer, then
-                # slice per item to avoid per-row dtype/copy overhead.
+                # Encode all embeddings as a single FP32 bytes buffer to minimize
+                # per-item serialization overhead. Clients split using embed_dim.
                 br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
                 emb_dim = int(br_cpu.shape[1])
-                # Single tobytes() over (B, H)
-                emb_all = br_cpu.numpy().tobytes()
-                row_nbytes = emb_dim * 4  # float32
-                for i in range(B):
-                    start = i * row_nbytes
-                    end = start + row_nbytes
-                    emb_slice = memoryview(emb_all)[start:end]
-                    outputs.append(
-                        inference_pb2.Output(
-                            heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
-                            embedding=emb_slice,
-                        )
+                embeddings_concat = br_cpu.numpy().tobytes()
+                # Do not include per-item embeddings; keep Output.embedding empty
+                outputs = [
+                    inference_pb2.Output(
+                        heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
                     )
+                    for i in range(B)
+                ]
             else:
                 outputs = [
                     inference_pb2.Output(
@@ -153,6 +149,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                 latency_ms=latency_ms,
                 embed_dim=int(emb_dim),
                 embed_dtype=inference_pb2.InferResponse.FP32,
+                embeddings_concat=embeddings_concat or b"",
             )
         else:
             resp = inference_pb2.InferResponse(

@@ -71,6 +71,14 @@ message InferResponse {
     BF16 = 2;  // bfloat16 16-bit words, little-endian
   }
   EmbedDType embed_dtype = 6;
+
+  // Optional: when embeddings are requested, servers MAY return a single
+  // concatenated buffer containing all embeddings in batch order to avoid
+  // per-item serialization overhead. The buffer layout is:
+  //   [item0 (embed_dim * sizeof(dtype))][item1][...][itemB-1]
+  // Clients should prefer this field when present; fall back to per-item
+  // Output.embedding otherwise. The number of items is `len(item_ids)`.
+  bytes embeddings_concat = 7;
 }
 
 service Inference {
