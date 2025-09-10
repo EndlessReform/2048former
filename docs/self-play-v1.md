@@ -39,6 +39,7 @@ steps.npy (structured dtype)
   - `step_idx: <u32>` — 0-based index within run
   - `exps: (16,)u1` — board exponents (0..15), row-major
   - Optional (off by default): `action: u1` — 0..3 if we choose to keep it
+  - Optional (off by default): `reach_mask: u1` — bit0=8192, bit1=16384, bit2=32768
 - Notes:
   - This mirrors the spirit of the existing dataset rails but strips to the minimum. No `reward`, `done`, or `legal` fields.
   - Keeping exps in-place avoids recomputing tokens later and is compatible with our tokenizer.
@@ -52,11 +53,19 @@ metadata.db (SQLite)
   - Only run-level facts live here. Critic labels are derived from `highest_tile` at load time (per step via its `run_id`).
   - Provides the single “index” the loader needs and keeps the step file clean.
 
-embeddings.bf16.npy (optional, offline)
-- Shape: `[N, D]`, row-aligned to `steps.npy` (N rows, D = pooled dim).
-- Dtype: `bfloat16` (native model dtype). No quantization in v1.
-- Meta sidecar: `embeddings.json` with `{ model_sha, pooling, D, dtype: "bf16" }`.
-- Produced by a separate Python job that loads `steps.npy`, runs the tower in eval, mean-pools hidden states (or uses CLS/pool if available), and saves the array.
+Embeddings storage (fp32, offline)
+- Simplicity first: store embeddings as float32 `.npy` shards, row-aligned to `steps.npy`.
+- Files per session: `embeddings-000001.npy`, `embeddings-000002.npy`, ... each shaped `[N, D]` with `dtype=float32`.
+- Writer: offline embedding job runs model in bf16 for speed, mean-pools, then casts to fp32 before writing shards atomically.
+- Shard size default: 10M rows per shard at D=512 ≈ ~20 GB/shard. Adjust if needed, but this keeps shard count small and files manageable.
+- Loader: `np.load(..., mmap_mode='r')` → `torch.from_numpy` → move to device (fp32). No dtype quirks, portable, fast.
+
+Inline embeddings/server proto (minimal, optional)
+- We add small, backward-compatible fields to the inference proto so the engine can request pooled embeddings when desired.
+- Request: `return_embedding: bool` (default false).
+- Response: per-item `embedding: bytes`; response-level `embed_dim: uint32` and `embed_dtype` (enum: FP32, BF16). For v1, the server returns FP32 bytes.
+- Server implementation: computes mean-pooled hidden state; if `return_embedding`, encodes each row as FP32 bytes and fills the new fields. This is already wired in `packages/infer_2048/.../server.py` pending stub regeneration.
+- Client/engine: if inline mode is enabled, write embeddings row-aligned to steps; otherwise keep using the offline embedding job.
 
 ----------------------------------------
 
@@ -101,7 +110,7 @@ Engine implementation notes (v1)
 ----------------------------------------
 
 Why this is simpler
-- Exactly three artifacts per session: `steps.npy`, `embeddings.bf16.npy` (optional), `metadata.db`.
+- Exactly three artifacts per session: `steps.npy`, `embeddings-*.npy` (optional), `metadata.db`.
 - No derived step fields (rewards/done/legal) and no quantization.
 - No large matrix of tiny `.npy` columns, no new loader complexity.
 - Reuses our existing SQLite filtering story and aligns with current config patterns.
@@ -109,9 +118,24 @@ Why this is simpler
 ----------------------------------------
 
 Open edges (kept small on purpose)
-- If NumPy bfloat16 serialization is a concern, we can store embeddings as `uint16` bit-patterns with a declared `dtype_bits = "bf16"` in `embeddings.json`; the loader views them as bf16 tensors on read. This is a fallback, not the default.
 - If a single session grows too large, start a new session directory (session rotation) rather than introducing intra-session shard files.
 - If later we need actions or legality for auxiliary tasks, we can add an optional `action: u1` field to `steps.npy` without disturbing existing readers.
+
+----------------------------------------
+
+Sizing With Current Reach Rates
+- Given your sample (128 games: mean steps ≈ 12.8k; reach rates: 8192≈94.5%, 16384≈76.6%, 32768≈15.6%), training targets for a 2‑layer MLP on cached embeddings:
+- Recommended collection:
+  - 10M steps (≈780 games):
+    - Positives: 8192≈9.45M, 16384≈7.66M, 32768≈1.56M steps.
+    - Disk: embeddings ≈ 20 GB (D=512, fp32), steps/index negligible.
+    - Time at 40k steps/s: ~4–5 minutes.
+  - 20M steps: ≈40 GB; ~9–10 minutes; 32768 positives ≈ 3.1M.
+  - 50M steps: ≈100 GB; ~21 minutes; diminishing returns for this head.
+  - 100M steps: ≈200 GB (outer budget), likely unnecessary unless chasing calibration edges.
+-
+Notes:
+- Labels are run‑global; if desired, cap per‑run training samples during batching (e.g., ≤4k steps/run) to reduce correlation—no need to record less.
 
 ----------------------------------------
 

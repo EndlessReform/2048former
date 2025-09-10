@@ -1,5 +1,5 @@
 use crate::config;
-use crate::feeder::{Bins, FeederHandle};
+use crate::feeder::FeederHandle;
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::distributions::Distribution;
@@ -108,4 +108,3 @@ fn legal_mask(board: Board) -> [bool; 4] {
     }
     mask
 }
-

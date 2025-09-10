@@ -62,6 +62,7 @@ pub async fn infer_once(
         model_id: model_id.unwrap_or_default(),
         items: items_pb,
         batch_id: batch_id.unwrap_or_default(),
+        return_embedding: false,
     };
     let resp = client.infer(req).await?.into_inner();
     Ok(resp)

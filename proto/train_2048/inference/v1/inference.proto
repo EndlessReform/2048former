@@ -25,6 +25,10 @@ message InferRequest {
 
   // Optional batch identifier for telemetry/correlation.
   uint64 batch_id = 3;
+
+  // If true, include a pooled embedding for each item in the response.
+  // Embedding is returned as raw bytes; see InferResponse.embed_dtype.
+  bool return_embedding = 4;
 }
 
 // A single head's distribution as probabilities over bins.
@@ -38,6 +42,10 @@ message HeadProbs {
 message Output {
   // Shape conceptually: (4, n_bins)
   repeated HeadProbs heads = 1;
+
+  // Optional pooled embedding for this item, encoded per InferResponse.embed_dtype.
+  // When empty, no embedding was requested or returned.
+  bytes embedding = 2;
 }
 
 // Batched inference response.
@@ -53,6 +61,16 @@ message InferResponse {
 
   // Server-measured latency in milliseconds for the batch, if available.
   uint64 latency_ms = 4;
+
+  // Embedding metadata (present when return_embedding was true).
+  // All embeddings in this response share the same shape and dtype.
+  uint32 embed_dim = 5;
+  enum EmbedDType {
+    EMBED_DTYPE_UNSPECIFIED = 0;
+    FP32 = 1;  // float32 bytes, little-endian
+    BF16 = 2;  // bfloat16 16-bit words, little-endian
+  }
+  EmbedDType embed_dtype = 6;
 }
 
 service Inference {

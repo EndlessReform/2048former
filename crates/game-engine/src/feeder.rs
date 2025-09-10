@@ -131,6 +131,7 @@ impl Feeder {
                     model_id: String::new(),
                     items: items_pb,
                     batch_id: 0,
+                    return_embedding: false,
                 };
                 let mut client_clone = client.clone();
                 let completion = self.completion_tx.clone();

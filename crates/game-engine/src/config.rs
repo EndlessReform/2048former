@@ -222,6 +222,8 @@ impl Config {
 pub struct Report {
     #[serde(default)]
     pub results_file: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub session_dir: Option<std::path::PathBuf>,
 }
 
 mod defaults {

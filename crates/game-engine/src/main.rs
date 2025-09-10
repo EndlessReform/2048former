@@ -2,6 +2,7 @@ mod config;
 mod grpc;
 mod feeder;
 mod actor;
+mod recorder;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -10,6 +11,7 @@ use tokio::sync::mpsc;
 
 use actor::GameActor;
 use feeder::Feeder;
+use recorder::{RunSummary, SessionRecorder};
 
 use config::Config;
 
@@ -63,26 +65,68 @@ async fn main() {
     let (feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
     let feeder_task = feeder.spawn(client);
 
-    // Optional results writer
+    // Optional results writer and session recorder (metadata.db)
     let (res_tx, mut res_rx) = mpsc::channel::<actor::GameResult>(1024);
-    let writer_handle = if let Some(path) = &config.orchestrator.report.results_file {
-        let path = path.clone();
+    let writer_handle = {
+        let results_path = config.orchestrator.report.results_file.clone();
+        let session_dir = config.orchestrator.report.session_dir.clone();
         Some(tokio::spawn(async move {
-            let mut file = match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Failed to open results file {}: {}", path.display(), e);
-                    return;
+            // Results JSONL sink (optional)
+            let mut file_opt = if let Some(path) = results_path.as_ref() {
+                match tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        eprintln!("Failed to open results file {}: {}", path.display(), e);
+                        None
+                    }
                 }
+            } else { None };
+
+            // Session recorder (sync; lightweight ops per finished game)
+            let mut rec_opt = match session_dir.as_ref() {
+                Some(dir) => match SessionRecorder::new(dir) {
+                    Ok(mut rec) => {
+                        // Write a minimal meta record for provenance
+                        let ts = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                            Ok(d) => format!("{}", d.as_secs_f64()),
+                            Err(_) => String::from("0.0"),
+                        };
+                        let _ = rec.set_meta("ts", &ts);
+                        Some(rec)
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to init session recorder at {}: {}", dir.display(), e);
+                        None
+                    }
+                },
+                None => None,
             };
+
             while let Some(r) = res_rx.recv().await {
-                #[derive(serde::Serialize)]
-                struct Rec { game_id: u32, seed: u64, steps: u64, score: u64, highest_tile: u32 }
-                let rec = Rec { game_id: r.game_id, seed: r.seed, steps: r.steps, score: r.score, highest_tile: r.highest_tile };
-                if let Ok(line) = serde_json::to_string(&rec) { let _ = tokio::io::AsyncWriteExt::write_all(&mut file, line.as_bytes()).await; let _ = tokio::io::AsyncWriteExt::write_all(&mut file, b"\n").await; let _ = tokio::io::AsyncWriteExt::flush(&mut file).await; }
+                // Emit JSONL if enabled
+                if let Some(f) = file_opt.as_mut() {
+                    #[derive(serde::Serialize)]
+                    struct Rec { game_id: u32, seed: u64, steps: u64, score: u64, highest_tile: u32 }
+                    let rec = Rec { game_id: r.game_id, seed: r.seed, steps: r.steps, score: r.score, highest_tile: r.highest_tile };
+                    if let Ok(line) = serde_json::to_string(&rec) {
+                        let _ = tokio::io::AsyncWriteExt::write_all(f, line.as_bytes()).await;
+                        let _ = tokio::io::AsyncWriteExt::write_all(f, b"\n").await;
+                        let _ = tokio::io::AsyncWriteExt::flush(f).await;
+                    }
+                }
+                // Record run into SQLite if enabled
+                if let Some(rec) = rec_opt.as_mut() {
+                    let _ = rec.upsert_run(RunSummary {
+                        id: r.game_id as u64,
+                        seed: r.seed,
+                        steps: r.steps,
+                        max_score: r.score,
+                        highest_tile: r.highest_tile,
+                    });
+                }
             }
         }))
-    } else { None };
+    };
 
     // Spawn per-game actors up to max_concurrent_games, total num_seeds games
     let total = config.num_seeds as usize;
