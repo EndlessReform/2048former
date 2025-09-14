@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tonic::Status;
+use tokio_util::sync::CancellationToken;
 
 /// Single inference item sent to the micro-batcher.
 /// - `id` is a stable, caller-supplied identifier used for routing
@@ -37,6 +38,7 @@ pub struct Feeder {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Bins, Status>>>>>,
     metrics: Option<Arc<Metrics>>, // client-side batch metrics
     emb_tx: Option<tokio_mpsc::Sender<EmbeddingRow>>, // optional inline embeddings
+    cancel: Option<CancellationToken>,
 }
 
 impl Feeder {
@@ -61,6 +63,7 @@ impl Feeder {
             pending: pending.clone(),
             metrics: metrics.clone(),
             emb_tx: None,
+            cancel: None,
         };
         (feeder, FeederHandle { tx: req_tx, pending })
     }
@@ -93,9 +96,17 @@ impl Feeder {
                 let mut buf: Vec<InferenceItem> = Vec::with_capacity(target);
 
                 // Block for the first item (or exit if channel closed)
-                match self.req_rx.recv().await {
-                    Some(item) => buf.push(item),
-                    None => return,
+                if let Some(tok) = &self.cancel {
+                    // Allow cancel to short-circuit waiting for the first item
+                    tokio::select! {
+                        biased;
+                        _ = tok.cancelled() => { return; }
+                        maybe = self.req_rx.recv() => {
+                            match maybe { Some(item) => buf.push(item), None => return }
+                        }
+                    }
+                } else {
+                    match self.req_rx.recv().await { Some(item) => buf.push(item), None => return }
                 }
 
                 let deadline = Instant::now() + flush;
@@ -105,10 +116,20 @@ impl Feeder {
                         break;
                     }
                     let remaining = deadline.saturating_duration_since(now);
-                    match tokio::time::timeout(remaining, self.req_rx.recv()).await {
-                        Ok(Some(item)) => buf.push(item),
-                        Ok(None) => return,
-                        Err(_elapsed) => break, // flush window expired
+                    if let Some(tok) = &self.cancel {
+                        tokio::select! {
+                            biased;
+                            _ = tok.cancelled() => break, // stop batching immediately
+                            r = tokio::time::timeout(remaining, self.req_rx.recv()) => {
+                                match r { Ok(Some(item)) => buf.push(item), Ok(None) => return, Err(_elapsed) => break }
+                            }
+                        }
+                    } else {
+                        match tokio::time::timeout(remaining, self.req_rx.recv()).await {
+                            Ok(Some(item)) => buf.push(item),
+                            Ok(None) => return,
+                            Err(_elapsed) => break, // flush window expired
+                        }
                     }
                 }
 
@@ -241,6 +262,11 @@ impl Feeder {
     /// Enable inline embeddings emission by providing a channel to receive them.
     pub fn set_embeddings_channel(&mut self, ch: tokio_mpsc::Sender<EmbeddingRow>) {
         self.emb_tx = Some(ch);
+    }
+
+    /// Install a cancellation token to request graceful shutdown.
+    pub fn set_cancel_token(&mut self, token: CancellationToken) {
+        self.cancel = Some(token);
     }
 }
 

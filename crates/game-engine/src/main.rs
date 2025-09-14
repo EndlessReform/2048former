@@ -1,21 +1,148 @@
-mod config;
-mod grpc;
-mod feeder;
 mod actor;
-mod recorder;
+mod config;
 mod ds_writer;
+mod feeder;
+mod grpc;
+mod recorder;
 
 use clap::Parser;
+use log::{debug, error, info};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::task::JoinSet;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use actor::GameActor;
 use feeder::Feeder;
+use rand::{RngCore, SeedableRng};
 use recorder::{RunSummary, SessionRecorder};
-use rand::{SeedableRng, RngCore};
 
 use config::Config;
+
+struct ShardedWriter {
+    session_dir: PathBuf,
+    shard_max_steps: usize,
+    max_gb: Option<f64>,
+    inline_embeddings: bool,
+    shard_idx: u32,
+    steps: Vec<ds_writer::StepRow>,
+    emb_map: HashMap<u64, (usize, Vec<f32>)>,
+    emb_dim: Option<usize>,
+    total_steps: u64,
+}
+
+impl ShardedWriter {
+    fn new(
+        session_dir: PathBuf,
+        shard_max_steps: usize,
+        max_gb: Option<f64>,
+        inline_embeddings: bool,
+    ) -> Self {
+        Self {
+            session_dir,
+            shard_max_steps,
+            max_gb,
+            inline_embeddings,
+            shard_idx: 0,
+            steps: Vec::with_capacity(shard_max_steps),
+            emb_map: HashMap::new(),
+            emb_dim: None,
+            total_steps: 0,
+        }
+    }
+
+    fn push_step(&mut self, row: ds_writer::StepRow) {
+        self.steps.push(row);
+        self.total_steps += 1;
+        if self.total_steps % 10_000 == 0 {
+            debug!(
+                "total steps: {}, buffered: {}",
+                self.total_steps,
+                self.steps.len()
+            );
+        }
+        if self.steps.len() >= self.shard_max_steps {
+            self.write_shard("shard_full");
+        }
+    }
+
+    fn push_embedding(&mut self, er: feeder::EmbeddingRow) {
+        if self.emb_dim.is_none() {
+            self.emb_dim = Some(er.dim);
+        }
+        if self.emb_dim == Some(er.dim) {
+            self.emb_map.insert(er.id, (er.dim, er.values));
+        }
+        if self.emb_map.len() >= self.shard_max_steps {
+            self.write_shard("emb_full");
+        }
+    }
+
+    fn write_shard(&mut self, reason: &str) {
+        if self.steps.is_empty() {
+            return;
+        }
+        self.shard_idx += 1;
+        let shard_id = format!("{:06}", self.shard_idx);
+
+        // Write steps shard
+        let steps_path = self.session_dir.join(format!("steps-{shard_id}.npy"));
+        info!(
+            "flushing {} steps to {} (reason: {})",
+            self.steps.len(),
+            steps_path.display(),
+            reason
+        );
+        let steps_bytes_est = self.steps.len() * (8 + 4 + 16);
+        if self
+            .max_gb
+            .map_or(false, |gb| (steps_bytes_est as f64) / 1e9 > gb)
+        {
+            eprintln!("Skipping steps shard write: est. size > cap");
+        } else if let Err(e) = ds_writer::write_steps_npy(&self.steps, &steps_path) {
+            eprintln!("Failed to write steps shard {}: {}", shard_id, e);
+        }
+
+        // Write embeddings shard if enabled and consistent
+        if self.inline_embeddings {
+            if let Some(dim) = self.emb_dim {
+                let mut floats = Vec::with_capacity(self.steps.len() * dim);
+                let mut consistent = true;
+                for row in &self.steps {
+                    let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
+                    if let Some((_d, v)) = self.emb_map.remove(&id) {
+                        floats.extend_from_slice(&v);
+                    } else {
+                        consistent = false;
+                        break;
+                    }
+                }
+
+                if consistent && !floats.is_empty() {
+                    let emb_path = self.session_dir.join(format!("embeddings-{shard_id}.npy"));
+                    let emb_bytes_est = floats.len() * 4;
+                    if self
+                        .max_gb
+                        .map_or(false, |gb| (emb_bytes_est as f64) / 1e9 > gb)
+                    {
+                        eprintln!("Skipping embeddings shard write: est. size > cap");
+                    } else if let Err(e) =
+                        ds_writer::write_embeddings_npy(&floats, self.steps.len(), dim, &emb_path)
+                    {
+                        eprintln!("Failed to write embeddings shard {}: {}", shard_id, e);
+                    }
+                }
+            }
+        }
+        self.steps.clear();
+        self.emb_map.clear();
+    }
+
+    fn flush(&mut self) {
+        self.write_shard("flush");
+    }
+}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,6 +153,7 @@ struct Args {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    env_logger::init();
     let args = Args::parse();
     println!("Using configuration file: {}", args.config.display());
     let config = match Config::from_toml(&args.config) {
@@ -35,6 +163,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    debug!("Loaded config: {:#?}", config);
 
     // Initialize game engine tables if needed
     ai_2048::engine::new();
@@ -45,7 +174,10 @@ async fn main() {
         match grpc::connect_uds(uds_path).await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to connect to inference server over UDS {}: {e}", uds_path.display());
+                eprintln!(
+                    "Failed to connect to inference server over UDS {}: {e}",
+                    uds_path.display()
+                );
                 std::process::exit(2);
             }
         }
@@ -63,8 +195,12 @@ async fn main() {
     };
     println!("Connected to inference server");
 
+    // Shared cancellation to coordinate graceful shutdown
+    let cancel = CancellationToken::new();
+
     // Start feeder
     let (mut feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
+    feeder.set_cancel_token(cancel.clone());
     // Optional embeddings pipeline
     let (emb_tx, mut emb_rx) = mpsc::channel::<feeder::EmbeddingRow>(65_536);
     if config.orchestrator.inline_embeddings {
@@ -84,21 +220,30 @@ async fn main() {
         Some(tokio::spawn(async move {
             // Results JSONL sink (optional)
             let mut file_opt = if let Some(path) = results_path.as_ref() {
-                match tokio::fs::OpenOptions::new().create(true).append(true).open(path).await {
+                match tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await
+                {
                     Ok(f) => Some(f),
                     Err(e) => {
                         eprintln!("Failed to open results file {}: {}", path.display(), e);
                         None
                     }
                 }
-            } else { None };
+            } else {
+                None
+            };
 
             // Session recorder (sync; lightweight ops per finished game)
             let mut rec_opt = match session_dir.as_ref() {
                 Some(dir) => match SessionRecorder::new(dir) {
                     Ok(mut rec) => {
                         // Write a minimal meta record for provenance
-                        let ts = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                        let ts = match std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                        {
                             Ok(d) => format!("{}", d.as_secs_f64()),
                             Err(_) => String::from("0.0"),
                         };
@@ -106,7 +251,11 @@ async fn main() {
                         Some(rec)
                     }
                     Err(e) => {
-                        eprintln!("Failed to init session recorder at {}: {}", dir.display(), e);
+                        eprintln!(
+                            "Failed to init session recorder at {}: {}",
+                            dir.display(),
+                            e
+                        );
                         None
                     }
                 },
@@ -117,8 +266,20 @@ async fn main() {
                 // Emit JSONL if enabled
                 if let Some(f) = file_opt.as_mut() {
                     #[derive(serde::Serialize)]
-                    struct Rec { game_id: u32, seed: u64, steps: u64, score: u64, highest_tile: u32 }
-                    let rec = Rec { game_id: r.game_id, seed: r.seed, steps: r.steps, score: r.score, highest_tile: r.highest_tile };
+                    struct Rec {
+                        game_id: u32,
+                        seed: u64,
+                        steps: u64,
+                        score: u64,
+                        highest_tile: u32,
+                    }
+                    let rec = Rec {
+                        game_id: r.game_id,
+                        seed: r.seed,
+                        steps: r.steps,
+                        score: r.score,
+                        highest_tile: r.highest_tile,
+                    };
                     if let Ok(line) = serde_json::to_string(&rec) {
                         let _ = tokio::io::AsyncWriteExt::write_all(f, line.as_bytes()).await;
                         let _ = tokio::io::AsyncWriteExt::write_all(f, b"\n").await;
@@ -140,119 +301,46 @@ async fn main() {
         }))
     };
 
-    // Optional step collector -> steps.npy
+    // Optional step collector -> steps-*.npy, embeddings-*.npy
     let step_writer_handle = {
-        let session_dir = config.orchestrator.report.session_dir.clone();
+        let report_conf = config.orchestrator.report.clone();
         let inline_emb = config.orchestrator.inline_embeddings;
-        let max_ram_mb = config.orchestrator.report.max_ram_mb;
-        let max_gb = config.orchestrator.report.max_gb;
         Some(tokio::spawn(async move {
-            if let Some(dir) = session_dir.as_ref() {
-                use std::collections::HashMap;
-                let mut steps: Vec<ds_writer::StepRow> = Vec::new();
-                let mut id_to_idx: HashMap<u64, usize> = HashMap::new();
-                let mut emb_map: HashMap<u64, (usize, Vec<f32>)> = HashMap::new();
-                let mut emb_dim_opt: Option<usize> = None;
-                // Simple RAM guardrails (approximate)
-                let ram_cap_bytes = max_ram_mb.map(|mb| (mb as usize) * 1024 * 1024);
-                let step_row_bytes = 8 + 4 + 16; // run_id u64 + step_idx u32 + exps[16] u8
-                let mut est_bytes_steps: usize = 0;
-                let mut est_bytes_emb: usize = 0;
-                let mut accept_steps = true;
-                let mut accept_embs = true;
+            if let Some(dir) = report_conf.session_dir.as_ref() {
+                let mut writer = ShardedWriter::new(
+                    dir.clone(),
+                    report_conf.shard_max_steps_or_default(),
+                    report_conf.max_gb,
+                    inline_emb,
+                );
 
-                // Drain both channels
                 let mut step_done = false;
-                let mut emb_done = !inline_emb; // if not enabled, consider done
+                let mut emb_done = !inline_emb;
                 loop {
                     tokio::select! {
                         biased;
                         maybe_row = step_rx.recv(), if !step_done => {
                             match maybe_row {
-                                Some(row) => {
-                                    if accept_steps {
-                                        let next = est_bytes_steps.saturating_add(step_row_bytes);
-                                        if ram_cap_bytes.map(|cap| next > cap).unwrap_or(false) {
-                                            accept_steps = false;
-                                        } else {
-                                            est_bytes_steps = next;
-                                            let idx = steps.len();
-                                            let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
-                                            id_to_idx.insert(id, idx);
-                                            steps.push(row);
-                                        }
-                                    }
+                                Some(row) => writer.push_step(row),
+                                None => {
+                                    info!("step_rx closed");
+                                    step_done = true;
                                 }
-                                None => { step_done = true; }
                             }
                         }
                         maybe_emb = emb_rx.recv(), if !emb_done => {
                             match maybe_emb {
-                                Some(er) => {
-                                    if emb_dim_opt.is_none() { emb_dim_opt = Some(er.dim); }
-                                    if emb_dim_opt == Some(er.dim) {
-                                        if accept_embs {
-                                            let add_bytes = er.dim * 4;
-                                            let next = est_bytes_emb.saturating_add(add_bytes);
-                                            let total_next = est_bytes_steps.saturating_add(next);
-                                            if ram_cap_bytes.map(|cap| total_next > cap).unwrap_or(false) {
-                                                accept_embs = false;
-                                            } else {
-                                                est_bytes_emb = next;
-                                                emb_map.insert(er.id, (er.dim, er.values));
-                                            }
-                                        }
-                                    }
+                                Some(er) => writer.push_embedding(er),
+                                None => {
+                                    info!("emb_rx closed");
+                                    emb_done = true;
                                 }
-                                None => { emb_done = true; }
                             }
                         }
                         else => { break; }
                     }
                 }
-
-                // Write steps
-                if !steps.is_empty() {
-                    let path = dir.join("steps.npy");
-                    // Disk failsafe for steps
-                    let steps_bytes_est = steps.len().saturating_mul(step_row_bytes);
-                    let over_gb = max_gb.map(|gb| (steps_bytes_est as f64) / (1024.0 * 1024.0 * 1024.0) > gb).unwrap_or(false);
-                    if over_gb {
-                        eprintln!("Skipping steps.npy write: estimated size {:.2} GB exceeds cap {:.2} GB", (steps_bytes_est as f64)/(1024.0*1024.0*1024.0), max_gb.unwrap());
-                    } else if let Err(e) = ds_writer::write_steps_npy(&steps, &path) {
-                        eprintln!("Failed to write steps.npy at {}: {}", path.display(), e);
-                    }
-                }
-
-                // If embeddings present and complete, write shard 000001
-                if inline_emb {
-                    if let Some(dim) = emb_dim_opt {
-                        if steps.len() == emb_map.len() {
-                            let mut floats = Vec::with_capacity(steps.len() * dim);
-                            for row in &steps {
-                                let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
-                                if let Some((_d, v)) = emb_map.remove(&id) {
-                                    floats.extend_from_slice(&v);
-                                } else {
-                                    // missing embedding; abort writing
-                                    floats.clear();
-                                    break;
-                                }
-                            }
-                            if floats.len() == steps.len() * dim {
-                                let path = dir.join("embeddings-000001.npy");
-                                // Disk failsafe for embeddings
-                                let emb_bytes_est = floats.len().saturating_mul(4);
-                                let over_gb = max_gb.map(|gb| (emb_bytes_est as f64) / (1024.0 * 1024.0 * 1024.0) > gb).unwrap_or(false);
-                                if over_gb {
-                                    eprintln!("Skipping embeddings shard write: estimated size {:.2} GB exceeds cap {:.2} GB", (emb_bytes_est as f64)/(1024.0*1024.0*1024.0), max_gb.unwrap());
-                                } else if let Err(e) = ds_writer::write_embeddings_npy(&floats, steps.len(), dim, &path) {
-                                    eprintln!("Failed to write embeddings shard at {}: {}", path.display(), e);
-                                }
-                            }
-                        }
-                    }
-                }
+                writer.flush();
             } else {
                 // Drain and drop
                 while step_rx.recv().await.is_some() {}
@@ -279,64 +367,100 @@ async fn main() {
     let mut next_game_id: u32 = 0;
 
     let mut make_seed = |idx: usize| -> u64 {
-        if random_seeds { seed_rng.next_u64() } else { base_seed.wrapping_add(idx as u64) }
+        if random_seeds {
+            seed_rng.next_u64()
+        } else {
+            base_seed.wrapping_add(idx as u64)
+        }
     };
 
-    let mut should_continue = |finished_games: usize, total_steps_done: u64| -> bool {
-        let games_ok = match target_games { Some(g) => finished_games < g, None => true };
-        let steps_ok = match target_steps { Some(s) => total_steps_done < s, None => true };
-        games_ok || steps_ok
+    let should_continue = |finished_games: usize, total_steps_done: u64| -> bool {
+        let games_ok = match target_games {
+            Some(g) => finished_games < g,
+            None => true,
+        };
+        let steps_ok = match target_steps {
+            Some(s) => total_steps_done < s,
+            None => true,
+        };
+        games_ok && steps_ok
     };
 
-    // Prime concurrent actors
-    while should_continue(finished, total_steps) && set.len() < max_conc {
-        let game_id = next_game_id;
-        let actor = GameActor::new(
-            game_id,
-            handle.clone(),
-            make_seed(started),
-            config.sampling.clone(),
-            Some(step_tx.clone()),
-        );
-        set.spawn(actor.run());
-        started += 1;
-        next_game_id = next_game_id.wrapping_add(1);
-    }
+    // Main game loop
+    loop {
+        // Spawn new actors if there is capacity and we should continue
+        while set.len() < max_conc && should_continue(finished, total_steps) {
+            let game_id = next_game_id;
+            let actor = GameActor::new(
+                game_id,
+                handle.clone(),
+                make_seed(started),
+                config.sampling.clone(),
+                Some(step_tx.clone()),
+                cancel.clone(),
+                target_steps.map(actor::StepBudget::new),
+            );
+            set.spawn(actor.run());
+            started += 1;
+            next_game_id = next_game_id.wrapping_add(1);
+        }
 
-    // Keep the pipeline full until all games complete
-    while should_continue(finished, total_steps) {
+        // If the set is empty, we're done
+        if set.is_empty() {
+            break;
+        }
+
+        // Wait for a game to finish
         if let Some(res) = set.join_next().await {
             match res {
                 Ok(r) => {
                     total_steps = total_steps.saturating_add(r.steps);
-                    if res_tx.capacity() > 0 { let _ = res_tx.send(r).await; } else { /* drop if backpressured */ }
+                    if res_tx.capacity() > 0 {
+                        let _ = res_tx.send(r).await;
+                    } else { /* drop if backpressured */
+                    }
                 }
                 Err(e) => {
-                    eprintln!("actor task failed: {e}");
+                    error!("actor task failed: {e}");
                 }
             }
             finished += 1;
-            if should_continue(finished, total_steps) {
-                let game_id = next_game_id;
-                let actor = GameActor::new(
-                    game_id,
-                    handle.clone(),
-                    make_seed(started),
-                    config.sampling.clone(),
-                    Some(step_tx.clone()),
-                );
-                set.spawn(actor.run());
-                started += 1;
-                next_game_id = next_game_id.wrapping_add(1);
-            }
+        } else {
+            // This should not be reached if !set.is_empty()
+            break;
+        }
+
+        // If we've reached the limit, request graceful cancellation.
+        if !should_continue(finished, total_steps) {
+            cancel.cancel();
         }
     }
 
+    info!("Draining pipeline...");
+    drop(set);
+
     // All actors done; drop the handle so feeder can exit, then wait for it
+    info!("Draining pipeline...");
+    // Signal end of submissions and step collection
     drop(handle);
-    let _ = feeder_task.await;
-    drop(res_tx);
     drop(step_tx);
-    if let Some(h) = writer_handle { let _ = h.await; }
-    if let Some(h) = step_writer_handle { let _ = h.await; }
+    // Ensure embeddings channel closes for step writer termination
+    drop(emb_tx);
+
+    info!("Waiting for feeder task...");
+    let _ = feeder_task.await;
+    info!("Feeder task finished.");
+
+    drop(res_tx);
+    if let Some(h) = writer_handle {
+        info!("Waiting for writer task...");
+        let _ = h.await;
+        info!("Writer task finished.");
+    }
+    if let Some(h) = step_writer_handle {
+        info!("Waiting for step writer task...");
+        let _ = h.await;
+        info!("Step writer task finished.");
+    }
+    info!("All tasks finished.");
 }

@@ -246,10 +246,20 @@ pub struct Report {
     /// Optional: disk failsafe for dataset artifacts. If estimated size exceeds this many GB, skip writing.
     #[serde(default)]
     pub max_gb: Option<f64>,
+    /// Shard steps/embeddings NPY files after this many steps. Defaults to 1M.
+    #[serde(default = "defaults::shard_max_steps")]
+    pub shard_max_steps: usize,
+}
+
+impl Report {
+    pub fn shard_max_steps_or_default(&self) -> usize {
+        if self.shard_max_steps == 0 { defaults::shard_max_steps() } else { self.shard_max_steps }
+    }
 }
 
 mod defaults {
     pub fn flush_us() -> u64 { 250 }
+    pub fn shard_max_steps() -> usize { 1_000_000 }
     pub fn target_batch() -> usize { 512 }
     pub fn max_batch() -> usize { 1024 }
     pub fn inflight_batches() -> usize { 2 }
