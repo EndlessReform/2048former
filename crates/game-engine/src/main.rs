@@ -352,6 +352,8 @@ async fn main() {
     // Spawn per-game actors up to max_concurrent_games
     let target_games: Option<usize> = config.num_seeds.map(|v| v as usize);
     let target_steps: Option<u64> = config.max_steps;
+    // Shared global step budget across all actors (if max_steps is set)
+    let step_budget = target_steps.map(actor::StepBudget::new);
     let max_conc = config.max_concurrent_games as usize;
     let mut started: usize = 0;
     let mut finished: usize = 0;
@@ -398,7 +400,7 @@ async fn main() {
                 config.sampling.clone(),
                 Some(step_tx.clone()),
                 cancel.clone(),
-                target_steps.map(actor::StepBudget::new),
+                step_budget.clone(),
             );
             set.spawn(actor.run());
             started += 1;
