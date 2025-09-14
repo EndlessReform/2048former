@@ -12,12 +12,19 @@ from .binning import BinningConfig
 
 
 def _find_repo_root() -> Path:
-    # Heuristic: repo root is the parent of 'src'
+    """Return the repository root by walking upwards.
+
+    Prefer a directory that contains a VCS marker ('.git') or monorepo markers
+    like 'packages' or top-level 'datasets'. Fallback to the old heuristic
+    (parent of 'src') if nothing matches.
+    """
     here = Path(__file__).resolve()
-    # e.g., .../repo/src/train_2048/config.py -> repo
-    src_dir = here.parent.parent  # .../repo/src
-    root = src_dir.parent
-    return root
+    for parent in here.parents:
+        if (parent / ".git").exists() or (parent / "packages").exists() or (parent / "datasets").exists():
+            return parent
+    # Fallback: parent of 'src'
+    src_dir = here.parent.parent
+    return src_dir.parent
 
 
 class DatasetConfig(BaseModel):
@@ -184,6 +191,29 @@ class DropoutConfig(BaseModel):
         return v
 
 
+class CheckpointConfig(BaseModel):
+    # Save an epoch checkpoint at this cadence (keep all)
+    every_epochs: Optional[int] = 1
+    # Optionally evaluate and save a single best checkpoint every N steps
+    save_best_every_steps: Optional[int] = None
+    # Minimum improvement required to update the best
+    best_min_delta: float = 0.0
+
+    @field_validator("every_epochs", "save_best_every_steps")
+    @classmethod
+    def _non_negative_or_none(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("checkpoint intervals must be > 0 when provided")
+        return v
+
+    @field_validator("best_min_delta")
+    @classmethod
+    def _delta_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("best_min_delta must be >= 0")
+        return v
+
+
 class TrainingConfig(BaseModel):
     # IO
     init_dir: str
@@ -198,6 +228,8 @@ class TrainingConfig(BaseModel):
     binning: BinningConfig = Field(default_factory=BinningConfig)
     # Dataset input
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
+    # Checkpointing
+    checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
 
     # Misc
     seed: int = 0
@@ -221,6 +253,7 @@ __all__ = [
     "HyperParams",
     "BatchConfig",
     "DropoutConfig",
+    "CheckpointConfig",
     "TrainingConfig",
     "load_config",
     "load_encoder_from_init",

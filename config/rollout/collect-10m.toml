@@ -1,5 +1,5 @@
-#max_steps = 10000000
-max_steps = 1000000
+max_steps = 10000000
+#max_steps = 1000000
 max_concurrent_games = 512
 max_retries = 3
 

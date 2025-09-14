@@ -26,9 +26,13 @@ struct ShardedWriter {
     max_gb: Option<f64>,
     inline_embeddings: bool,
     shard_idx: u32,
-    steps: Vec<ds_writer::StepRow>,
-    emb_map: HashMap<u64, (usize, Vec<f32>)>,
+    // Ready, paired rows (guaranteed to have both step and embedding when enabled)
+    steps_buf: Vec<ds_writer::StepRow>,
+    emb_buf: Vec<f32>,
     emb_dim: Option<usize>,
+    // Pending unmatched items by global id = (run_id<<32)|step_idx
+    pending_steps: HashMap<u64, ds_writer::StepRow>,
+    pending_embs: HashMap<u64, Vec<f32>>,
     total_steps: u64,
 }
 
@@ -45,42 +49,67 @@ impl ShardedWriter {
             max_gb,
             inline_embeddings,
             shard_idx: 0,
-            steps: Vec::with_capacity(shard_max_steps),
-            emb_map: HashMap::new(),
+            steps_buf: Vec::with_capacity(shard_max_steps),
+            emb_buf: Vec::new(),
             emb_dim: None,
+            pending_steps: HashMap::new(),
+            pending_embs: HashMap::new(),
             total_steps: 0,
         }
     }
 
     fn push_step(&mut self, row: ds_writer::StepRow) {
-        self.steps.push(row);
+        let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
+        if self.inline_embeddings {
+            if let Some(v) = self.pending_embs.remove(&id) {
+                // Pair immediately
+                if let Some(dim) = self.emb_dim {
+                    if v.len() == dim {
+                        self.steps_buf.push(row);
+                        self.emb_buf.extend_from_slice(&v);
+                    } else {
+                        // Drop mismatched embedding silently
+                        self.pending_steps.insert(id, row);
+                    }
+                } else {
+                    // First embedding defines dim
+                    self.emb_dim = Some(v.len());
+                    self.steps_buf.push(row);
+                    self.emb_buf.extend_from_slice(&v);
+                }
+            } else {
+                self.pending_steps.insert(id, row);
+            }
+        } else {
+            self.steps_buf.push(row);
+        }
         self.total_steps += 1;
         if self.total_steps % 10_000 == 0 {
-            debug!(
-                "total steps: {}, buffered: {}",
-                self.total_steps,
-                self.steps.len()
-            );
+            debug!("total steps: {}, paired buffered: {}", self.total_steps, self.steps_buf.len());
         }
-        if self.steps.len() >= self.shard_max_steps {
+        if self.steps_buf.len() >= self.shard_max_steps {
             self.write_shard("shard_full");
         }
     }
 
     fn push_embedding(&mut self, er: feeder::EmbeddingRow) {
-        if self.emb_dim.is_none() {
-            self.emb_dim = Some(er.dim);
+        if !self.inline_embeddings { return; }
+        if self.emb_dim.is_none() { self.emb_dim = Some(er.dim); }
+        if self.emb_dim != Some(er.dim) { return; }
+        let id = er.id;
+        if let Some(step) = self.pending_steps.remove(&id) {
+            self.steps_buf.push(step);
+            self.emb_buf.extend_from_slice(&er.values);
+        } else {
+            self.pending_embs.insert(id, er.values);
         }
-        if self.emb_dim == Some(er.dim) {
-            self.emb_map.insert(er.id, (er.dim, er.values));
-        }
-        if self.emb_map.len() >= self.shard_max_steps {
+        if self.steps_buf.len() >= self.shard_max_steps {
             self.write_shard("emb_full");
         }
     }
 
     fn write_shard(&mut self, reason: &str) {
-        if self.steps.is_empty() {
+        if self.steps_buf.is_empty() {
             return;
         }
         self.shard_idx += 1;
@@ -90,53 +119,41 @@ impl ShardedWriter {
         let steps_path = self.session_dir.join(format!("steps-{shard_id}.npy"));
         info!(
             "flushing {} steps to {} (reason: {})",
-            self.steps.len(),
+            self.steps_buf.len(),
             steps_path.display(),
             reason
         );
-        let steps_bytes_est = self.steps.len() * (8 + 4 + 16);
+        let steps_bytes_est = self.steps_buf.len() * (8 + 4 + 16);
         if self
             .max_gb
             .map_or(false, |gb| (steps_bytes_est as f64) / 1e9 > gb)
         {
             eprintln!("Skipping steps shard write: est. size > cap");
-        } else if let Err(e) = ds_writer::write_steps_npy(&self.steps, &steps_path) {
+        } else if let Err(e) = ds_writer::write_steps_npy(&self.steps_buf, &steps_path) {
             eprintln!("Failed to write steps shard {}: {}", shard_id, e);
         }
 
         // Write embeddings shard if enabled and consistent
         if self.inline_embeddings {
             if let Some(dim) = self.emb_dim {
-                let mut floats = Vec::with_capacity(self.steps.len() * dim);
-                let mut consistent = true;
-                for row in &self.steps {
-                    let id = ((row.run_id as u64) << 32) | (row.step_idx as u64);
-                    if let Some((_d, v)) = self.emb_map.remove(&id) {
-                        floats.extend_from_slice(&v);
-                    } else {
-                        consistent = false;
-                        break;
-                    }
-                }
-
-                if consistent && !floats.is_empty() {
+                if !self.emb_buf.is_empty() {
                     let emb_path = self.session_dir.join(format!("embeddings-{shard_id}.npy"));
-                    let emb_bytes_est = floats.len() * 4;
+                    let emb_bytes_est = self.emb_buf.len() * 4;
                     if self
                         .max_gb
                         .map_or(false, |gb| (emb_bytes_est as f64) / 1e9 > gb)
                     {
                         eprintln!("Skipping embeddings shard write: est. size > cap");
                     } else if let Err(e) =
-                        ds_writer::write_embeddings_npy(&floats, self.steps.len(), dim, &emb_path)
+                        ds_writer::write_embeddings_npy(&self.emb_buf, self.steps_buf.len(), dim, &emb_path)
                     {
                         eprintln!("Failed to write embeddings shard {}: {}", shard_id, e);
                     }
                 }
             }
         }
-        self.steps.clear();
-        self.emb_map.clear();
+        self.steps_buf.clear();
+        self.emb_buf.clear();
     }
 
     fn flush(&mut self) {
