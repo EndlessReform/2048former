@@ -9,9 +9,14 @@ use clap::Parser;
 use log::{debug, error, info};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use std::time::Duration;
 
 use actor::GameActor;
 use feeder::Feeder;
@@ -234,6 +239,11 @@ async fn main() {
         let session_dir = config.orchestrator.report.session_dir.clone();
         let max_ram_mb = config.orchestrator.report.max_ram_mb;
         let max_gb = config.orchestrator.report.max_gb;
+        // Surface where results will be written (or disabled)
+        match results_path.as_ref() {
+            Some(p) => eprintln!("[client] results file: {}", p.display()),
+            None => eprintln!("[client] results file: disabled"),
+        }
         Some(tokio::spawn(async move {
             // Results JSONL sink (optional)
             let mut file_opt = if let Some(path) = results_path.as_ref() {
@@ -375,6 +385,9 @@ async fn main() {
     let mut started: usize = 0;
     let mut finished: usize = 0;
     let mut total_steps: u64 = 0;
+    // Progress accounting
+    let started_counter = Arc::new(AtomicUsize::new(0));
+    let finished_counter = Arc::new(AtomicUsize::new(0));
     let mut set: JoinSet<actor::GameResult> = JoinSet::new();
 
     // Seed strategy (default reproducible):
@@ -393,22 +406,36 @@ async fn main() {
         }
     };
 
-    let should_continue = |finished_games: usize, total_steps_done: u64| -> bool {
-        let games_ok = match target_games {
-            Some(g) => finished_games < g,
-            None => true,
-        };
-        let steps_ok = match target_steps {
-            Some(s) => total_steps_done < s,
-            None => true,
-        };
+    // Bug fix: bound spawning by `started` (not `finished`) to avoid overshooting `num_seeds`.
+    let can_spawn_more = |started_games: usize, total_steps_done: u64| -> bool {
+        let games_ok = match target_games { Some(g) => started_games < g, None => true };
+        let steps_ok = match target_steps { Some(s) => total_steps_done < s, None => true };
         games_ok && steps_ok
+    };
+
+    // Spawn a lightweight progress reporter (prints every 2s)
+    let progress_task = {
+        let started_c = started_counter.clone();
+        let finished_c = finished_counter.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let s = started_c.load(Ordering::Relaxed);
+                let f = finished_c.load(Ordering::Relaxed);
+                let running = s.saturating_sub(f);
+                eprintln!(
+                    "[client] progress: started={} running={} finished={}",
+                    s, running, f
+                );
+                if running == 0 { break; }
+            }
+        })
     };
 
     // Main game loop
     loop {
         // Spawn new actors if there is capacity and we should continue
-        while set.len() < max_conc && should_continue(finished, total_steps) {
+        while set.len() < max_conc && can_spawn_more(started, total_steps) {
             let game_id = next_game_id;
             let actor = GameActor::new(
                 game_id,
@@ -421,6 +448,7 @@ async fn main() {
             );
             set.spawn(actor.run());
             started += 1;
+            started_counter.fetch_add(1, Ordering::Relaxed);
             next_game_id = next_game_id.wrapping_add(1);
         }
 
@@ -444,17 +472,24 @@ async fn main() {
                 }
             }
             finished += 1;
+            finished_counter.fetch_add(1, Ordering::Relaxed);
         } else {
             // This should not be reached if !set.is_empty()
             break;
         }
 
-        // If we've reached the limit, request graceful cancellation.
-        if !should_continue(finished, total_steps) {
-            cancel.cancel();
+        // If we've reached the limit, decide whether to cancel immediately
+        // or allow all in-flight games to finish:
+        // - If we are running with a global step budget AND saving embeddings,
+        //   we cancel to respect the exact budget for dataset collection.
+        // - Otherwise (typical benchmark/results mode), do NOT cancel; stop
+        //   spawning new games and let existing ones finish naturally.
+        if !can_spawn_more(started, total_steps) {
+            if step_budget.is_some() && config.orchestrator.inline_embeddings {
+                cancel.cancel();
+            }
         }
     }
-
     info!("Draining pipeline...");
     drop(set);
 
@@ -481,5 +516,6 @@ async fn main() {
         let _ = h.await;
         info!("Step writer task finished.");
     }
+    let _ = progress_task.await;
     info!("All tasks finished.");
 }

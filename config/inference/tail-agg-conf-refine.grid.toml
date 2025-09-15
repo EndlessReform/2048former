@@ -1,0 +1,31 @@
+# Grid: TailAggConf gate sweep (<= 10 variants)
+# - Focus on start_gate near key transition points (5k, 7k, 9k, 11k)
+# - Two stop_gate options to bound the window while keeping variant count small
+# - Fix best-known params from previous runs: alpha=0.28, beta=12.0, gamma=1.0
+
+num_seeds = 384
+max_retries = 1
+max_concurrent_games = 256
+
+[sampling]
+strategy = "TailAggConf"
+conf_alpha = [0.28, 0.31, 0.34]
+conf_beta = 12.0
+conf_gamma = 1.0
+
+start_gate = [5000, 7000, 9000, 11000]
+# stop_gate  = [14000, 16000]
+
+[orchestrator.connection]
+# Use UDS by default; the bench can override via --uds/--tcp.
+uds_path = "/tmp/2048_infer.sock"
+
+[orchestrator.batch]
+flush_us = 500
+target_batch = 128
+max_batch = 256
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+
+# Results/metrics are injected by the benchmark harness; no need to set here.

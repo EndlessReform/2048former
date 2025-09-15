@@ -1,5 +1,5 @@
 # init_dir = "inits/v1_50m_20250830_stable"
-init_dir = "inits/v1_50m_32bin"
+init_dir = "inits/v1/10m_32bin"
 # init_dir = "inits/v1_50m_20250906_longctxt_base"
 checkpoint_dir = "checkpoints"
 seed = 0
@@ -14,12 +14,12 @@ mode = "online"                        # online | offline | disabled
 report_every = 50                      # log to W&B every N steps (>=1)
 
 [hyperparameters]
-learning_rate = 3e-4
+learning_rate = 6e-4
 muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay
-warmup_steps = 1500
+warmup_steps = 400
 # decay_steps = 0
 # Alternatively, specify a percentage of total steps for cooldown/decay
 cooldown_pct = 0.2 # e.g., last 10% of steps
@@ -29,7 +29,7 @@ min_lr_ratio = 0.1
 name = "adamw"      # adamw | muon
 weight_decay = 0.01
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.98
 eps = 1e-8
 
 [batch]
@@ -95,7 +95,7 @@ dataset_dir = "./datasets/ds_v4_full-game"
 # sql_params = [50_000, 2_000_000]
 
 # Drive by epochs
-num_epochs = 10
+num_epochs = 3
 
 # Validation: disjoint by runs. Here, use a fixed percentage split.
 val_run_pct = 0.02
