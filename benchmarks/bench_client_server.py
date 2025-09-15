@@ -151,8 +151,33 @@ def _collect_run_metrics(results_file: Path) -> dict:
         "steps_max": int(max(steps)),
         "steps_min": int(min(steps)),
         "top_max": int(max(tops)),
+        "top_min": int(min(tops)),
         **{f"reach_{thr}": reached_counts[thr] for thr in thresholds},
     }
+
+
+def _format_summary_text(results_file: Path, title: str = "Benchmark Summary (client/server)") -> str:
+    m = _collect_run_metrics(results_file)
+    lines: list[str] = []
+    lines.append("\n=== " + title + " ===")
+    games = int(m.get("games", 0) or 0)
+    if games == 0:
+        lines.append("games: 0")
+        return "\n".join(lines)
+    lines.append(f"games: {games}")
+    lines.append(
+        f"scores    -> mean: {m['score_mean']:.2f}  max: {m['score_max']}  min: {m['score_min']}"
+    )
+    lines.append(
+        f"steps     -> mean: {m['steps_mean']:.2f}  max: {m['steps_max']}  min: {m['steps_min']}"
+    )
+    thresholds = [1024, 2048, 4096, 8192, 16384, 32768]
+    lines.append(
+        "reached   -> "
+        + ", ".join(f"{thr}: {int(m.get(f'reach_{thr}', 0))}/{games}" for thr in thresholds)
+    )
+    lines.append(f"top tile  -> max: {m['top_max']}  min: {m['top_min']}")
+    return "\n".join(lines)
 
 
 def _write_grid_csv_summary(outdir: Path, rows: list[dict]) -> None:
@@ -359,30 +384,10 @@ def start_client(client_cfg: Path, release: bool) -> int:
     return proc.wait()
 
 
-def summarize_results(results_file: Path) -> None:
-    # Simple JSONL reader
-    scores, steps, tops = [], [], []
-    with open(results_file, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            scores.append(int(rec["score"]))
-            steps.append(int(rec["steps"]))
-            tops.append(int(rec["highest_tile"]))
-    import statistics
-
-    if not scores:
-        print("No games found in results file.")
-        return
-    thresholds = [1024, 2048, 4096, 8192, 16384, 32768]
-    reached_counts = {thr: sum(1 for t in tops if t >= thr) for thr in thresholds}
-    print("\n=== Benchmark Summary (client/server) ===")
-    print(f"games: {len(scores)}")
-    print(f"scores    -> mean: {statistics.fmean(scores):.2f}  max: {max(scores)}  min: {min(scores)}")
-    print(f"steps     -> mean: {statistics.fmean(steps):.2f}  max: {max(steps)}  min: {min(steps)}")
-    print("reached   -> " + ", ".join(f"{thr}: {reached_counts[thr]}/{len(scores)}" for thr in thresholds))
-    print(f"top tile  -> max: {max(tops)}  min: {min(tops)}")
+def summarize_results(results_file: Path) -> str:
+    text = _format_summary_text(results_file)
+    print(text)
+    return text
 
 
 def main() -> None:
@@ -507,14 +512,23 @@ def main() -> None:
 
     if not args.no_summary:
         if single_cfg is not None:
-            summarize_results(rp.results_file)
+            text = summarize_results(rp.results_file)
+            # Persist the exact summary to a text file in the run directory
+            with (rp.outdir / "summary.txt").open("w", encoding="utf-8") as fp:
+                fp.write(text + "\n")
         else:
-            # Summarize each variant's results
-            for idx, (label, _cfg_variant) in enumerate(variants):
-                res_file = rp.outdir / (f"grid_{idx:03d}_" + label) / "results.jsonl"
-                if res_file.exists():
-                    print(f"\n[bench] Summary for {label}")
-                    summarize_results(res_file)
+            # Summarize each variant's results and write a combined summary file
+            out_txt = rp.outdir / "summary.txt"
+            with out_txt.open("w", encoding="utf-8") as fp:
+                for idx, (label, _cfg_variant) in enumerate(variants):
+                    res_file = rp.outdir / (f"grid_{idx:03d}_" + label) / "results.jsonl"
+                    if res_file.exists():
+                        header = f"[bench] Summary for {label}"
+                        print("\n" + header)
+                        text = _format_summary_text(res_file, title=f"Benchmark Summary (client/server) — {label}")
+                        print(text)
+                        fp.write(header + "\n")
+                        fp.write(text + "\n")
 
 
 if __name__ == "__main__":

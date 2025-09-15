@@ -18,6 +18,7 @@ profiles
 
 # inference
 bench_runs
+selfplay
 
 # Added by cargo
 

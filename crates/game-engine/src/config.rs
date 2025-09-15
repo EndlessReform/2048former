@@ -136,8 +136,15 @@ impl SamplingStrategy {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub struct Config {
-    pub num_seeds: u32,
+    /// Optional: number of games to run. If omitted, the orchestrator will run until `max_steps` is reached.
+    #[serde(default)]
+    pub num_seeds: Option<u32>,
+    /// Optional: total steps budget across all games. If set, the orchestrator stops once this is reached.
+    #[serde(default)]
+    pub max_steps: Option<u64>,
+    /// Max per-actor games scheduled concurrently.
     pub max_concurrent_games: u32,
+    /// Transient RPC retry attempts (batch-level).
     pub max_retries: u32,
 
     pub sampling: SamplingStrategy,
@@ -155,6 +162,15 @@ pub struct Orchestrator {
     pub batch: Batch,
     #[serde(default)]
     pub report: Report,
+    /// If true, request embeddings from the server and write them to NPY shards.
+    #[serde(default)]
+    pub inline_embeddings: bool,
+    /// Optional: use this as a fixed base seed for reproducibility. If omitted, seeds are fully random.
+    #[serde(default)]
+    pub fixed_seed: Option<u64>,
+    /// Opt-out: when true, ignore fixed/default base seed and use full randomness.
+    #[serde(default)]
+    pub random_seeds: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -187,7 +203,7 @@ pub struct Batch {
 
 impl Default for Orchestrator {
     fn default() -> Self {
-        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default() }
+        Self { connection: Connection::default(), batch: Batch::default(), report: Report::default(), inline_embeddings: false, fixed_seed: None, random_seeds: false }
     }
 }
 
@@ -222,10 +238,28 @@ impl Config {
 pub struct Report {
     #[serde(default)]
     pub results_file: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub session_dir: Option<std::path::PathBuf>,
+    /// Optional: in-memory buffering cap to avoid OOM (approximate). If exceeded, stop collecting new rows.
+    #[serde(default)]
+    pub max_ram_mb: Option<usize>,
+    /// Optional: disk failsafe for dataset artifacts. If estimated size exceeds this many GB, skip writing.
+    #[serde(default)]
+    pub max_gb: Option<f64>,
+    /// Shard steps/embeddings NPY files after this many steps. Defaults to 1M.
+    #[serde(default = "defaults::shard_max_steps")]
+    pub shard_max_steps: usize,
+}
+
+impl Report {
+    pub fn shard_max_steps_or_default(&self) -> usize {
+        if self.shard_max_steps == 0 { defaults::shard_max_steps() } else { self.shard_max_steps }
+    }
 }
 
 mod defaults {
     pub fn flush_us() -> u64 { 250 }
+    pub fn shard_max_steps() -> usize { 1_000_000 }
     pub fn target_batch() -> usize { 512 }
     pub fn max_batch() -> usize { 1024 }
     pub fn inflight_batches() -> usize { 2 }

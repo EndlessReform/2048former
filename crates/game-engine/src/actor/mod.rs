@@ -1,8 +1,11 @@
 use crate::config;
-use crate::feeder::{Bins, FeederHandle};
+use crate::feeder::FeederHandle;
+use crate::ds_writer::StepRow as DsStepRow;
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio_util::sync::CancellationToken;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
-use rand::distributions::Distribution;
 use rand::SeedableRng;
 
 pub mod strategies;
@@ -15,6 +18,33 @@ pub struct GameActor {
     pub board: Board,
     pub seed: u64,
     pub sampling: config::SamplingStrategy,
+    pub step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
+    pub cancel: CancellationToken,
+    pub step_budget: Option<StepBudget>,
+}
+
+#[derive(Clone)]
+pub struct StepBudget {
+    max: u64,
+    used: Arc<AtomicU64>,
+}
+
+impl StepBudget {
+    pub fn new(max: u64) -> Self { Self { max, used: Arc::new(AtomicU64::new(0)) } }
+    /// Try to consume exactly 1 step budget. Returns false if exhausted.
+    pub fn try_take(&self) -> bool {
+        let mut cur = self.used.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.max { return false; }
+            match self.used.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(next) => cur = next,
+            }
+        }
+    }
+    /// Read the number of steps consumed so far.
+    #[allow(dead_code)]
+    pub fn used(&self) -> u64 { self.used.load(Ordering::Relaxed) }
 }
 
 pub struct GameResult {
@@ -26,13 +56,21 @@ pub struct GameResult {
 }
 
 impl GameActor {
-    pub fn new(game_id: u32, handle: FeederHandle, seed: u64, sampling: config::SamplingStrategy) -> Self {
+    pub fn new(
+        game_id: u32,
+        handle: FeederHandle,
+        seed: u64,
+        sampling: config::SamplingStrategy,
+        step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
+        cancel: CancellationToken,
+        step_budget: Option<StepBudget>,
+    ) -> Self {
         // Initialize a fresh board with two random tiles
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut board: Board = Board::EMPTY;
         board = board.with_random_tile(&mut rng);
         board = board.with_random_tile(&mut rng);
-        Self { game_id, handle, board, seed, sampling }
+        Self { game_id, handle, board, seed, sampling, step_tx, cancel, step_budget }
     }
 
     /// Run the actor loop to completion and return the result.
@@ -42,17 +80,24 @@ impl GameActor {
         let mut rng = rand::rngs::StdRng::from_entropy();
 
         while !self.board.is_game_over() {
+            if self.cancel.is_cancelled() { break; }
+            if let Some(b) = &self.step_budget { if !b.try_take() { break; } }
             let id = ((self.game_id as u64) << 32) | seq;
             let board_bytes = board_to_exponents(self.board);
+            // Record step row (pre-move state) for dataset
+            if let Some(tx) = &self.step_tx {
+                let _ = tx.try_send(DsStepRow { run_id: self.game_id as u64, step_idx: steps as u32, exps: board_bytes });
+            }
             let rx = self.handle.submit(id, self.game_id, board_bytes).await;
-            let bins = match rx.await {
-                Ok(Ok(b)) => b,
-                Ok(Err(_status)) => {
-                    // On RPC failure, end the game; outer orchestrator may decide to retry/restart.
-                    break;
-                }
-                Err(_canceled) => {
-                    break;
+            let bins = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => { break; }
+                res = rx => {
+                    match res {
+                        Ok(Ok(b)) => b,
+                        Ok(Err(_status)) => { break; },
+                        Err(_canceled) => { break; },
+                    }
                 }
             };
             // Compute legal mask and select move according to configured sampling strategy
@@ -108,4 +153,3 @@ fn legal_mask(board: Board) -> [bool; 4] {
     }
     mask
 }
-

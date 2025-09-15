@@ -251,6 +251,37 @@ def train(
     except Exception:
         wandb_report_every = 1
 
+    # Best checkpoint tracking (evaluated at coarse intervals)
+    best_val_loss = float("inf")
+
+    def _maybe_save_best(step: int, epoch: Optional[int] = None) -> None:
+        """Save a 'model-best.safetensors' at coarse intervals based on val loss.
+        Not tied to general val cadence to avoid frequent writes.
+        """
+        if getattr(cfg, "checkpoint", None) is None:
+            return
+        if cfg.checkpoint.save_best_every_steps is None:
+            return
+        if dl_val is None:
+            return
+        interval = int(cfg.checkpoint.save_best_every_steps)
+        if step <= 0 or (step % interval) != 0:
+            return
+        nonlocal best_val_loss
+        val_metrics = evaluate(model, dl_val, device)
+        val_loss = float(val_metrics["loss"])
+        if val_loss + float(cfg.checkpoint.best_min_delta) < best_val_loss:
+            best_val_loss = val_loss
+            _save_checkpoint(model, run_ckpt_dir / "model-best.safetensors")
+            if wandb_run is not None:
+                _safe_wandb_log(
+                    {
+                        "best/val_loss": val_loss,
+                        "best/epoch": (epoch if epoch is not None else -1),
+                    },
+                    step=step,
+                )
+
     if fixed_steps > 0:
         it = iter(dl_train)
         pbar = tqdm(
@@ -314,8 +345,10 @@ def train(
                             "val/loss_r": val_metrics["head_losses"][3],
                         },
                         step=global_step,
-                    )
+                )
             global_step += 1
+            # Coarse best checkpointing (if configured)
+            _maybe_save_best(global_step, None)
     else:
         for epoch in range(epochs):
             if per_epoch_steps > 0:
@@ -386,6 +419,17 @@ def train(
                                 step=global_step,
                             )
                     global_step += 1
+                    # Coarse best checkpointing (if configured)
+                    _maybe_save_best(global_step, epoch)
+                # Epoch-end checkpoint (keep all)
+                if (
+                    getattr(cfg, "checkpoint", None) is not None
+                    and cfg.checkpoint.every_epochs is not None
+                    and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0)
+                ):
+                    _save_checkpoint(
+                        model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors"
+                    )
             else:
                 pbar = tqdm(desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
                 it = iter(dl_train)
@@ -449,6 +493,17 @@ def train(
                                 step=global_step,
                             )
                     global_step += 1
+                    # Coarse best checkpointing (if configured)
+                    _maybe_save_best(global_step, epoch)
+                # Epoch-end checkpoint (keep all)
+                if (
+                    getattr(cfg, "checkpoint", None) is not None
+                    and cfg.checkpoint.every_epochs is not None
+                    and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0)
+                ):
+                    _save_checkpoint(
+                        model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors"
+                    )
 
     # Save final checkpoint (canonical name expected by loaders)
     ckpt_path = _save_checkpoint(model, run_ckpt_dir / "model.safetensors")

@@ -9,7 +9,9 @@ import grpc
 
 import torch
 
-from core_2048 import load_encoder_from_init, prepare_model_for_inference, forward_distributions
+from core_2048 import load_encoder_from_init, prepare_model_for_inference
+from core_2048.infer import forward_distributions
+import torch.nn.functional as F
 
 
 # Expect stubs under package-local path: src/infer_2048/proto/train_2048/inference/v1
@@ -89,20 +91,47 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             tokens = torch.as_tensor(tokens_list, dtype=torch.long, device=model_device)
             vlog("[server] tokens moved to device")
 
-            # Forward: per-head (B, n_bins)
-            head_probs = forward_distributions(self.model, tokens, set_eval=True)
-            vlog("[server] forward done")
-
-            # Convert to response with a SINGLE DtoH copy: stack heads -> (B,4,n_bins) on CPU
-            probs_all = torch.stack(head_probs, dim=1)  # (B, 4, n_bins)
+            # Forward once to obtain hidden states and logits
+            prev_mode = self.model.training
+            self.model.eval()
+            with torch.inference_mode():
+                hidden_states, ev_logits = self.model(tokens)
+                # Softmax per head over bins
+                head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in ev_logits]
+                probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
+                # Optional pooled embedding: mean over sequence
+                return_embedding: bool = bool(getattr(request, "return_embedding", False))
+                if return_embedding:
+                    board_repr = hidden_states.mean(dim=1)  # (B, H)
+            # Materialize CPU copies
             probs_cpu = probs_all.to("cpu", non_blocking=False)
             probs_list: list[list[list[float]]] = probs_cpu.tolist()  # B x 4 x n_bins
-            outputs = [
-                inference_pb2.Output(
-                    heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
-                )
-                for i in range(B)
-            ]
+
+            outputs = []
+            emb_dim: int = 0
+            embeddings_concat: Optional[bytes] = None
+            if bool(getattr(request, "return_embedding", False)):
+                # Encode all embeddings as a single FP32 bytes buffer to minimize
+                # per-item serialization overhead. Clients split using embed_dim.
+                br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
+                emb_dim = int(br_cpu.shape[1])
+                embeddings_concat = br_cpu.numpy().tobytes()
+                # Do not include per-item embeddings; keep Output.embedding empty
+                outputs = [
+                    inference_pb2.Output(
+                        heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
+                    )
+                    for i in range(B)
+                ]
+            else:
+                outputs = [
+                    inference_pb2.Output(
+                        heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
+                    )
+                    for i in range(B)
+                ]
+            # Restore training state
+            self.model.train(prev_mode)
             vlog("[server] response materialized")
         except Exception as e:
             print(f"[server] Infer exception: {e}", flush=True)
@@ -111,12 +140,24 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
 
         t1 = time.perf_counter()
         latency_ms = int((t1 - t0) * 1000.0)
-        resp = inference_pb2.InferResponse(
-            batch_id=request.batch_id,
-            item_ids=item_ids,
-            outputs=outputs,
-            latency_ms=latency_ms,
-        )
+        # Build response; include embedding metadata if present
+        if bool(getattr(request, "return_embedding", False)):
+            resp = inference_pb2.InferResponse(
+                batch_id=request.batch_id,
+                item_ids=item_ids,
+                outputs=outputs,
+                latency_ms=latency_ms,
+                embed_dim=int(emb_dim),
+                embed_dtype=inference_pb2.InferResponse.FP32,
+                embeddings_concat=embeddings_concat or b"",
+            )
+        else:
+            resp = inference_pb2.InferResponse(
+                batch_id=request.batch_id,
+                item_ids=item_ids,
+                outputs=outputs,
+                latency_ms=latency_ms,
+            )
         vlog(f"[server] Infer end: B={B} latency_ms={latency_ms}")
         return resp
 

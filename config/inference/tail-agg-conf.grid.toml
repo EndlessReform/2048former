@@ -8,7 +8,7 @@ strategy = "TailAggConf"
 # Grid over confidence-weighted tail aggregation
 # Try a few alphas (max p2 weight at zero margin), betas (slope), and gammas (curvature)
 conf_alpha = [0.20, 0.25, 0.30]
-conf_beta  = [8.0, 12.0, 16.0]
+conf_beta = [8.0, 12.0, 16.0]
 conf_gamma = [1.0, 1.5]
 
 # Optional gating to restrict non-argmax to a window (disabled by default)
@@ -36,4 +36,3 @@ queue_cap = 8192
 # Optional: per-game results (JSONL)
 # [orchestrator.report]
 # results_file = "runs/results.jsonl"
-
