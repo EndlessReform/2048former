@@ -12,12 +12,12 @@ pub mod api {
 // Re-export for concise paths: pb::inference_client::InferenceClient, messages, etc.
 pub use api::train_2048::inference::v1 as pb;
 
-use pb::inference_client::InferenceClient;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tokio::net::UnixStream;
-use tower::service_fn;
 use hyper_util::rt::tokio::TokioIo;
+use pb::inference_client::InferenceClient;
 use std::io;
+use tokio::net::UnixStream;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
 
 // Public alias for the generated client type
 pub type Client = InferenceClient<Channel>;
@@ -30,7 +30,9 @@ pub async fn connect<D: AsRef<str>>(dst: D) -> Result<Client, tonic::transport::
 
 /// Connect to the inference endpoint over a Unix Domain Socket at `path`.
 /// Example path: "/tmp/2048_infer.sock".
-pub async fn connect_uds<P: AsRef<std::path::Path>>(path: P) -> Result<Client, tonic::transport::Error> {
+pub async fn connect_uds<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Client, tonic::transport::Error> {
     // Hyper requires a valid URI even when using a custom connector; use a dummy.
     let ep = Endpoint::try_from("http://[::]:50051")?;
     let path_string = path.as_ref().to_path_buf();
@@ -56,7 +58,10 @@ pub async fn infer_once(
 ) -> Result<pb::InferResponse, tonic::Status> {
     let items_pb: Vec<pb::Item> = items
         .into_iter()
-        .map(|(id, board)| pb::Item { id, board: board.to_vec() })
+        .map(|(id, board)| pb::Item {
+            id,
+            board: board.to_vec(),
+        })
         .collect();
     let req = pb::InferRequest {
         model_id: model_id.unwrap_or_default(),

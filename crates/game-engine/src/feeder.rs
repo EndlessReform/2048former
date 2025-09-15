@@ -1,14 +1,14 @@
 use crate::config;
 use crate::grpc::{self, pb};
-use tokio::sync::mpsc as tokio_mpsc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tonic::Status;
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
 
 /// Single inference item sent to the micro-batcher.
 /// - `id` is a stable, caller-supplied identifier used for routing
@@ -65,7 +65,13 @@ impl Feeder {
             emb_tx: None,
             cancel: None,
         };
-        (feeder, FeederHandle { tx: req_tx, pending })
+        (
+            feeder,
+            FeederHandle {
+                tx: req_tx,
+                pending,
+            },
+        )
     }
 
     /// Sender used internally to return credits when a batch completes.
@@ -106,7 +112,10 @@ impl Feeder {
                         }
                     }
                 } else {
-                    match self.req_rx.recv().await { Some(item) => buf.push(item), None => return }
+                    match self.req_rx.recv().await {
+                        Some(item) => buf.push(item),
+                        None => return,
+                    }
                 }
 
                 let deadline = Instant::now() + flush;
@@ -173,18 +182,28 @@ impl Feeder {
                             let mut map = pending.lock().await;
                             // If embeddings are requested, prefer concatenated buffer when present
                             let mut emitted_from_concat = false;
-                            if let (Some(ch), true) = (emb_tx.as_ref(), !resp.embeddings_concat.is_empty()) {
-                                if embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                            if let (Some(ch), true) =
+                                (emb_tx.as_ref(), !resp.embeddings_concat.is_empty())
+                            {
+                                if embed_dim > 0
+                                    && resp.embed_dtype
+                                        == pb::infer_response::EmbedDType::Fp32 as i32
+                                {
                                     // Safe cast: u8 bytes to f32 words
-                                    let floats: &[f32] = bytemuck::try_cast_slice(&resp.embeddings_concat)
-                                        .unwrap_or(&[]);
+                                    let floats: &[f32] =
+                                        bytemuck::try_cast_slice(&resp.embeddings_concat)
+                                            .unwrap_or(&[]);
                                     let n_items = resp.item_ids.len();
                                     if floats.len() == n_items * embed_dim {
                                         for (i, item_id) in resp.item_ids.iter().enumerate() {
                                             let start = i * embed_dim;
                                             let end = start + embed_dim;
                                             let v: Vec<f32> = floats[start..end].to_vec();
-                                            let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                            let _ = ch.try_send(EmbeddingRow {
+                                                id: *item_id,
+                                                dim: embed_dim,
+                                                values: v,
+                                            });
                                         }
                                         emitted_from_concat = true;
                                     }
@@ -202,11 +221,22 @@ impl Feeder {
                                 }
                                 // If not emitted via concatenated buffer, fall back to per-item field
                                 if !emitted_from_concat {
-                                    if let (Some(ch), Some(out)) = (emb_tx.as_ref(), resp.outputs.get(i)) {
-                                        if !out.embedding.is_empty() && embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                                    if let (Some(ch), Some(out)) =
+                                        (emb_tx.as_ref(), resp.outputs.get(i))
+                                    {
+                                        if !out.embedding.is_empty()
+                                            && embed_dim > 0
+                                            && resp.embed_dtype
+                                                == pb::infer_response::EmbedDType::Fp32 as i32
+                                        {
                                             if out.embedding.len() == embed_dim * 4 {
-                                                let v: Vec<f32> = bytemuck::cast_slice(&out.embedding).to_vec();
-                                                let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                                let v: Vec<f32> =
+                                                    bytemuck::cast_slice(&out.embedding).to_vec();
+                                                let _ = ch.try_send(EmbeddingRow {
+                                                    id: *item_id,
+                                                    dim: embed_dim,
+                                                    values: v,
+                                                });
                                             }
                                         }
                                     }
@@ -293,7 +323,11 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new() -> Self { Self { inner: Arc::new(Mutex::new(MetricsInner::default())) } }
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MetricsInner::default())),
+        }
+    }
 
     async fn record_complete(&self, batch_len: usize) {
         let mut g = self.inner.lock().await;
@@ -304,11 +338,20 @@ impl Metrics {
 
     async fn snapshot(&self) -> MetricsInner {
         let g = self.inner.lock().await;
-        MetricsInner { counts: g.counts.clone(), total_items: g.total_items, total_batches: g.total_batches }
+        MetricsInner {
+            counts: g.counts.clone(),
+            total_items: g.total_items,
+            total_batches: g.total_batches,
+        }
     }
 
     async fn run_reporter(&self, path: std::path::PathBuf, interval_s: f64) {
-        let mut file = match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
             Ok(f) => f,
             Err(_) => return,
         };
@@ -328,7 +371,9 @@ impl Metrics {
             // top 10 by batch frequency
             let mut top: Vec<(usize, u64)> = snap.counts.iter().map(|(k, v)| (*k, *v)).collect();
             top.sort_by(|a, b| b.1.cmp(&a.1));
-            if top.len() > 10 { top.truncate(10); }
+            if top.len() > 10 {
+                top.truncate(10);
+            }
             let covered_batches: u64 = top.iter().map(|(_, c)| *c).sum();
             let missed_batches = snap.total_batches.saturating_sub(covered_batches);
 
@@ -339,7 +384,9 @@ impl Metrics {
                 .map(|(bs, c)| (*bs, (*bs as u64) * (*c)))
                 .collect();
             top_items.sort_by(|a, b| b.1.cmp(&a.1));
-            if top_items.len() > 10 { top_items.truncate(10); }
+            if top_items.len() > 10 {
+                top_items.truncate(10);
+            }
             let covered_items: u64 = top_items.iter().map(|(_, c)| *c).sum();
             let missed_items = snap.total_items.saturating_sub(covered_items);
 

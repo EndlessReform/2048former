@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Summary for a completed run/game.
 #[derive(Debug, Clone, Copy)]
@@ -26,7 +26,8 @@ impl SessionRecorder {
     /// Create or open a session at `dir`, ensure schema exists.
     pub fn new<P: AsRef<Path>>(dir: P) -> Result<Self, rusqlite::Error> {
         let session_dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&session_dir).map_err(|_e| rusqlite::Error::ExecuteReturnedResults)?;
+        std::fs::create_dir_all(&session_dir)
+            .map_err(|_e| rusqlite::Error::ExecuteReturnedResults)?;
         let db_path = session_dir.join("metadata.db");
         let conn = Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", &"WAL")?;
@@ -61,7 +62,11 @@ impl SessionRecorder {
     }
 
     /// Set a session meta value by key (stored as TEXT; put JSON if needed).
-    pub fn set_meta<K: AsRef<str>, V: AsRef<str>>(&mut self, key: K, value: V) -> Result<(), rusqlite::Error> {
+    pub fn set_meta<K: AsRef<str>, V: AsRef<str>>(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> Result<(), rusqlite::Error> {
         self.conn.execute(
             "INSERT INTO session (meta_key, meta_value) VALUES (?1, ?2)
              ON CONFLICT(meta_key) DO UPDATE SET meta_value=excluded.meta_value",
@@ -101,7 +106,9 @@ impl SessionRecorder {
     }
 
     /// Absolute path to the session directory.
-    pub fn session_dir(&self) -> &Path { &self.session_dir }
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
+    }
 }
 
 #[cfg(test)]
@@ -119,10 +126,31 @@ mod tests {
         rec.set_meta("ts", "2025-09-10T12:34:56Z").unwrap();
         rec.set_meta("model_id", "v1_pretrained_50m").unwrap();
         // Upsert two runs
-        rec.upsert_run(RunSummary { id: 1, seed: 42, steps: 1000, max_score: 12345, highest_tile: 8192 }).unwrap();
-        rec.upsert_run(RunSummary { id: 2, seed: 43, steps: 1500, max_score: 23456, highest_tile: 16384 }).unwrap();
+        rec.upsert_run(RunSummary {
+            id: 1,
+            seed: 42,
+            steps: 1000,
+            max_score: 12345,
+            highest_tile: 8192,
+        })
+        .unwrap();
+        rec.upsert_run(RunSummary {
+            id: 2,
+            seed: 43,
+            steps: 1500,
+            max_score: 23456,
+            highest_tile: 16384,
+        })
+        .unwrap();
         // Update one run
-        rec.upsert_run(RunSummary { id: 1, seed: 42, steps: 1100, max_score: 13000, highest_tile: 8192 }).unwrap();
+        rec.upsert_run(RunSummary {
+            id: 1,
+            seed: 42,
+            steps: 1100,
+            max_score: 13000,
+            highest_tile: 8192,
+        })
+        .unwrap();
 
         // Read back
         let ts = rec.get_meta("ts").unwrap();

@@ -4,11 +4,11 @@ max_concurrent_games = 512
 max_retries = 3
 
 [sampling]
-# strategy = "Argmax"
-strategy = "TailAggConf"
-conf_alpha = 0.20
-conf_beta = 16.0
-conf_gamma = 1.0
+strategy = "Argmax"
+# strategy = "TailAggConf"
+# conf_alpha = 0.20
+# conf_beta = 16.0
+# conf_gamma = 1.0
 
 [orchestrator.connection]
 uds_path = "/tmp/2048_infer.sock"

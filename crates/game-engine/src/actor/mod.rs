@@ -1,12 +1,15 @@
 use crate::config;
-use crate::feeder::FeederHandle;
 use crate::ds_writer::StepRow as DsStepRow;
-use tokio::sync::mpsc as tokio_mpsc;
-use tokio_util::sync::CancellationToken;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use crate::feeder::FeederHandle;
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::SeedableRng;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub mod strategies;
 
@@ -30,13 +33,25 @@ pub struct StepBudget {
 }
 
 impl StepBudget {
-    pub fn new(max: u64) -> Self { Self { max, used: Arc::new(AtomicU64::new(0)) } }
+    pub fn new(max: u64) -> Self {
+        Self {
+            max,
+            used: Arc::new(AtomicU64::new(0)),
+        }
+    }
     /// Try to consume exactly 1 step budget. Returns false if exhausted.
     pub fn try_take(&self) -> bool {
         let mut cur = self.used.load(Ordering::Relaxed);
         loop {
-            if cur >= self.max { return false; }
-            match self.used.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            if cur >= self.max {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return true,
                 Err(next) => cur = next,
             }
@@ -44,7 +59,9 @@ impl StepBudget {
     }
     /// Read the number of steps consumed so far.
     #[allow(dead_code)]
-    pub fn used(&self) -> u64 { self.used.load(Ordering::Relaxed) }
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
 }
 
 pub struct GameResult {
@@ -70,7 +87,16 @@ impl GameActor {
         let mut board: Board = Board::EMPTY;
         board = board.with_random_tile(&mut rng);
         board = board.with_random_tile(&mut rng);
-        Self { game_id, handle, board, seed, sampling, step_tx, cancel, step_budget }
+        Self {
+            game_id,
+            handle,
+            board,
+            seed,
+            sampling,
+            step_tx,
+            cancel,
+            step_budget,
+        }
     }
 
     /// Run the actor loop to completion and return the result.
@@ -80,13 +106,23 @@ impl GameActor {
         let mut rng = rand::rngs::StdRng::from_entropy();
 
         while !self.board.is_game_over() {
-            if self.cancel.is_cancelled() { break; }
-            if let Some(b) = &self.step_budget { if !b.try_take() { break; } }
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            if let Some(b) = &self.step_budget {
+                if !b.try_take() {
+                    break;
+                }
+            }
             let id = ((self.game_id as u64) << 32) | seq;
             let board_bytes = board_to_exponents(self.board);
             // Record step row (pre-move state) for dataset
             if let Some(tx) = &self.step_tx {
-                let _ = tx.try_send(DsStepRow { run_id: self.game_id as u64, step_idx: steps as u32, exps: board_bytes });
+                let _ = tx.try_send(DsStepRow {
+                    run_id: self.game_id as u64,
+                    step_idx: steps as u32,
+                    exps: board_bytes,
+                });
             }
             let rx = self.handle.submit(id, self.game_id, board_bytes).await;
             let bins = tokio::select! {
@@ -105,7 +141,8 @@ impl GameActor {
             // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
             let start_gate = self.sampling.start_gate_or_default();
             let stop_gate = self.sampling.stop_gate();
-            let outside_window = (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
+            let outside_window =
+                (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
             let mv = if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
                 // Strategy is argmax; no gating effect
                 strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
@@ -127,7 +164,13 @@ impl GameActor {
             seq += 1;
         }
 
-        GameResult { game_id: self.game_id, seed: self.seed, steps, score: self.board.score(), highest_tile: self.board.highest_tile() as u32 }
+        GameResult {
+            game_id: self.game_id,
+            seed: self.seed,
+            steps,
+            score: self.board.score(),
+            highest_tile: self.board.highest_tile() as u32,
+        }
     }
 }
 
