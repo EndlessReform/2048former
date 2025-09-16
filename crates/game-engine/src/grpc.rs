@@ -25,7 +25,9 @@ pub type Client = InferenceClient<Channel>;
 /// Connect to the inference endpoint over TCP, e.g. "http://127.0.0.1:50051".
 /// For UDS support, add a separate helper using `connect_with_connector`.
 pub async fn connect<D: AsRef<str>>(dst: D) -> Result<Client, tonic::transport::Error> {
-    InferenceClient::connect(dst.as_ref().to_string()).await
+    let ep = Endpoint::try_from(dst.as_ref().to_string())?;
+    let channel = ep.connect().await?;
+    Ok(InferenceClient::new(channel))
 }
 
 /// Connect to the inference endpoint over a Unix Domain Socket at `path`.
@@ -68,6 +70,7 @@ pub async fn infer_once(
         items: items_pb,
         batch_id: batch_id.unwrap_or_default(),
         return_embedding: false,
+        argmax_only: false,
     };
     let resp = client.infer(req).await?.into_inner();
     Ok(resp)

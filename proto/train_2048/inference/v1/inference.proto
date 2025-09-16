@@ -29,6 +29,11 @@ message InferRequest {
   // If true, include a pooled embedding for each item in the response.
   // Embedding is returned as raw bytes; see InferResponse.embed_dtype.
   bool return_embedding = 4;
+
+  // If true, the server MAY skip returning full per-head distributions and
+  // instead emit argmax-only decisions (see InferResponse.argmax_heads /
+  // argmax_p1). Clients should fall back to full distributions when unset.
+  bool argmax_only = 5;
 }
 
 // A single head's distribution as probabilities over bins.
@@ -79,6 +84,13 @@ message InferResponse {
   // Clients should prefer this field when present; fall back to per-item
   // Output.embedding otherwise. The number of items is `len(item_ids)`.
   bytes embeddings_concat = 7;
+
+  // When InferRequest.argmax_only=true, servers MAY populate these fields
+  // with the argmax head index (0=Up,1=Down,2=Left,3=Right) and its
+  // corresponding probability mass in the final bin (p1). Length matches
+  // len(item_ids). When empty, fall back to `outputs`.
+  repeated uint32 argmax_heads = 8;
+  repeated float argmax_p1 = 9;
 }
 
 service Inference {

@@ -266,7 +266,10 @@ async fn main() {
     let cancel = CancellationToken::new();
 
     // Start feeder
-    let (mut feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
+    let (mut feeder, handle) = Feeder::new(
+        config.orchestrator.batch.clone(),
+        config.orchestrator.argmax_only,
+    );
     feeder.set_cancel_token(cancel.clone());
     // Optional embeddings pipeline
     let (emb_tx, mut emb_rx) = mpsc::channel::<feeder::EmbeddingRow>(65_536);

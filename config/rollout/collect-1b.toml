@@ -1,0 +1,37 @@
+max_steps = 1_000_000_000
+# max_steps = 1000000
+# max_concurrent_games = 512
+max_concurrent_games = 1024
+max_retries = 3
+
+[sampling]
+strategy = "Argmax"
+# strategy = "TailAggConf"
+# conf_alpha = 0.20
+# conf_beta = 16.0
+# conf_gamma = 1.0
+
+[orchestrator.connection]
+uds_path = "/tmp/2048_infer.sock"
+
+[orchestrator.batch]
+flush_us = 5000
+target_batch = 1024
+max_batch = 8192
+inflight_batches = 6
+per_game_inflight = 64
+queue_cap = 65536
+metrics_interval_s = 5
+
+[orchestrator]
+inline_embeddings = false
+# Omit fixed_seed to use full randomness across runs.
+random_seeds = true
+argmax_only = true
+
+[orchestrator.report]
+session_dir = "selfplay/1b_v1_pretrained"
+shard_max_steps = 10_000_000
+# Optional sanity caps (approximate):
+max_ram_mb = 16384
+max_gb = 120

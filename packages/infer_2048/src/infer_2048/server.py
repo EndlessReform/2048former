@@ -8,6 +8,7 @@ import os
 import grpc
 
 import torch
+import numpy as np
 
 from core_2048 import load_encoder_from_init, prepare_model_for_inference
 from core_2048.infer import forward_distributions
@@ -59,6 +60,9 @@ def vlog(msg: str) -> None:
 class InferenceService(inference_pb2_grpc.InferenceServicer):
     def __init__(self, model: torch.nn.Module) -> None:
         self.model = model
+        # Reusable pinned host buffer for tokens to enable async H2D copies.
+        # Allocated lazily and grown geometrically to avoid realloc thrash.
+        self._tokens_cpu = None  # type: Optional[torch.Tensor]
 
     async def Infer(self, request, context):  # type: ignore[override]
         t0 = time.perf_counter()
@@ -69,9 +73,14 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             return inference_pb2.InferResponse(batch_id=request.batch_id, item_ids=[], outputs=[], latency_ms=0)
 
         try:
-            # Build tokens tensor (B,16) from bytes
-            tokens_list: list[list[int]] = []
+            argmax_only: bool = bool(getattr(request, "argmax_only", False))
+            return_embedding: bool = bool(getattr(request, "return_embedding", False))
+            if argmax_only and return_embedding:
+                return_embedding = False
+
+            # Build item_ids and a single contiguous bytes buffer of boards
             item_ids: list[int] = []
+            boards_parts: list[bytes] = []
             for it in items:
                 b = it.board
                 if len(b) != 16:
@@ -79,57 +88,79 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                         grpc.StatusCode.INVALID_ARGUMENT,
                         f"Item {it.id} has invalid board length {len(b)} (expected 16)",
                     )
-                # Copy once from bytes -> Python ints; we'll upload in one shot below
-                tokens_list.append([x for x in b])
+                boards_parts.append(b if isinstance(b, (bytes, bytearray)) else bytes(b))
                 item_ids.append(int(it.id))
-            vlog("[server] tokens built")
+            boards_bytes = b"".join(boards_parts)
+            # Zero-copy NumPy view -> (B,16) uint8
+            np_view = np.frombuffer(boards_bytes, dtype=np.uint8)
+            try:
+                np_view = np_view.reshape(B, 16)
+            except ValueError:
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
+                    f"Invalid boards buffer length {np_view.size}, expected {B*16}",
+                )
 
-            # Single async HtoD copy by using pinned host memory
+            # Ensure reusable pinned host buffer has sufficient capacity
+            cap = 0 if self._tokens_cpu is None else int(self._tokens_cpu.shape[0])
+            if self._tokens_cpu is None or cap < B:
+                new_cap = max(1, cap)
+                while new_cap < B:
+                    new_cap *= 2
+                self._tokens_cpu = torch.empty((new_cap, 16), dtype=torch.uint8, pin_memory=True)
+
+            # Copy NumPy view into pinned buffer (NumPy -> pinned Tensor via ndarray view),
+            # then async H2D to device with cast to long. Avoid torch.from_numpy on a
+            # non-writable view to prevent warnings and undefined behavior.
+            dst_np = self._tokens_cpu[:B].numpy()  # writable ndarray sharing pinned memory
+            dst_np[...] = np_view  # memcpy from read-only view into pinned buffer
             model_device = next(self.model.parameters()).device
-            # Use a single, synchronous copy to device to avoid
-            # potential stream/capture issues with compile/profilers.
-            tokens = torch.as_tensor(tokens_list, dtype=torch.long, device=model_device)
-            vlog("[server] tokens moved to device")
+            tokens = self._tokens_cpu[:B].to(device=model_device, dtype=torch.long, non_blocking=True)
+            vlog("[server] tokens staged (pinned) and moved to device")
 
             # Forward once to obtain hidden states and logits
             prev_mode = self.model.training
             self.model.eval()
             with torch.inference_mode():
                 hidden_states, ev_logits = self.model(tokens)
-                # Softmax per head over bins
                 head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in ev_logits]
-                probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
-                # Optional pooled embedding: mean over sequence
-                return_embedding: bool = bool(getattr(request, "return_embedding", False))
                 if return_embedding:
                     board_repr = hidden_states.mean(dim=1)  # (B, H)
-            # Materialize CPU copies
-            probs_cpu = probs_all.to("cpu", non_blocking=False)
-            probs_list: list[list[list[float]]] = probs_cpu.tolist()  # B x 4 x n_bins
 
-            outputs = []
+            outputs: list[inference_pb2.Output] = []
             emb_dim: int = 0
             embeddings_concat: Optional[bytes] = None
-            if bool(getattr(request, "return_embedding", False)):
-                # Encode all embeddings as a single FP32 bytes buffer to minimize
-                # per-item serialization overhead. Clients split using embed_dim.
-                br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
-                emb_dim = int(br_cpu.shape[1])
-                embeddings_concat = br_cpu.numpy().tobytes()
-                # Do not include per-item embeddings; keep Output.embedding empty
-                outputs = [
-                    inference_pb2.Output(
-                        heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
-                    )
-                    for i in range(B)
-                ]
+            argmax_heads: list[int] = []
+            argmax_p1: list[float] = []
+
+            if argmax_only:
+                p1_tensor = torch.stack([hp[:, -1] for hp in head_probs_t], dim=1)
+                p1_cpu = p1_tensor.to(dtype=torch.float32, device="cpu", non_blocking=False)
+                best_p1, best_head = torch.max(p1_cpu, dim=1)
+                argmax_heads = [int(h) for h in best_head.tolist()]
+                argmax_p1 = [float(v) for v in best_p1.tolist()]
             else:
-                outputs = [
-                    inference_pb2.Output(
-                        heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
-                    )
-                    for i in range(B)
-                ]
+                probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
+                probs_cpu = probs_all.to("cpu", non_blocking=False)
+                probs_list: list[list[list[float]]] = probs_cpu.tolist()
+
+                if return_embedding:
+                    br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
+                    emb_dim = int(br_cpu.shape[1])
+                    embeddings_concat = br_cpu.numpy().tobytes()
+                    outputs = [
+                        inference_pb2.Output(
+                            heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
+                        )
+                        for i in range(B)
+                    ]
+                else:
+                    outputs = [
+                        inference_pb2.Output(
+                            heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
+                        )
+                        for i in range(B)
+                    ]
             # Restore training state
             self.model.train(prev_mode)
             vlog("[server] response materialized")
@@ -141,7 +172,16 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         t1 = time.perf_counter()
         latency_ms = int((t1 - t0) * 1000.0)
         # Build response; include embedding metadata if present
-        if bool(getattr(request, "return_embedding", False)):
+        if argmax_only:
+            resp = inference_pb2.InferResponse(
+                batch_id=request.batch_id,
+                item_ids=item_ids,
+                outputs=[],
+                latency_ms=latency_ms,
+                argmax_heads=argmax_heads,
+                argmax_p1=argmax_p1,
+            )
+        elif return_embedding:
             resp = inference_pb2.InferResponse(
                 batch_id=request.batch_id,
                 item_ids=item_ids,
@@ -214,14 +254,23 @@ async def serve_async(
     svc = InferenceService(model)
 
     vlog("[server] creating grpc server...")
-    server = grpc.aio.server()
+    # Allow large batch payloads by increasing gRPC message limits (both directions).
+    # Default is ~4MB which can cap batch size when returning full distributions.
+    max_mb = int(os.environ.get("INFER_2048_GRPC_MAX_MB", "64"))
+    max_bytes = max(4, max_mb) * 1024 * 1024
+    server = grpc.aio.server(
+        options=[
+            ("grpc.max_send_message_length", max_bytes),
+            ("grpc.max_receive_message_length", max_bytes),
+        ]
+    )
     inference_pb2_grpc.add_InferenceServicer_to_server(svc, server)
     server.add_insecure_port(bind)
     vlog("[server] starting grpc server...")
     await server.start()
     print(
         f"[server] ready on {bind} (device={device}, compile_mode={compile_mode}, "
-        f"warmup_sizes={warmup_sizes}, dynamic_batch={dynamic_batch})",
+        f"warmup_sizes={warmup_sizes}, dynamic_batch={dynamic_batch}, max_msg_mb={max_mb})",
         flush=True,
     )
     try:

@@ -195,6 +195,9 @@ pub struct Orchestrator {
     /// Opt-out: when true, ignore fixed/default base seed and use full randomness.
     #[serde(default)]
     pub random_seeds: bool,
+    /// If true, request argmax-only responses from the inference server.
+    #[serde(default)]
+    pub argmax_only: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -234,6 +237,7 @@ impl Default for Orchestrator {
             inline_embeddings: false,
             fixed_seed: None,
             random_seeds: false,
+            argmax_only: false,
         }
     }
 }

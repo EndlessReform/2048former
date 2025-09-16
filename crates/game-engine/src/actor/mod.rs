@@ -1,6 +1,6 @@
 use crate::config;
 use crate::ds_writer::StepRow as DsStepRow;
-use crate::feeder::FeederHandle;
+use crate::feeder::{FeederHandle, InferenceOutput};
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::SeedableRng;
@@ -125,12 +125,12 @@ impl GameActor {
                 });
             }
             let rx = self.handle.submit(id, self.game_id, board_bytes).await;
-            let bins = tokio::select! {
+            let inference = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => { break; }
                 res = rx => {
                     match res {
-                        Ok(Ok(b)) => b,
+                        Ok(Ok(out)) => out,
                         Ok(Err(_status)) => { break; },
                         Err(_canceled) => { break; },
                     }
@@ -138,20 +138,37 @@ impl GameActor {
             };
             // Compute legal mask and select move according to configured sampling strategy
             let legal = legal_mask(self.board);
-            // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
-            let start_gate = self.sampling.start_gate_or_default();
-            let stop_gate = self.sampling.stop_gate();
-            let outside_window =
-                (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
-            let mv = if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
-                // Strategy is argmax; no gating effect
-                strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
-            } else if outside_window {
-                // Force argmax outside the sampling window
-                strategies::select_move_max_p1(&bins, &legal)
-            } else {
-                // Within window: apply configured non-argmax strategy
-                strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
+            let mv = match inference {
+                InferenceOutput::Bins(bins) => {
+                    // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
+                    let start_gate = self.sampling.start_gate_or_default();
+                    let stop_gate = self.sampling.stop_gate();
+                    let outside_window =
+                        (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
+                    if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
+                    } else if outside_window {
+                        strategies::select_move_max_p1(&bins, &legal)
+                    } else {
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
+                    }
+                }
+                InferenceOutput::Argmax { head, .. } => {
+                    let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
+                    let idx = head as usize;
+                    if let Some(&choice) = dirs.get(idx) {
+                        if legal.get(idx).copied().unwrap_or(false) {
+                            Some(choice)
+                        } else {
+                            dirs.iter()
+                                .enumerate()
+                                .find(|(i, _)| legal.get(*i).copied().unwrap_or(false))
+                                .map(|(_, &m)| m)
+                        }
+                    } else {
+                        None
+                    }
+                }
             };
 
             if let Some(m) = mv {
