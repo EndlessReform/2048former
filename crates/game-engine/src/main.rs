@@ -468,14 +468,16 @@ async fn main() {
         }
     };
 
-    // Bug fix: bound spawning by `started` (not `finished`) to avoid overshooting `num_seeds`.
-    let can_spawn_more = |started_games: usize, total_steps_done: u64| -> bool {
+    // Spawn policy: use live step budget and a tail guard so we don't start
+    // new games when very close to the budget (they would exit immediately).
+    let tail_guard: u64 = 200_000; // steps margin before budget to stop spawning
+    let can_spawn_more = |started_games: usize, steps_done_live: u64| -> bool {
         let games_ok = match target_games {
             Some(g) => started_games < g,
             None => true,
         };
         let steps_ok = match target_steps {
-            Some(s) => total_steps_done < s,
+            Some(s) => steps_done_live.saturating_add(tail_guard) < s,
             None => true,
         };
         games_ok && steps_ok
@@ -544,7 +546,12 @@ async fn main() {
     // Main game loop
     loop {
         // Spawn new actors if there is capacity and we should continue
-        while set.len() < max_conc && can_spawn_more(started, total_steps) {
+        let steps_done_live: u64 = if let Some(b) = &step_budget {
+            b.used()
+        } else {
+            total_steps
+        };
+        while set.len() < max_conc && can_spawn_more(started, steps_done_live) {
             let game_id = next_game_id;
             let actor = GameActor::new(
                 game_id,
@@ -593,9 +600,16 @@ async fn main() {
         //   we cancel to respect the exact budget for dataset collection.
         // - Otherwise (typical benchmark/results mode), do NOT cancel; stop
         //   spawning new games and let existing ones finish naturally.
-        if !can_spawn_more(started, total_steps) {
-            if step_budget.is_some() && config.orchestrator.inline_embeddings {
-                cancel.cancel();
+        let steps_done_live: u64 = if let Some(b) = &step_budget {
+            b.used()
+        } else {
+            total_steps
+        };
+        if let Some(s) = target_steps {
+            if steps_done_live >= s {
+                if step_budget.is_some() && config.orchestrator.inline_embeddings {
+                    cancel.cancel();
+                }
             }
         }
     }
