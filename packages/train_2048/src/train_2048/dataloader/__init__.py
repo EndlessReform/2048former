@@ -4,14 +4,12 @@ from typing import Optional, Tuple
 
 from torch.utils.data import DataLoader
 
-from ..binning import Binner
 from ..config import TrainingConfig
 from .steps import build_steps_dataloaders
 
 
 def build_dataloaders(
     cfg: TrainingConfig,
-    binner: Binner,
     *,
     num_workers_train: int = 12,
 ) -> Tuple[DataLoader, Optional[DataLoader], int]:
@@ -20,10 +18,18 @@ def build_dataloaders(
     Splits are disjoint by runs, configured via SQL or random run split.
     """
 
+    target_mode = getattr(cfg.target, "mode", "binned_ev")
+    binner = None
+    if target_mode == "binned_ev":
+        from ..binning import Binner
+
+        binner = Binner.from_config(cfg.binning)
+
     ds_cfg = cfg.dataset
     return build_steps_dataloaders(
         dataset_dir=ds_cfg.resolved_dataset_dir(),
         binner=binner,
+        target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
         run_sql=getattr(ds_cfg, "run_sql", None),
         sql_params=getattr(ds_cfg, "sql_params", None),

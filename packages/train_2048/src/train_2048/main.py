@@ -62,6 +62,7 @@ def main(argv: Optional[list[str]] = None):
                     "lr_schedule": cfg.hyperparameters.lr_schedule.model_dump(),
                     "batch": cfg.batch.model_dump(),
                     "dropout": cfg.dropout.model_dump(),
+                    "target": cfg.target.model_dump(),
                     "binning": cfg.binning.model_dump(),
                     "dataset": cfg.dataset.model_dump(),
                 },

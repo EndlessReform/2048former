@@ -104,11 +104,17 @@ def _indices_from_run_ids(steps: np.ndarray, run_ids: np.ndarray) -> np.ndarray:
     return np.flatnonzero(mask).astype(np.int64, copy=False)
 
 
-def make_collate_steps(binner: Optional[Binner], steps: np.ndarray) -> Callable:
-    """Collate function that gathers tokens/mask/values and bins EVs.
+def make_collate_steps(
+    target_mode: str,
+    steps: np.ndarray,
+    binner: Optional[Binner],
+) -> Callable:
+    """Collate function that gathers tokens/mask/values and builds training targets."""
 
-    Returns dict with keys: tokens, branch_mask, branch_values, branch_bin_targets, n_bins.
-    """
+    if target_mode not in {"binned_ev", "hard_move"}:
+        raise ValueError(f"Unknown target mode: {target_mode}")
+    if target_mode == "binned_ev" and binner is None:
+        raise ValueError("Binner is required when target_mode='binned_ev'")
 
     import ai_2048 as a2  # lazy import
 
@@ -116,7 +122,7 @@ def make_collate_steps(binner: Optional[Binner], steps: np.ndarray) -> Callable:
         import numpy as _np
 
         idxs = _np.asarray(batch_indices, dtype=_np.int64)
-        exps_buf, _dirs, evs = a2.batch_from_steps(steps, idxs, parallel=True)
+        exps_buf, dirs, evs = a2.batch_from_steps(steps, idxs, parallel=True)
 
         # Tokens from exponents buffer
         exps = _np.frombuffer(exps_buf, dtype=_np.uint8).reshape(-1, 16)
@@ -149,10 +155,14 @@ def make_collate_steps(binner: Optional[Binner], steps: np.ndarray) -> Callable:
             "branch_mask": branch_mask,
             "branch_values": branch_values,
         }
-        if binner is not None:
+        if target_mode == "binned_ev":
+            assert binner is not None  # for type checkers
             binner.to_device(branch_values.device)
             out["branch_bin_targets"] = binner.bin_values(branch_values).long()
             out["n_bins"] = int(binner.n_bins)
+        else:  # hard_move
+            dirs_arr = _np.asarray(dirs, dtype=_np.int64)
+            out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
         return out
 
     return _collate
@@ -160,7 +170,8 @@ def make_collate_steps(binner: Optional[Binner], steps: np.ndarray) -> Callable:
 
 def build_steps_dataloaders(
     dataset_dir: str,
-    binner: Binner,
+    binner: Optional[Binner],
+    target_mode: str,
     batch_size: int,
     *,
     run_sql: Optional[str] = None,
@@ -203,7 +214,7 @@ def build_steps_dataloaders(
     val_indices = _indices_from_run_ids(steps, val_rids) if val_rids is not None else None
 
     ds_train = StepsDataset(dataset_dir, indices=train_indices)
-    collate = make_collate_steps(binner, ds_train.steps)
+    collate = make_collate_steps(target_mode, ds_train.steps, binner)
 
     prefetch_train = 8 if num_workers_train > 0 else None
     dl_train = DataLoader(
@@ -222,7 +233,7 @@ def build_steps_dataloaders(
         num_workers_val = max(2, num_workers_train // 3)
         prefetch_val = 4 if num_workers_val > 0 else None
         ds_val = StepsDataset(dataset_dir, indices=val_indices)
-        collate_v = make_collate_steps(binner, ds_val.steps)
+        collate_v = make_collate_steps(target_mode, ds_val.steps, binner)
         dl_val = DataLoader(
             ds_val,
             batch_size=batch_size,

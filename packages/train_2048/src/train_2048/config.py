@@ -11,6 +11,12 @@ from core_2048 import Encoder, EncoderConfig, load_encoder_from_init, normalize_
 from .binning import BinningConfig
 
 
+class TargetConfig(BaseModel):
+    """Configure which supervision target to use during training."""
+
+    mode: Literal["binned_ev", "hard_move"] = "binned_ev"
+
+
 def _find_repo_root() -> Path:
     """Return the repository root by walking upwards.
 
@@ -224,6 +230,7 @@ class TrainingConfig(BaseModel):
     hyperparameters: HyperParams = Field(default_factory=HyperParams)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     dropout: DropoutConfig = Field(default_factory=DropoutConfig)
+    target: TargetConfig = Field(default_factory=TargetConfig)
     # Discretization for EV heads
     binning: BinningConfig = Field(default_factory=BinningConfig)
     # Dataset input
@@ -253,6 +260,7 @@ __all__ = [
     "HyperParams",
     "BatchConfig",
     "DropoutConfig",
+    "TargetConfig",
     "CheckpointConfig",
     "TrainingConfig",
     "load_config",

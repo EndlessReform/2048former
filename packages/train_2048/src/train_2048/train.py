@@ -13,15 +13,27 @@ import torch.distributed as dist
 import time, json, math
 
 from .config import TrainingConfig, load_encoder_from_init, normalize_state_dict_keys
-from .binning import Binner
 from .dataloader import build_dataloaders
 
 
 def _format_postfix(
-    loss: float, head_losses: list[float], lr: float, dt_data_ms: float | None = None, dt_comp_ms: float | None = None
+    metrics: Dict[str, float | list[float] | None],
+    lr: float,
+    target_mode: str,
+    dt_data_ms: float | None = None,
+    dt_comp_ms: float | None = None,
 ) -> str:
-    u, d, l, r = head_losses
-    base = f"loss={loss:.4f}  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}  lr={lr:.2e}"
+    loss = float(metrics.get("loss", 0.0))
+    base = f"loss={loss:.4f}"
+    if target_mode == "binned_ev":
+        head_losses = metrics.get("head_losses") or [0.0, 0.0, 0.0, 0.0]
+        u, d, l, r = [float(x) for x in head_losses]
+        base += f"  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}"
+    else:
+        acc = metrics.get("policy_acc")
+        if acc is not None:
+            base += f"  policy_acc={float(acc):.3f}"
+    base += f"  lr={lr:.2e}"
     if dt_data_ms is not None and dt_comp_ms is not None:
         base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
     return base
@@ -163,11 +175,11 @@ def train(
     else:
         raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
+    target_mode = getattr(cfg.target, "mode", "binned_ev")
     # Data: build train (and optional val) views via dataloader module
-    binner = Binner.from_config(cfg.binning)
     num_workers_train = 12  # quick knob for throughput
     dl_train, dl_val, per_epoch_steps = build_dataloaders(
-        cfg, binner, num_workers_train=num_workers_train
+        cfg, num_workers_train=num_workers_train
     )
 
     # Training
@@ -268,7 +280,7 @@ def train(
         if step <= 0 or (step % interval) != 0:
             return
         nonlocal best_val_loss
-        val_metrics = evaluate(model, dl_val, device)
+        val_metrics = evaluate(model, dl_val, device, target_mode)
         val_loss = float(val_metrics["loss"])
         if val_loss + float(cfg.checkpoint.best_min_delta) < best_val_loss:
             best_val_loss = val_loss
@@ -307,45 +319,53 @@ def train(
                 it = iter(dl_train)
                 batch = next(it)
             t1 = time.perf_counter()
-            metrics = train_step(model, batch, optimizer, device)
+            metrics = train_step(model, batch, optimizer, device, target_mode)
             t2 = time.perf_counter()
             dt_data_ms = (t1 - t0) * 1e3
             dt_comp_ms = (t2 - t1) * 1e3
             pbar.set_postfix_str(
-                _format_postfix(
-                    metrics["loss"], metrics["head_losses"], lr_now, dt_data_ms, dt_comp_ms
-                )
+                _format_postfix(metrics, lr_now, target_mode, dt_data_ms, dt_comp_ms)
             )
             if wandb_run is not None and (global_step % wandb_report_every == 0):
-                _safe_wandb_log(
-                    {
-                        "train/loss": metrics["loss"],
-                        "train/loss_u": metrics["head_losses"][0],
-                        "train/loss_d": metrics["head_losses"][1],
-                        "train/loss_l": metrics["head_losses"][2],
-                        "train/loss_r": metrics["head_losses"][3],
-                        "train/lr": lr_now,
-                        "train/data_time_ms": dt_data_ms,
-                        "train/compute_time_ms": dt_comp_ms,
-                    },
-                    step=global_step,
-                )
+                log_payload = {
+                    "train/loss": metrics["loss"],
+                    "train/lr": lr_now,
+                    "train/data_time_ms": dt_data_ms,
+                    "train/compute_time_ms": dt_comp_ms,
+                }
+                if target_mode == "binned_ev":
+                    log_payload.update(
+                        {
+                            "train/loss_u": metrics["head_losses"][0],
+                            "train/loss_d": metrics["head_losses"][1],
+                            "train/loss_l": metrics["head_losses"][2],
+                            "train/loss_r": metrics["head_losses"][3],
+                        }
+                    )
+                else:
+                    if metrics.get("policy_acc") is not None:
+                        log_payload["train/policy_acc"] = metrics["policy_acc"]
+                _safe_wandb_log(log_payload, step=global_step)
             # Periodic validation
             if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
                 global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
             ):
-                val_metrics = evaluate(model, dl_val, device)
+                val_metrics = evaluate(model, dl_val, device, target_mode)
                 if wandb_run is not None:
-                    _safe_wandb_log(
-                        {
-                            "val/loss": val_metrics["loss"],
-                            "val/loss_u": val_metrics["head_losses"][0],
-                            "val/loss_d": val_metrics["head_losses"][1],
-                            "val/loss_l": val_metrics["head_losses"][2],
-                            "val/loss_r": val_metrics["head_losses"][3],
-                        },
-                        step=global_step,
-                )
+                    log_payload = {"val/loss": val_metrics["loss"]}
+                    if target_mode == "binned_ev":
+                        log_payload.update(
+                            {
+                                "val/loss_u": val_metrics["head_losses"][0],
+                                "val/loss_d": val_metrics["head_losses"][1],
+                                "val/loss_l": val_metrics["head_losses"][2],
+                                "val/loss_r": val_metrics["head_losses"][3],
+                            }
+                        )
+                    else:
+                        if val_metrics.get("policy_acc") is not None:
+                            log_payload["val/policy_acc"] = val_metrics["policy_acc"]
+                    _safe_wandb_log(log_payload, step=global_step)
             global_step += 1
             # Coarse best checkpointing (if configured)
             _maybe_save_best(global_step, None)
@@ -369,7 +389,7 @@ def train(
                     t_fetch1 = time.perf_counter()
                     # Compute
                     lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                    metrics = train_step(model, batch, optimizer, device)
+                    metrics = train_step(model, batch, optimizer, device, target_mode)
                     t_comp1 = time.perf_counter()
                     dt_data_ms = (t_fetch1 - t_fetch0) * 1e3
                     dt_comp_ms = (t_comp1 - t_fetch1) * 1e3
@@ -382,42 +402,49 @@ def train(
                         pre_decay_ckpt_saved = True
 
                     pbar.set_postfix_str(
-                        _format_postfix(
-                            metrics["loss"], metrics["head_losses"], lr_now, dt_data_ms, dt_comp_ms
-                        )
+                        _format_postfix(metrics, lr_now, target_mode, dt_data_ms, dt_comp_ms)
                     )
                     if wandb_run is not None and (global_step % wandb_report_every == 0):
-                        _safe_wandb_log(
-                            {
-                                "train/loss": metrics["loss"],
-                                "train/loss_u": metrics["head_losses"][0],
-                                "train/loss_d": metrics["head_losses"][1],
-                                "train/loss_l": metrics["head_losses"][2],
-                                "train/loss_r": metrics["head_losses"][3],
-                                "train/lr": lr_now,
-                                "train/epoch": epoch,
-                                "train/data_time_ms": dt_data_ms,
-                                "train/compute_time_ms": dt_comp_ms,
-                            },
-                            step=global_step,
-                        )
+                        log_payload = {
+                            "train/loss": metrics["loss"],
+                            "train/lr": lr_now,
+                            "train/epoch": epoch,
+                            "train/data_time_ms": dt_data_ms,
+                            "train/compute_time_ms": dt_comp_ms,
+                        }
+                        if target_mode == "binned_ev":
+                            log_payload.update(
+                                {
+                                    "train/loss_u": metrics["head_losses"][0],
+                                    "train/loss_d": metrics["head_losses"][1],
+                                    "train/loss_l": metrics["head_losses"][2],
+                                    "train/loss_r": metrics["head_losses"][3],
+                                }
+                            )
+                        else:
+                            if metrics.get("policy_acc") is not None:
+                                log_payload["train/policy_acc"] = metrics["policy_acc"]
+                        _safe_wandb_log(log_payload, step=global_step)
                     # Periodic validation
                     if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
                         global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
                     ):
-                        val_metrics = evaluate(model, dl_val, device)
+                        val_metrics = evaluate(model, dl_val, device, target_mode)
                         if wandb_run is not None:
-                            _safe_wandb_log(
-                                {
-                                    "val/loss": val_metrics["loss"],
-                                    "val/loss_u": val_metrics["head_losses"][0],
-                                    "val/loss_d": val_metrics["head_losses"][1],
-                                    "val/loss_l": val_metrics["head_losses"][2],
-                                    "val/loss_r": val_metrics["head_losses"][3],
-                                    "train/epoch": epoch,
-                                },
-                                step=global_step,
-                            )
+                            log_payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
+                            if target_mode == "binned_ev":
+                                log_payload.update(
+                                    {
+                                        "val/loss_u": val_metrics["head_losses"][0],
+                                        "val/loss_d": val_metrics["head_losses"][1],
+                                        "val/loss_l": val_metrics["head_losses"][2],
+                                        "val/loss_r": val_metrics["head_losses"][3],
+                                    }
+                                )
+                            else:
+                                if val_metrics.get("policy_acc") is not None:
+                                    log_payload["val/policy_acc"] = val_metrics["policy_acc"]
+                            _safe_wandb_log(log_payload, step=global_step)
                     global_step += 1
                     # Coarse best checkpointing (if configured)
                     _maybe_save_best(global_step, epoch)
@@ -443,7 +470,7 @@ def train(
                     t_fetch1 = time.perf_counter()
                     # Compute
                     lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                    metrics = train_step(model, batch, optimizer, device)
+                    metrics = train_step(model, batch, optimizer, device, target_mode)
                     t_comp1 = time.perf_counter()
                     dt_data_ms = (t_fetch1 - t_fetch0) * 1e3
                     dt_comp_ms = (t_comp1 - t_fetch1) * 1e3
@@ -456,42 +483,49 @@ def train(
                         pre_decay_ckpt_saved = True
 
                     pbar.set_postfix_str(
-                        _format_postfix(
-                            metrics["loss"], metrics["head_losses"], lr_now, dt_data_ms, dt_comp_ms
-                        )
+                        _format_postfix(metrics, lr_now, target_mode, dt_data_ms, dt_comp_ms)
                     )
                     if wandb_run is not None and (global_step % wandb_report_every == 0):
-                        _safe_wandb_log(
-                            {
-                                "train/loss": metrics["loss"],
-                                "train/loss_u": metrics["head_losses"][0],
-                                "train/loss_d": metrics["head_losses"][1],
-                                "train/loss_l": metrics["head_losses"][2],
-                                "train/loss_r": metrics["head_losses"][3],
-                                "train/lr": lr_now,
-                                "train/epoch": epoch,
-                                "train/data_time_ms": dt_data_ms,
-                                "train/compute_time_ms": dt_comp_ms,
-                            },
-                            step=global_step,
-                        )
+                        log_payload = {
+                            "train/loss": metrics["loss"],
+                            "train/lr": lr_now,
+                            "train/epoch": epoch,
+                            "train/data_time_ms": dt_data_ms,
+                            "train/compute_time_ms": dt_comp_ms,
+                        }
+                        if target_mode == "binned_ev":
+                            log_payload.update(
+                                {
+                                    "train/loss_u": metrics["head_losses"][0],
+                                    "train/loss_d": metrics["head_losses"][1],
+                                    "train/loss_l": metrics["head_losses"][2],
+                                    "train/loss_r": metrics["head_losses"][3],
+                                }
+                            )
+                        else:
+                            if metrics.get("policy_acc") is not None:
+                                log_payload["train/policy_acc"] = metrics["policy_acc"]
+                        _safe_wandb_log(log_payload, step=global_step)
                     # Periodic validation
                     if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
                         global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
                     ):
-                        val_metrics = evaluate(model, dl_val, device)
+                        val_metrics = evaluate(model, dl_val, device, target_mode)
                         if wandb_run is not None:
-                            _safe_wandb_log(
-                                {
-                                    "val/loss": val_metrics["loss"],
-                                    "val/loss_u": val_metrics["head_losses"][0],
-                                    "val/loss_d": val_metrics["head_losses"][1],
-                                    "val/loss_l": val_metrics["head_losses"][2],
-                                    "val/loss_r": val_metrics["head_losses"][3],
-                                    "train/epoch": epoch,
-                                },
-                                step=global_step,
-                            )
+                            log_payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
+                            if target_mode == "binned_ev":
+                                log_payload.update(
+                                    {
+                                        "val/loss_u": val_metrics["head_losses"][0],
+                                        "val/loss_d": val_metrics["head_losses"][1],
+                                        "val/loss_l": val_metrics["head_losses"][2],
+                                        "val/loss_r": val_metrics["head_losses"][3],
+                                    }
+                                )
+                            else:
+                                if val_metrics.get("policy_acc") is not None:
+                                    log_payload["val/policy_acc"] = val_metrics["policy_acc"]
+                            _safe_wandb_log(log_payload, step=global_step)
                     global_step += 1
                     # Coarse best checkpointing (if configured)
                     _maybe_save_best(global_step, epoch)
@@ -527,7 +561,7 @@ def train(
     return ckpt_path, global_step
 
 
-def _safe_wandb_log(data: Dict[str, float], step: int) -> None:
+def _safe_wandb_log(data: Dict[str, float | int], step: int) -> None:
     try:
         import wandb  # type: ignore
 
@@ -542,12 +576,14 @@ def train_step(
     batch: Dict[str, torch.Tensor],
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    target_mode: str,
 ):
     """Single optimization step over one DataLoader batch (no micro-batching)."""
 
     tokens = batch["tokens"].to(device, non_blocking=True)
-    branch_mask = batch["branch_mask"].to(device, non_blocking=True)
-    targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
+    branch_mask = batch.get("branch_mask")
+    if branch_mask is not None:
+        branch_mask = branch_mask.to(device, non_blocking=True)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -564,25 +600,66 @@ def train_step(
 
         autocast = _NullCtx()
 
+    policy_acc = None
+
     with autocast:
-        _hs, ev_logits = model(tokens)
+        _hs, head_out = model(tokens)
 
-        per_head_losses = []
-        for h in range(4):
-            logits_h = ev_logits[h].float()  # compute loss in fp32 for stability
-            tgt_h = targets_bins[:, h]
-            mask_h = branch_mask[:, h]
+        if target_mode == "binned_ev":
+            if "branch_bin_targets" not in batch:
+                raise KeyError("branch_bin_targets missing from batch for binned_ev target")
+            if branch_mask is None:
+                raise KeyError("branch_mask missing from batch for binned_ev target")
+            targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
+            per_head_losses = []
+            for h in range(4):
+                logits_h = head_out[h].float()  # compute loss in fp32 for stability
+                tgt_h = targets_bins[:, h]
+                mask_h = branch_mask[:, h]
 
-            # Cross-entropy per-sample
-            loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
-            # Mask illegal moves
-            if mask_h.any():
-                loss_h = loss_h[mask_h].mean()
+                # Cross-entropy per-sample
+                loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
+                # Mask illegal moves
+                if mask_h.any():
+                    loss_h = loss_h[mask_h].mean()
+                else:
+                    loss_h = torch.zeros((), device=logits_h.device, dtype=torch.float32)
+                per_head_losses.append(loss_h)
+
+            loss = sum(per_head_losses)
+        elif target_mode == "hard_move":
+            if "move_targets" not in batch:
+                raise KeyError("move_targets missing from batch for hard_move target")
+            move_targets = batch["move_targets"].to(device, non_blocking=True)
+            # Accept either the new single policy head (B,4) or fallback 4x1 list
+            if isinstance(head_out, (list, tuple)):
+                if not all(t.shape[-1] == 1 for t in head_out):
+                    raise RuntimeError("hard_move expects single policy head or 4x1 logits list")
+                logits = torch.stack([t.float().squeeze(-1) for t in head_out], dim=1)
             else:
-                loss_h = torch.zeros((), device=logits_h.device, dtype=torch.float32)
-            per_head_losses.append(loss_h)
+                logits = head_out.float()  # (B, 4)
+            loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
+            loss = loss_per_sample.mean()
 
-        loss = sum(per_head_losses)
+            preds = logits.argmax(dim=1)
+            policy_acc = (preds == move_targets).float().mean()
+
+            per_head_losses = []
+            for h in range(4):
+                sel = move_targets == h
+                if sel.any():
+                    per_head_losses.append(loss_per_sample[sel].mean())
+                else:
+                    per_head_losses.append(
+                        torch.zeros((), device=logits.device, dtype=torch.float32)
+                    )
+
+            if branch_mask is not None:
+                chosen_mask = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
+                if not bool(chosen_mask.all()):
+                    raise RuntimeError("Encountered illegal move in hard targets batch")
+        else:
+            raise ValueError(f"Unknown target mode: {target_mode}")
 
     loss.backward()
     optimizer.step()
@@ -590,17 +667,28 @@ def train_step(
     head_losses = [lh.detach().item() for lh in per_head_losses]
     total_loss = loss.detach().item()
 
-    return {"loss": total_loss, "head_losses": head_losses}
+    return {
+        "loss": total_loss,
+        "head_losses": head_losses,
+        "policy_acc": float(policy_acc.detach().item()) if policy_acc is not None else None,
+    }
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, dl_val: DataLoader, device: torch.device):
+def evaluate(
+    model: torch.nn.Module,
+    dl_val: DataLoader,
+    device: torch.device,
+    target_mode: str,
+):
     was_training = model.training
     model.eval()
 
     total_loss = 0.0
     total_heads = torch.zeros(4, dtype=torch.float64)
     n_batches = 0
+    total_correct = 0.0
+    total_examples = 0
 
     if device.type == "cuda":
         autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -616,24 +704,75 @@ def evaluate(model: torch.nn.Module, dl_val: DataLoader, device: torch.device):
 
     for batch in dl_val:
         tokens = batch["tokens"].to(device, non_blocking=True)
-        branch_mask = batch["branch_mask"].to(device, non_blocking=True)
-        targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
+        branch_mask = batch.get("branch_mask")
+        if branch_mask is not None:
+            branch_mask = branch_mask.to(device, non_blocking=True)
 
         with autocast:
-            _hs, ev_logits = model(tokens)
-            per_head_losses = []
-            for h in range(4):
-                logits_h = ev_logits[h].float()
-                tgt_h = targets_bins[:, h]
-                mask_h = branch_mask[:, h]
-                loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
-                if mask_h.any():
-                    loss_h = loss_h[mask_h].mean()
-                else:
-                    loss_h = torch.zeros((), device=logits_h.device, dtype=torch.float32)
-                per_head_losses.append(loss_h)
+            _hs, head_out = model(tokens)
 
-            loss = sum(per_head_losses)
+            if target_mode == "binned_ev":
+                if "branch_bin_targets" not in batch:
+                    raise KeyError(
+                        "branch_bin_targets missing from batch for binned_ev target"
+                    )
+                if branch_mask is None:
+                    raise KeyError("branch_mask missing from batch for binned_ev target")
+                targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
+                per_head_losses = []
+                for h in range(4):
+                    logits_h = head_out[h].float()
+                    tgt_h = targets_bins[:, h]
+                    mask_h = branch_mask[:, h]
+                    loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
+                    if mask_h.any():
+                        loss_h = loss_h[mask_h].mean()
+                    else:
+                        loss_h = torch.zeros(
+                            (), device=logits_h.device, dtype=torch.float32
+                        )
+                    per_head_losses.append(loss_h)
+
+                loss = sum(per_head_losses)
+            elif target_mode == "hard_move":
+                if "move_targets" not in batch:
+                    raise KeyError("move_targets missing from batch for hard_move target")
+                move_targets = batch["move_targets"].to(device, non_blocking=True)
+                if isinstance(head_out, (list, tuple)):
+                    if not all(t.shape[-1] == 1 for t in head_out):
+                        raise RuntimeError(
+                            "hard_move expects single policy head or 4x1 logits list"
+                        )
+                    logits = torch.stack([t.float().squeeze(-1) for t in head_out], dim=1)
+                else:
+                    logits = head_out.float()
+                loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
+                loss = loss_per_sample.mean()
+
+                preds = logits.argmax(dim=1)
+                total_correct += float((preds == move_targets).sum().item())
+                total_examples += int(move_targets.numel())
+
+                per_head_losses = []
+                for h in range(4):
+                    sel = move_targets == h
+                    if sel.any():
+                        per_head_losses.append(loss_per_sample[sel].mean())
+                    else:
+                        per_head_losses.append(
+                            torch.zeros((), device=logits.device, dtype=torch.float32)
+                        )
+
+                if branch_mask is not None:
+                    chosen_mask = branch_mask[
+                        torch.arange(move_targets.size(0), device=device), move_targets
+                    ]
+                    if not bool(chosen_mask.all()):
+                        raise RuntimeError(
+                            "Encountered illegal move in hard targets validation batch"
+                        )
+            else:
+                raise ValueError(f"Unknown target mode: {target_mode}")
 
         total_loss += float(loss.detach().item())
         total_heads += torch.tensor(
@@ -645,11 +784,14 @@ def evaluate(model: torch.nn.Module, dl_val: DataLoader, device: torch.device):
         model.train()
 
     if n_batches == 0:
-        return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0]}
+        return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None}
 
     avg_loss = float(total_loss / n_batches)
     avg_heads = (total_heads / n_batches).tolist()
-    return {"loss": avg_loss, "head_losses": avg_heads}
+    policy_acc = None
+    if target_mode == "hard_move" and total_examples > 0:
+        policy_acc = float(total_correct / total_examples)
+    return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": policy_acc}
 
 
 def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:

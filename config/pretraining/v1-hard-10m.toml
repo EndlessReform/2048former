@@ -1,0 +1,66 @@
+# init_dir = "inits/v1/10m_hard_move"  # update once the hard-target init is available
+init_dir = "inits/v1/10m_hard"
+checkpoint_dir = "checkpoints"
+seed = 0
+
+[wandb]
+enabled = true
+project = "train-2048-hard-target"
+entity = ""
+run_name = ""
+tags = []
+mode = "online"                    # online | offline | disabled
+report_every = 50                  # log to W&B every N steps (>=1)
+
+[hyperparameters]
+learning_rate = 6e-4
+muon_lr = 2e-2
+
+[hyperparameters.lr_schedule]
+name = "warmup-stable-decay" # constant | warmup-stable-decay
+warmup_steps = 400
+cooldown_pct = 0.2
+min_lr_ratio = 0.1
+
+[hyperparameters.optimizer]
+name = "adamw"      # adamw | muon
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.98
+eps = 1e-8
+
+[batch]
+batch_size = 1536
+# micro_batch_size = 256
+
+[dropout]
+dropout_prob = 0.03
+attention_dropout_prob = 0.0
+
+[target]
+mode = "hard_move"
+
+[dataset]
+# Root directory containing steps.npy and metadata.db
+dataset_dir = "./datasets/ds_v4_full-game"
+
+# Universe selection via SQL (optional)
+# run_sql = "SELECT id FROM runs WHERE max_score BETWEEN ? AND ?"
+# sql_params = [50_000, 2_000_000]
+
+# Drive by epochs
+num_epochs = 3
+
+# Validation: disjoint by runs. Here, use a fixed percentage split.
+val_run_pct = 0.02
+val_split_seed = 42
+
+val_every = 5_000
+
+[checkpoint]
+# Save every epoch (keep all). Epoch count is small.
+every_epochs = 1
+# Optionally save a best checkpoint every N steps based on validation loss.
+save_best_every_steps = 10_000
+# Require a small improvement to update the best to reduce churn.
+best_min_delta = 0.002
