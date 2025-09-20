@@ -11,8 +11,7 @@ import torch
 import numpy as np
 
 from core_2048 import load_encoder_from_init, prepare_model_for_inference
-from core_2048.infer import forward_distributions
-import torch.nn.functional as F
+from core_2048.infer import forward_distributions, logits_to_distributions
 
 
 # Expect stubs under package-local path: src/infer_2048/proto/train_2048/inference/v1
@@ -122,8 +121,8 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             prev_mode = self.model.training
             self.model.eval()
             with torch.inference_mode():
-                hidden_states, ev_logits = self.model(tokens)
-                head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in ev_logits]
+                hidden_states, head_outputs = self.model(tokens)
+                head_probs_t = logits_to_distributions(self.model, head_outputs)
                 if return_embedding:
                     board_repr = hidden_states.mean(dim=1)  # (B, H)
 

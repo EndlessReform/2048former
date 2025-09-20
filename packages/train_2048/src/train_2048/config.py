@@ -14,7 +14,45 @@ from .binning import BinningConfig
 class TargetConfig(BaseModel):
     """Configure which supervision target to use during training."""
 
-    mode: Literal["binned_ev", "hard_move"] = "binned_ev"
+    mode: Literal["binned_ev", "hard_move", "tsad_soft"] = "binned_ev"
+    # Temperature for TSAD softmax; smaller => sharper distribution.
+    tsad_temperature: float = 1.0
+    # Strategy for scaling per-position advantages prior to temperature.
+    tsad_scale_kind: Literal["max_abs", "mad"] = "max_abs"
+    # Minimum denominator applied to prevent division by zero during scaling.
+    tsad_min_scale: float = 1e-3
+    # Blend factor between soft KD distribution and hard one-hot of logged move.
+    tsad_mix_with_hard: float = 0.1
+    # Optional auxiliary hard cross-entropy loss weight.
+    tsad_aux_ce_weight: float = 0.0
+
+    @field_validator("tsad_temperature")
+    @classmethod
+    def _tsad_temperature_positive(cls, v: float) -> float:
+        if v <= 0.0:
+            raise ValueError("target.tsad_temperature must be > 0")
+        return v
+
+    @field_validator("tsad_min_scale")
+    @classmethod
+    def _tsad_min_scale_positive(cls, v: float) -> float:
+        if v <= 0.0:
+            raise ValueError("target.tsad_min_scale must be > 0")
+        return v
+
+    @field_validator("tsad_mix_with_hard")
+    @classmethod
+    def _tsad_mix_unit_interval(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("target.tsad_mix_with_hard must be within [0, 1]")
+        return v
+
+    @field_validator("tsad_aux_ce_weight")
+    @classmethod
+    def _tsad_aux_ce_weight_non_negative(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError("target.tsad_aux_ce_weight must be >= 0")
+        return v
 
 
 def _find_repo_root() -> Path:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import ceil
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Tuple
 
 import numpy as np
 import sqlite3
@@ -10,6 +10,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from ..binning import Binner
+
+if TYPE_CHECKING:
+    from ..config import TargetConfig
 
 
 class StepsDataset(Dataset):
@@ -108,13 +111,16 @@ def make_collate_steps(
     target_mode: str,
     steps: np.ndarray,
     binner: Optional[Binner],
+    target_cfg: "TargetConfig" | None = None,
 ) -> Callable:
     """Collate function that gathers tokens/mask/values and builds training targets."""
 
-    if target_mode not in {"binned_ev", "hard_move"}:
+    if target_mode not in {"binned_ev", "hard_move", "tsad_soft"}:
         raise ValueError(f"Unknown target mode: {target_mode}")
     if target_mode == "binned_ev" and binner is None:
         raise ValueError("Binner is required when target_mode='binned_ev'")
+    if target_mode == "tsad_soft" and target_cfg is None:
+        raise ValueError("Target config is required when target_mode='tsad_soft'")
 
     import ai_2048 as a2  # lazy import
 
@@ -160,8 +166,76 @@ def make_collate_steps(
             binner.to_device(branch_values.device)
             out["branch_bin_targets"] = binner.bin_values(branch_values).long()
             out["n_bins"] = int(binner.n_bins)
-        else:  # hard_move
+        elif target_mode == "hard_move":
             dirs_arr = _np.asarray(dirs, dtype=_np.int64)
+            out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
+        else:  # tsad_soft
+            assert target_cfg is not None
+            dirs_arr = _np.asarray(dirs, dtype=_np.int64)
+            mix_with_hard = float(getattr(target_cfg, "tsad_mix_with_hard", 0.0))
+            temperature = float(getattr(target_cfg, "tsad_temperature", 1.0))
+            min_scale = float(getattr(target_cfg, "tsad_min_scale", 1e-3))
+            scale_kind = getattr(target_cfg, "tsad_scale_kind", "max_abs")
+
+            # Teacher distribution initialised to zeros; fill legal moves per sample.
+            soft_targets = _np.zeros_like(evs_clean, dtype=_np.float32)
+
+            for i in range(evs_clean.shape[0]):
+                legal_mask_i = legal[i]
+                if not legal_mask_i.any():
+                    continue
+                legal_vals = evs_clean[i, legal_mask_i]
+                if legal_vals.size == 0:
+                    continue
+                best = float(legal_vals.max())
+                advantages = legal_vals - best
+
+                if scale_kind == "mad":
+                    center = _np.median(legal_vals)
+                    scale = float(_np.mean(_np.abs(legal_vals - center)))
+                else:  # max_abs
+                    scale = float(_np.max(_np.abs(advantages)))
+                scale = max(scale, min_scale)
+                denom = max(scale * temperature, min_scale)
+                logits = advantages / denom
+                logits = logits - _np.max(logits)
+                probs = _np.exp(logits)
+                probs_sum = float(_np.sum(probs))
+                if not _np.isfinite(probs_sum) or probs_sum <= 0.0:
+                    probs = _np.ones_like(probs)
+                    probs_sum = float(probs.size)
+                probs = probs / probs_sum
+
+                probs_full = _np.zeros(4, dtype=_np.float32)
+                probs_full[legal_mask_i] = probs.astype(_np.float32, copy=False)
+
+                move_idx = int(dirs_arr[i])
+                hard_full = _np.zeros(4, dtype=_np.float32)
+                if 0 <= move_idx < 4 and legal_mask_i[move_idx]:
+                    hard_full[move_idx] = 1.0
+                else:
+                    # Fallback: pin to current argmax probability.
+                    best_idx_rel = int(probs.argmax())
+                    legal_indices = _np.flatnonzero(legal_mask_i)
+                    best_global = int(legal_indices[best_idx_rel])
+                    hard_full[best_global] = 1.0
+
+                mixed = (1.0 - mix_with_hard) * probs_full + mix_with_hard * hard_full
+                mixed_sum = float(_np.sum(mixed[legal_mask_i]))
+                if mixed_sum <= 0.0 or not _np.isfinite(mixed_sum):
+                    mixed = probs_full
+                    mixed_sum = float(_np.sum(mixed[legal_mask_i]))
+                if mixed_sum <= 0.0:
+                    # Uniform over legal moves as last resort.
+                    legal_indices = _np.flatnonzero(legal_mask_i)
+                    mixed = _np.zeros(4, dtype=_np.float32)
+                    mixed[legal_indices] = 1.0 / max(len(legal_indices), 1)
+                    mixed_sum = 1.0
+                soft_targets[i] = (mixed / mixed_sum).astype(_np.float32, copy=False)
+
+            out["policy_targets"] = torch.from_numpy(soft_targets.copy()).to(
+                dtype=torch.float32
+            )
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
         return out
 
@@ -172,6 +246,7 @@ def build_steps_dataloaders(
     dataset_dir: str,
     binner: Optional[Binner],
     target_mode: str,
+    target_cfg: "TargetConfig" | None,
     batch_size: int,
     *,
     run_sql: Optional[str] = None,
@@ -214,7 +289,7 @@ def build_steps_dataloaders(
     val_indices = _indices_from_run_ids(steps, val_rids) if val_rids is not None else None
 
     ds_train = StepsDataset(dataset_dir, indices=train_indices)
-    collate = make_collate_steps(target_mode, ds_train.steps, binner)
+    collate = make_collate_steps(target_mode, ds_train.steps, binner, target_cfg)
 
     prefetch_train = 8 if num_workers_train > 0 else None
     dl_train = DataLoader(
@@ -233,7 +308,7 @@ def build_steps_dataloaders(
         num_workers_val = max(2, num_workers_train // 3)
         prefetch_val = 4 if num_workers_val > 0 else None
         ds_val = StepsDataset(dataset_dir, indices=val_indices)
-        collate_v = make_collate_steps(target_mode, ds_val.steps, binner)
+        collate_v = make_collate_steps(target_mode, ds_val.steps, binner, target_cfg)
         dl_val = DataLoader(
             ds_val,
             batch_size=batch_size,

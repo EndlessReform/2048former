@@ -30,6 +30,7 @@ def build_dataloaders(
         dataset_dir=ds_cfg.resolved_dataset_dir(),
         binner=binner,
         target_mode=target_mode,
+        target_cfg=cfg.target,
         batch_size=cfg.batch.batch_size,
         run_sql=getattr(ds_cfg, "run_sql", None),
         sql_params=getattr(ds_cfg, "sql_params", None),

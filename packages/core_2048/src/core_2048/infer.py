@@ -1,9 +1,58 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
+
+
+def _head_type(model: torch.nn.Module) -> str:
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return "binned_ev"
+    return getattr(cfg, "head_type", "binned_ev")
+
+
+def logits_to_distributions(
+    model: torch.nn.Module,
+    head_outputs: torch.Tensor | Sequence[torch.Tensor],
+) -> list[torch.Tensor]:
+    """Normalize model head outputs into per-direction probability tensors.
+
+    Returns a list of length 4. Each tensor is (B, n_bins) with probabilities
+    summing to 1 along the last dimension.
+    """
+
+    head = _head_type(model)
+    if head == "action_policy":
+        if isinstance(head_outputs, (list, tuple)):
+            parts = []
+            for tensor in head_outputs:
+                part = tensor.float()
+                if part.dim() > 1:
+                    if part.size(-1) != 1:
+                        raise ValueError(
+                            "policy head tensor list must contain (B, 1) logits"
+                        )
+                    part = part.squeeze(-1)
+                parts.append(part)
+            policy_logits = torch.stack(parts, dim=1)
+        else:
+            policy_logits = head_outputs.float()
+            if policy_logits.dim() != 2 or policy_logits.size(-1) != 4:
+                raise ValueError(
+                    "action_policy head expects logits shaped (B, 4)"
+                )
+        probs = F.softmax(policy_logits, dim=-1)
+        head_probs: list[torch.Tensor] = []
+        for dir_idx in range(probs.size(-1)):
+            p = probs[:, dir_idx]
+            head_probs.append(torch.stack((1.0 - p, p), dim=-1))
+        return head_probs
+
+    if not isinstance(head_outputs, (list, tuple)):
+        raise TypeError("binned_ev head expects sequence of logits tensors")
+    return [F.softmax(logits.float(), dim=-1) for logits in head_outputs]
 
 
 def forward_distributions(
@@ -41,9 +90,8 @@ def forward_distributions(
             model.eval()
 
         try:
-            _hs, ev_logits = model(tokens.to(model_device, dtype=torch.long))
-            # Softmax per head over bins
-            head_probs = [F.softmax(logits.float(), dim=-1) for logits in ev_logits]
+            _hs, head_outputs = model(tokens.to(model_device, dtype=torch.long))
+            head_probs = logits_to_distributions(model, head_outputs)
         finally:
             if set_eval and prev_mode is not None:
                 model.train(prev_mode)
@@ -92,4 +140,3 @@ def prepare_model_for_inference(
     except StopIteration:
         used_dtype = None
     return model, used_dtype
-

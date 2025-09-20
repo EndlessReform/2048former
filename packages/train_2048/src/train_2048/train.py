@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
 from safetensors.torch import save_file as safe_save_file
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -14,6 +15,81 @@ import time, json, math
 
 from .config import TrainingConfig, load_encoder_from_init, normalize_state_dict_keys
 from .dataloader import build_dataloaders
+from .binning import Binner
+
+
+def _ensure_action_policy_head(model: torch.nn.Module) -> None:
+    cfg = getattr(model, "config", None)
+    hidden_size = int(getattr(cfg, "hidden_size", 0)) or None
+    if hidden_size is None:
+        raise ValueError("Model config must define hidden_size to create policy head")
+    already_policy = getattr(cfg, "head_type", "binned_ev") == "action_policy"
+    if already_policy and getattr(model, "policy_head", None) is not None:
+        return
+
+    model.policy_head = nn.Linear(hidden_size, 4)
+    if hasattr(model, "ev_heads"):
+        model.ev_heads = None  # remove binned heads if present
+    if cfg is not None:
+        cfg.head_type = "action_policy"
+        cfg.output_n_bins = None
+
+
+def _ensure_binned_ev_head(model: torch.nn.Module, n_bins: int) -> None:
+    if n_bins <= 0:
+        raise ValueError("n_bins must be positive to build binned EV heads")
+    cfg = getattr(model, "config", None)
+    already_binned = getattr(cfg, "head_type", "binned_ev") == "binned_ev"
+    existing = getattr(model, "ev_heads", None)
+    if already_binned and isinstance(existing, nn.ModuleList):
+        return
+
+    hidden_size = int(getattr(cfg, "hidden_size", 0)) or None
+    if hidden_size is None:
+        raise ValueError("Model config must define hidden_size to create EV heads")
+
+    heads = nn.ModuleList([nn.Linear(hidden_size, int(n_bins)) for _ in range(4)])
+    model.ev_heads = heads
+    model.policy_head = None
+    if cfg is not None:
+        cfg.head_type = "binned_ev"
+        cfg.output_n_bins = int(n_bins)
+
+
+def _policy_logits_from_head_out(
+    head_out: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]
+) -> torch.Tensor:
+    if isinstance(head_out, (list, tuple)):
+        parts = []
+        for tensor in head_out:
+            t = tensor.float()
+            if t.dim() == 2 and t.size(-1) == 1:
+                parts.append(t.squeeze(-1))
+            elif t.dim() == 1:
+                parts.append(t)
+            else:
+                raise RuntimeError(
+                    "policy targets expect head outputs shaped (B, 1) per move or (B,)"
+                )
+        if len(parts) != 4:
+            raise RuntimeError("policy head expects exactly 4 move logits")
+        logits = torch.stack(parts, dim=1)
+    else:
+        logits = head_out.float()
+        if logits.dim() != 2 or logits.size(-1) != 4:
+            raise RuntimeError("policy head expects logits shaped (B, 4)")
+    return logits
+
+
+def _log_softmax_with_mask(logits: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return F.log_softmax(logits, dim=-1)
+    mask_bool = mask.to(dtype=torch.bool)
+    penalty = (~mask_bool).to(dtype=logits.dtype) * -1e9
+    return F.log_softmax(logits + penalty, dim=-1)
+
+if TYPE_CHECKING:
+    from .config import TargetConfig
 
 
 def _format_postfix(
@@ -33,6 +109,12 @@ def _format_postfix(
         acc = metrics.get("policy_acc")
         if acc is not None:
             base += f"  policy_acc={float(acc):.3f}"
+        kd_loss = metrics.get("kd_loss")
+        if kd_loss is not None:
+            base += f"  kd={float(kd_loss):.3f}"
+        aux_ce = metrics.get("aux_ce_loss")
+        if aux_ce is not None and float(aux_ce) > 0.0:
+            base += f"  aux_ce={float(aux_ce):.3f}"
     base += f"  lr={lr:.2e}"
     if dt_data_ms is not None and dt_comp_ms is not None:
         base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
@@ -52,8 +134,17 @@ def train(
 
     device = torch.device(device_str)
 
+    target_cfg = cfg.target
+    target_mode = getattr(target_cfg, "mode", "binned_ev")
+
     # Model
     model = load_encoder_from_init(cfg.init_dir)
+    if target_mode in {"hard_move", "tsad_soft"}:
+        _ensure_action_policy_head(model)
+    elif target_mode == "binned_ev" and getattr(model, "ev_heads", None) is None:
+        n_bins = cfg.binning.n_bins
+        _ensure_binned_ev_head(model, n_bins)
+
     if device.type == "cuda":
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
@@ -175,7 +266,7 @@ def train(
     else:
         raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
-    target_mode = getattr(cfg.target, "mode", "binned_ev")
+    target_mode = getattr(target_cfg, "mode", "binned_ev")
     # Data: build train (and optional val) views via dataloader module
     num_workers_train = 12  # quick knob for throughput
     dl_train, dl_val, per_epoch_steps = build_dataloaders(
@@ -280,7 +371,7 @@ def train(
         if step <= 0 or (step % interval) != 0:
             return
         nonlocal best_val_loss
-        val_metrics = evaluate(model, dl_val, device, target_mode)
+        val_metrics = evaluate(model, dl_val, device, target_mode, target_cfg)
         val_loss = float(val_metrics["loss"])
         if val_loss + float(cfg.checkpoint.best_min_delta) < best_val_loss:
             best_val_loss = val_loss
@@ -319,7 +410,7 @@ def train(
                 it = iter(dl_train)
                 batch = next(it)
             t1 = time.perf_counter()
-            metrics = train_step(model, batch, optimizer, device, target_mode)
+            metrics = train_step(model, batch, optimizer, device, target_mode, target_cfg)
             t2 = time.perf_counter()
             dt_data_ms = (t1 - t0) * 1e3
             dt_comp_ms = (t2 - t1) * 1e3
@@ -345,12 +436,16 @@ def train(
                 else:
                     if metrics.get("policy_acc") is not None:
                         log_payload["train/policy_acc"] = metrics["policy_acc"]
+                    if metrics.get("kd_loss") is not None:
+                        log_payload["train/kd_loss"] = metrics["kd_loss"]
+                    if metrics.get("aux_ce_loss") is not None:
+                        log_payload["train/aux_ce_loss"] = metrics["aux_ce_loss"]
                 _safe_wandb_log(log_payload, step=global_step)
             # Periodic validation
             if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
                 global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
             ):
-                val_metrics = evaluate(model, dl_val, device, target_mode)
+                val_metrics = evaluate(model, dl_val, device, target_mode, target_cfg)
                 if wandb_run is not None:
                     log_payload = {"val/loss": val_metrics["loss"]}
                     if target_mode == "binned_ev":
@@ -365,6 +460,10 @@ def train(
                     else:
                         if val_metrics.get("policy_acc") is not None:
                             log_payload["val/policy_acc"] = val_metrics["policy_acc"]
+                        if val_metrics.get("kd_loss") is not None:
+                            log_payload["val/kd_loss"] = val_metrics["kd_loss"]
+                        if val_metrics.get("aux_ce_loss") is not None:
+                            log_payload["val/aux_ce_loss"] = val_metrics["aux_ce_loss"]
                     _safe_wandb_log(log_payload, step=global_step)
             global_step += 1
             # Coarse best checkpointing (if configured)
@@ -389,7 +488,7 @@ def train(
                     t_fetch1 = time.perf_counter()
                     # Compute
                     lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                    metrics = train_step(model, batch, optimizer, device, target_mode)
+                    metrics = train_step(model, batch, optimizer, device, target_mode, target_cfg)
                     t_comp1 = time.perf_counter()
                     dt_data_ms = (t_fetch1 - t_fetch0) * 1e3
                     dt_comp_ms = (t_comp1 - t_fetch1) * 1e3
@@ -424,12 +523,20 @@ def train(
                         else:
                             if metrics.get("policy_acc") is not None:
                                 log_payload["train/policy_acc"] = metrics["policy_acc"]
+                            if metrics.get("kd_loss") is not None:
+                                log_payload["train/kd_loss"] = metrics["kd_loss"]
+                            if metrics.get("aux_ce_loss") is not None:
+                                log_payload["train/aux_ce_loss"] = metrics["aux_ce_loss"]
+                            if metrics.get("kd_loss") is not None:
+                                log_payload["train/kd_loss"] = metrics["kd_loss"]
+                            if metrics.get("aux_ce_loss") is not None:
+                                log_payload["train/aux_ce_loss"] = metrics["aux_ce_loss"]
                         _safe_wandb_log(log_payload, step=global_step)
                     # Periodic validation
                     if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
                         global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
                     ):
-                        val_metrics = evaluate(model, dl_val, device, target_mode)
+                        val_metrics = evaluate(model, dl_val, device, target_mode, target_cfg)
                         if wandb_run is not None:
                             log_payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
                             if target_mode == "binned_ev":
@@ -444,6 +551,14 @@ def train(
                             else:
                                 if val_metrics.get("policy_acc") is not None:
                                     log_payload["val/policy_acc"] = val_metrics["policy_acc"]
+                                if val_metrics.get("kd_loss") is not None:
+                                    log_payload["val/kd_loss"] = val_metrics["kd_loss"]
+                                if val_metrics.get("aux_ce_loss") is not None:
+                                    log_payload["val/aux_ce_loss"] = val_metrics["aux_ce_loss"]
+                                if val_metrics.get("kd_loss") is not None:
+                                    log_payload["val/kd_loss"] = val_metrics["kd_loss"]
+                                if val_metrics.get("aux_ce_loss") is not None:
+                                    log_payload["val/aux_ce_loss"] = val_metrics["aux_ce_loss"]
                             _safe_wandb_log(log_payload, step=global_step)
                     global_step += 1
                     # Coarse best checkpointing (if configured)
@@ -470,7 +585,7 @@ def train(
                     t_fetch1 = time.perf_counter()
                     # Compute
                     lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                    metrics = train_step(model, batch, optimizer, device, target_mode)
+                    metrics = train_step(model, batch, optimizer, device, target_mode, target_cfg)
                     t_comp1 = time.perf_counter()
                     dt_data_ms = (t_fetch1 - t_fetch0) * 1e3
                     dt_comp_ms = (t_comp1 - t_fetch1) * 1e3
@@ -510,7 +625,7 @@ def train(
                     if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
                         global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)
                     ):
-                        val_metrics = evaluate(model, dl_val, device, target_mode)
+                        val_metrics = evaluate(model, dl_val, device, target_mode, target_cfg)
                         if wandb_run is not None:
                             log_payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
                             if target_mode == "binned_ev":
@@ -577,6 +692,7 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     target_mode: str,
+    target_cfg,
 ):
     """Single optimization step over one DataLoader batch (no micro-batching)."""
 
@@ -601,6 +717,9 @@ def train_step(
         autocast = _NullCtx()
 
     policy_acc = None
+    kd_loss_value: Optional[float] = None
+    aux_ce_value: Optional[float] = None
+    per_head_losses: list[torch.Tensor] = []
 
     with autocast:
         _hs, head_out = model(tokens)
@@ -611,15 +730,12 @@ def train_step(
             if branch_mask is None:
                 raise KeyError("branch_mask missing from batch for binned_ev target")
             targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
-            per_head_losses = []
             for h in range(4):
-                logits_h = head_out[h].float()  # compute loss in fp32 for stability
+                logits_h = head_out[h].float()
                 tgt_h = targets_bins[:, h]
                 mask_h = branch_mask[:, h]
 
-                # Cross-entropy per-sample
                 loss_h = F.cross_entropy(logits_h, tgt_h, reduction="none")
-                # Mask illegal moves
                 if mask_h.any():
                     loss_h = loss_h[mask_h].mean()
                 else:
@@ -631,20 +747,13 @@ def train_step(
             if "move_targets" not in batch:
                 raise KeyError("move_targets missing from batch for hard_move target")
             move_targets = batch["move_targets"].to(device, non_blocking=True)
-            # Accept either the new single policy head (B,4) or fallback 4x1 list
-            if isinstance(head_out, (list, tuple)):
-                if not all(t.shape[-1] == 1 for t in head_out):
-                    raise RuntimeError("hard_move expects single policy head or 4x1 logits list")
-                logits = torch.stack([t.float().squeeze(-1) for t in head_out], dim=1)
-            else:
-                logits = head_out.float()  # (B, 4)
+            logits = _policy_logits_from_head_out(head_out)
             loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
             loss = loss_per_sample.mean()
 
             preds = logits.argmax(dim=1)
             policy_acc = (preds == move_targets).float().mean()
 
-            per_head_losses = []
             for h in range(4):
                 sel = move_targets == h
                 if sel.any():
@@ -655,9 +764,46 @@ def train_step(
                     )
 
             if branch_mask is not None:
-                chosen_mask = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
+                chosen_mask = branch_mask[
+                    torch.arange(move_targets.size(0), device=device), move_targets
+                ]
                 if not bool(chosen_mask.all()):
                     raise RuntimeError("Encountered illegal move in hard targets batch")
+        elif target_mode == "tsad_soft":
+            if "policy_targets" not in batch:
+                raise KeyError("policy_targets missing from batch for tsad_soft target")
+            if branch_mask is None:
+                raise KeyError("branch_mask missing from batch for tsad_soft target")
+
+            logits = _policy_logits_from_head_out(head_out)
+            mask_bool = branch_mask.to(dtype=torch.bool)
+            log_probs = _log_softmax_with_mask(logits, mask_bool)
+
+            policy_targets = batch["policy_targets"].to(device, non_blocking=True).float()
+            teacher = policy_targets * mask_bool.to(dtype=policy_targets.dtype)
+            teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+            kd_loss = F.kl_div(log_probs, teacher, reduction="batchmean")
+            loss = kd_loss
+            kd_loss_value = float(kd_loss.detach().item())
+
+            aux_weight = float(getattr(target_cfg, "tsad_aux_ce_weight", 0.0) or 0.0)
+            move_targets_tensor = None
+            if "move_targets" in batch:
+                move_targets_tensor = batch["move_targets"].to(device, non_blocking=True)
+                preds = logits.argmax(dim=1)
+                policy_acc = (preds == move_targets_tensor).float().mean()
+
+            if aux_weight > 0.0:
+                if move_targets_tensor is None:
+                    raise KeyError(
+                        "move_targets required in batch when tsad_aux_ce_weight > 0"
+                    )
+                ce_loss = F.cross_entropy(logits, move_targets_tensor, reduction="mean")
+                loss = loss + aux_weight * ce_loss
+                aux_ce_value = float(ce_loss.detach().item())
+            else:
+                aux_ce_value = 0.0 if aux_weight > 0.0 else None
         else:
             raise ValueError(f"Unknown target mode: {target_mode}")
 
@@ -671,7 +817,11 @@ def train_step(
         "loss": total_loss,
         "head_losses": head_losses,
         "policy_acc": float(policy_acc.detach().item()) if policy_acc is not None else None,
+        "kd_loss": kd_loss_value,
+        "aux_ce_loss": aux_ce_value,
     }
+
+
 
 
 @torch.no_grad()
@@ -680,6 +830,7 @@ def evaluate(
     dl_val: DataLoader,
     device: torch.device,
     target_mode: str,
+    target_cfg,
 ):
     was_training = model.training
     model.eval()
@@ -689,10 +840,15 @@ def evaluate(
     n_batches = 0
     total_correct = 0.0
     total_examples = 0
+    total_kd = 0.0
+    kd_batches = 0
+    total_aux_ce = 0.0
+    aux_batches = 0
 
     if device.type == "cuda":
         autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
+
         class _NullCtx:
             def __enter__(self):
                 return None
@@ -738,14 +894,7 @@ def evaluate(
                 if "move_targets" not in batch:
                     raise KeyError("move_targets missing from batch for hard_move target")
                 move_targets = batch["move_targets"].to(device, non_blocking=True)
-                if isinstance(head_out, (list, tuple)):
-                    if not all(t.shape[-1] == 1 for t in head_out):
-                        raise RuntimeError(
-                            "hard_move expects single policy head or 4x1 logits list"
-                        )
-                    logits = torch.stack([t.float().squeeze(-1) for t in head_out], dim=1)
-                else:
-                    logits = head_out.float()
+                logits = _policy_logits_from_head_out(head_out)
                 loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
                 loss = loss_per_sample.mean()
 
@@ -771,6 +920,40 @@ def evaluate(
                         raise RuntimeError(
                             "Encountered illegal move in hard targets validation batch"
                         )
+            elif target_mode == "tsad_soft":
+                if "policy_targets" not in batch:
+                    raise KeyError("policy_targets missing from batch for tsad_soft target")
+                if branch_mask is None:
+                    raise KeyError("branch_mask missing from batch for tsad_soft target")
+
+                logits = _policy_logits_from_head_out(head_out)
+                mask_bool = branch_mask.to(dtype=torch.bool)
+                log_probs = _log_softmax_with_mask(logits, mask_bool)
+
+                policy_targets = batch["policy_targets"].to(device, non_blocking=True).float()
+                teacher = policy_targets * mask_bool.to(dtype=policy_targets.dtype)
+                teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+                kd_loss = F.kl_div(log_probs, teacher, reduction="batchmean")
+                loss = kd_loss
+                total_kd += float(kd_loss.detach().item())
+                kd_batches += 1
+
+                per_head_losses = [
+                    torch.zeros((), device=logits.device, dtype=torch.float32) for _ in range(4)
+                ]
+
+                aux_weight = float(getattr(target_cfg, "tsad_aux_ce_weight", 0.0) or 0.0)
+                move_targets = batch.get("move_targets")
+                if move_targets is not None:
+                    move_targets = move_targets.to(device, non_blocking=True)
+                    preds = logits.argmax(dim=1)
+                    total_correct += float((preds == move_targets).sum().item())
+                    total_examples += int(move_targets.numel())
+                if aux_weight > 0.0 and move_targets is not None:
+                    ce_loss = F.cross_entropy(logits, move_targets, reduction="mean")
+                    total_aux_ce += float(ce_loss.detach().item())
+                    aux_batches += 1
             else:
                 raise ValueError(f"Unknown target mode: {target_mode}")
 
@@ -784,14 +967,28 @@ def evaluate(
         model.train()
 
     if n_batches == 0:
-        return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None}
+        return {
+            "loss": 0.0,
+            "head_losses": [0.0, 0.0, 0.0, 0.0],
+            "policy_acc": None,
+            "kd_loss": None,
+            "aux_ce_loss": None,
+        }
 
     avg_loss = float(total_loss / n_batches)
     avg_heads = (total_heads / n_batches).tolist()
     policy_acc = None
-    if target_mode == "hard_move" and total_examples > 0:
+    if target_mode in {"hard_move", "tsad_soft"} and total_examples > 0:
         policy_acc = float(total_correct / total_examples)
-    return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": policy_acc}
+    avg_kd = float(total_kd / kd_batches) if kd_batches > 0 else None
+    avg_aux = float(total_aux_ce / aux_batches) if aux_batches > 0 else None
+    return {
+        "loss": avg_loss,
+        "head_losses": avg_heads,
+        "policy_acc": policy_acc,
+        "kd_loss": avg_kd,
+        "aux_ce_loss": avg_aux,
+    }
 
 
 def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:
@@ -803,4 +1000,4 @@ def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:
     return path
 
 
-__all__ = ["train", "train_step"]
+__all__ = ["train", "train_step", "evaluate"]

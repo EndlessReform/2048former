@@ -1,5 +1,6 @@
-gRPC Inference (Server + Client)
---------------------------------
+# Inference
+
+## gRPC Inference (Server + Client)
 
 - Python server (Torch):
   - Generate stubs once:
@@ -18,12 +19,11 @@ Notes
 - UDS and TCP are both supported; UDS avoids TCP overhead on a single node.
 - The wire format returns per-head probability distributions over bins; selection happens in Rust.
 
-Inference
----------
+## Inference
 
 Example: choose the move with the highest probability of the '1' bin.
 
-```
+```python
 import torch
 from train_2048.config import load_encoder_from_init
 from train_2048.inference import infer_move
