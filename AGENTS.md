@@ -28,6 +28,11 @@
 - Keep dataclasses/Pydantic models in `config.py`; avoid circular imports.
 - Prefer explicit `from train_2048 import …` over relative wildcards.
 
+### Rust self-play data writers
+- Use `npyz` (with the `derive` feature) for `.npy` output. Declare record dtypes explicitly in code (see `ds_writer::step_row_dtype`) and keep them aligned with the Python reference (`align=True`).
+- Write metadata through `rusqlite` (`bundled` feature). Enable WAL + `synchronous = NORMAL`, and use `INSERT … ON CONFLICT DO UPDATE` so reruns are idempotent.
+- When adding fields to either steps or metadata, update the docs and dtype/schema definitions before merging; mismatched layouts have broken previous runs.
+
 ## Testing Guidelines
 - No formal test suite yet. Validate via:
   - Quick sim: `bin/play_2048.py` (prints moves/sec, score, highest tile).
