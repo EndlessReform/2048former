@@ -1,4 +1,3 @@
 [workspace]
-members=["crates/game-engine"]
+members=["crates/game-engine", "crates/dataset-packer"]
 resolver = "3"
-

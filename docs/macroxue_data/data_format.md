@@ -95,24 +95,28 @@ TODO: add sharding
 
 ### Row-level data format
 
-We use a custom npy compound dtype for rows, 32-byte aligned for SIMD:
+We use a custom npy compound dtype for rows, aligned and padded to keep SIMD loads straightforward:
 
 ```python
 import numpy as np
 
 STEP_ROW_DTYPE = np.dtype(
     [
+        ("run_id", np.uint32),           # sequential game id
+        ("step_index", np.uint32),       # index within the run
         ("board", np.uint64),            # 16 packed 4-bit tiles (LSB = cell 0)
         ("tile_65536_mask", np.uint16),  # bit i set when tile i stores 2**16
-        ("move", np.uint8),              # 0=up, 1=right, 2=down, 3=left
-        ("valuation_type", np.uint8),    # enum in docs/macroxue_data/valuation.md
+        ("move_dir", np.uint8),          # 0=up, 1=right, 2=down, 3=left
+        ("valuation_type", np.uint8),    # enum (see valuation_types.json)
+        ("ev_legal", np.uint8),          # bitfield: up/right/down/left
+        ("max_rank", np.uint8),          # denormalised for filtering
         ("seed", np.uint32),             # PRNG seed that generated the run
         ("branch_evs", np.float32, (4,)),# EVs for [up, right, down, left]
     ],
     align=True,
 )
 
-assert STEP_ROW_DTYPE.itemsize == 32
+assert STEP_ROW_DTYPE.itemsize == 48
 ```
 
 ### Runs metadata
@@ -121,42 +125,27 @@ We keep the existing SQLite metadata schema so the training dataloader can keep 
 
 1. Enumerate every `.meta.json` (one per game) and assign a stable integer `id` that matches the `run_id` values written into `steps.npy` (we typically use the incrementing run counter from the ingest loop).
 2. Parse `seed`, `num_moves`, `score`, and `max_tile` from the JSON and insert them as `seed`, `steps`, `max_score`, and `highest_tile`. Other fields (`depth`, `seconds`, etc.) can be stored as JSON under `session` if you want to preserve them, but the loader does not require them.
-3. Create `metadata.db`, run the schema shown above, and bulk insert the rows. A tiny helper script does the job:
-
-```python
-import json, sqlite3
-from pathlib import Path
-
-root = Path("macroxue_ingest")
-db = sqlite3.connect(root / "metadata.db")
-db.executescript(
-    """
-    CREATE TABLE IF NOT EXISTS runs (
-        id INTEGER PRIMARY KEY,
-        seed BIGINT NOT NULL,
-        steps INT NOT NULL,
-        max_score INT NOT NULL,
-        highest_tile INT NOT NULL
-    );
-    DELETE FROM runs;
-    """
-)
-
-rows = []
-for idx, meta_path in enumerate(sorted(root.glob("**/*.meta.json"))):
-    meta = json.loads(meta_path.read_text())
-    rows.append(
-        (idx, meta["seed"], meta["num_moves"], meta["score"], meta["max_tile"])
-    )
-
-db.executemany("INSERT INTO runs VALUES (?,?,?,?,?)", rows)
-db.commit()
-```
+3. Create `metadata.db`, run the schema shown above, and bulk insert the rows. The Rust packer described below performs the join and ensures `steps['run_id']` stays aligned.
 
 This preserves compatibility with `packages/train_2048.dataloader`, which expects to select run IDs via SQL and intersect them with `steps['run_id']`.
 
+### Packing utility
+
+`crates/dataset-packer` bundles a CLI that walks the raw Macroxue drops, pairs each `*.meta.json` with the matching `*.jsonl.gz`, and emits the aligned artifacts:
+
+```bash
+cargo run -p dataset-packer -- pack --input /path/to/raw --output /tmp/macroxue-pack --workers 8 --shard-rows 10000000 --overwrite
+```
+
+Outputs:
+- `steps.npy` (or sharded `steps-00000.npy`, …) with the dtype above.
+- `metadata.db` populated from the sidecars (`runs` + `session` tables).
+- `valuation_types.json`: index → valuation-name lookup used by `valuation_type`.
+
+`--shard-rows` is optional today but provides the extension point for splitting the dataset without rewriting the packer. Progress is reported via `indicatif`, logging is standard `env_logger`, and the heavy lifting (JSON parsing, board packing) runs under `rayon`.
+
 #### On Rust
 
-- `.npy` writers live in `crates/game-engine/src/ds_writer.rs` and rely on `npyz` with the `derive` feature to keep structured dtypes in sync with NumPy. Always express the dtype explicitly (see `step_row_dtype()`) and ensure `align=True` on the Python side matches the Rust struct layout.
+- `.npy` writers live in `crates/dataset-packer` (library) and `crates/game-engine/src/ds_writer.rs`, both using `npyz` with the `derive` feature to keep structured dtypes in sync with NumPy. Always express the dtype explicitly (see `StepRow::dtype()` / `step_row_dtype()`) and ensure `align=True` on the Python side matches the Rust struct layout.
 - Metadata writers use `rusqlite` (bundled) via `SessionRecorder` in `crates/game-engine/src/recorder.rs`. Stick to WAL + `synchronous=NORMAL`, and keep inserts idempotent (`INSERT … ON CONFLICT DO UPDATE`).
 - When adding new fields, update both the Rust schema and the docs first, then regenerate the helper scripts; previous breakages came from mismatching dtype definitions.

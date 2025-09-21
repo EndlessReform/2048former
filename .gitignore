@@ -9,7 +9,8 @@ __pycache__/
 *.egg-info
 
 # Training artifacts
-datasets
+datasets*
+macroxue_raws
 inits
 output
 *.a2pack

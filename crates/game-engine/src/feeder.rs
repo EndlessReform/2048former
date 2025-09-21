@@ -223,26 +223,32 @@ impl Feeder {
 
                             for (i, item_id) in resp.item_ids.iter().enumerate() {
                                 if let Some(tx) = map.remove(item_id) {
-                                    let payload: Result<InferenceOutput, Status> = if self.argmax_only {
-                                        match (
-                                            resp.argmax_heads.get(i),
-                                            resp.argmax_p1.get(i),
-                                        ) {
+                                    let payload: Result<InferenceOutput, Status> = if self
+                                        .argmax_only
+                                    {
+                                        match (resp.argmax_heads.get(i), resp.argmax_p1.get(i)) {
                                             (Some(head), Some(p1)) => Ok(InferenceOutput::Argmax {
                                                 head: *head,
                                                 _p1: *p1,
                                             }),
-                                            _ => Err(Status::internal("missing argmax output for item")),
+                                            _ => Err(Status::internal(
+                                                "missing argmax output for item",
+                                            )),
                                         }
                                     } else {
                                         resp.outputs
                                             .get(i)
                                             .map(|o| {
                                                 InferenceOutput::Bins(
-                                                    o.heads.iter().map(|h| h.probs.clone()).collect(),
+                                                    o.heads
+                                                        .iter()
+                                                        .map(|h| h.probs.clone())
+                                                        .collect(),
                                                 )
                                             })
-                                            .ok_or_else(|| Status::internal("missing output for item"))
+                                            .ok_or_else(|| {
+                                                Status::internal("missing output for item")
+                                            })
                                     };
                                     let _ = tx.send(payload);
                                 }
