@@ -39,6 +39,8 @@ def build_dataloaders(
         val_split_seed=int(getattr(ds_cfg, "val_split_seed", 42) or 42),
         num_workers_train=num_workers_train,
         mmap_mode=getattr(ds_cfg, "mmap_mode", False),
+        step_index_min=getattr(ds_cfg, "step_index_min", None),
+        step_index_max=getattr(ds_cfg, "step_index_max", None),
     )
 
 

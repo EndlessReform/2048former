@@ -118,12 +118,17 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             tokens = self._tokens_cpu[:B].to(device=model_device, dtype=torch.long, non_blocking=True)
             vlog("[server] tokens staged (pinned) and moved to device")
 
-            # Forward once to obtain hidden states and logits
+            # Forward once to obtain hidden states and logits/policy
             prev_mode = self.model.training
             self.model.eval()
             with torch.inference_mode():
-                hidden_states, ev_logits = self.model(tokens)
-                head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in ev_logits]
+                hidden_states, head_out = self.model(tokens)
+                is_binned = isinstance(head_out, (list, tuple))
+                if is_binned:
+                    head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in head_out]
+                else:
+                    policy_logits = head_out.float()  # (B,4)
+                    policy_probs = F.softmax(policy_logits, dim=-1)
                 if return_embedding:
                     board_repr = hidden_states.mean(dim=1)  # (B, H)
 
@@ -134,19 +139,34 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             argmax_p1: list[float] = []
 
             if argmax_only:
-                p1_tensor = torch.stack([hp[:, -1] for hp in head_probs_t], dim=1)
-                p1_cpu = p1_tensor.to(dtype=torch.float32, device="cpu", non_blocking=False)
-                best_p1, best_head = torch.max(p1_cpu, dim=1)
-                argmax_heads = [int(h) for h in best_head.tolist()]
-                argmax_p1 = [float(v) for v in best_p1.tolist()]
-                if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
-                    try:
-                        n_bins = int(head_probs_t[0].shape[-1]) if head_probs_t else -1
-                        p1_first = p1_cpu[0].tolist() if p1_cpu.shape[0] > 0 else []
-                        vlog(f"[server] DEBUG p1 (argmax_only) n_bins={n_bins} p1[0]={p1_first} best={argmax_heads[0] if argmax_heads else None}")
-                    except Exception:
-                        pass
+                if is_binned:
+                    p1_tensor = torch.stack([hp[:, -1] for hp in head_probs_t], dim=1)
+                    p1_cpu = p1_tensor.to(dtype=torch.float32, device="cpu", non_blocking=False)
+                    best_p1, best_head = torch.max(p1_cpu, dim=1)
+                    argmax_heads = [int(h) for h in best_head.tolist()]
+                    argmax_p1 = [float(v) for v in best_p1.tolist()]
+                    if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
+                        try:
+                            n_bins = int(head_probs_t[0].shape[-1]) if head_probs_t else -1
+                            p1_first = p1_cpu[0].tolist() if p1_cpu.shape[0] > 0 else []
+                            vlog(f"[server] DEBUG p1 (argmax_only) n_bins={n_bins} p1[0]={p1_first} best={argmax_heads[0] if argmax_heads else None}")
+                        except Exception:
+                            pass
+                else:
+                    # Single policy head (Up, Down, Left, Right)
+                    pol_cpu = policy_probs.to(dtype=torch.float32, device="cpu", non_blocking=False)
+                    best_p, best_head = torch.max(pol_cpu, dim=1)
+                    argmax_heads = [int(h) for h in best_head.tolist()]
+                    argmax_p1 = [float(v) for v in best_p.tolist()]
+                    if os.environ.get("INFER_2048_DUMP_POLICY", "0") != "0":
+                        try:
+                            first = pol_cpu[0].tolist() if pol_cpu.shape[0] > 0 else []
+                            vlog(f"[server] DEBUG policy (argmax_only) probs[0]={first} best_idx={argmax_heads[0] if argmax_heads else None}")
+                        except Exception:
+                            pass
             else:
+                if not is_binned:
+                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Non-argmax requests are not supported for action_policy models; set orchestrator.argmax_only=true")
                 probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
                 probs_cpu = probs_all.to("cpu", non_blocking=False)
                 probs_list: list[list[list[float]]] = probs_cpu.tolist()

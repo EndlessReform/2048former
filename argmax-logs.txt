@@ -1,0 +1,12 @@
+Loading model: checkpoints/20250921_145311
+Detected head_type=action_policy
+[data] StepsDataset: 1042675738 rows across 11 shard(s) from datasets/macroxue/d6_1b (mmap=on)
+Samples: 20000
+Agreement with oracle (argmax): 0.8778
+Predicted illegal by ev_legal: 0.0000
+Confusion (rows=oracle URDL, cols=pred URDL):
+     Up: 6157, 157, 180, 483
+  Right: 183, 2615, 20, 213
+   Down: 231, 33, 2653, 164
+   Left: 463, 175, 142, 6131
+Wrote up to 500 disagreements to disagreements.jsonl

@@ -55,12 +55,13 @@ def write_toml(d: dict, path: Path) -> None:
     def emit_table(fp, key, table):
         fp.write(f"[{key}]\n")
         for k, v in table.items():
-            if isinstance(v, (int, float)):
+            # IMPORTANT: check bool before int — bool is a subclass of int in Python
+            if isinstance(v, bool):
+                fp.write(f"{k} = {'true' if v else 'false'}\n")
+            elif isinstance(v, (int, float)):
                 fp.write(f"{k} = {v}\n")
             elif isinstance(v, str):
                 fp.write(f"{k} = \"{v}\"\n")
-            elif isinstance(v, bool):
-                fp.write(f"{k} = {'true' if v else 'false'}\n")
         fp.write("\n")
 
     with path.open("w", encoding="utf-8") as fp:

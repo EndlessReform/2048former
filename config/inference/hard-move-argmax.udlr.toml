@@ -1,0 +1,28 @@
+num_seeds = 256
+max_retries = 1
+max_concurrent_games = 256
+
+[sampling]
+# Hard-move (single policy head) requires Argmax-only selection
+strategy = "Argmax"
+
+[orchestrator.connection]
+uds_path = "/tmp/2048_infer.sock"
+
+[orchestrator]
+# IMPORTANT: Legacy single-head policy uses UDLR (Up, Down, Left, Right)
+head_order = "UDLR"
+# Force argmax-only requests so the server returns only the best head index
+argmax_only = true
+
+[orchestrator.batch]
+flush_us = 500
+target_batch = 128
+max_batch = 256
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+
+# Optional: per-game results (JSONL)
+# [orchestrator.report]
+# results_file = "runs/results.jsonl"

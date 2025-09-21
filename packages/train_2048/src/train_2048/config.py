@@ -41,6 +41,9 @@ class DatasetConfig(BaseModel):
     # Optional: SQL to define the universe of runs (training+validation)
     run_sql: Optional[str] = None
     sql_params: list[object] = Field(default_factory=list)
+    # Optional: restrict steps by index window (inclusive bounds)
+    step_index_min: Optional[int] = None
+    step_index_max: Optional[int] = None
 
     # Validation split options (by run to avoid leakage)
     # Option A: explicit SQL for validation runs

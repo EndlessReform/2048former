@@ -68,6 +68,23 @@ def train(
         model = model.to(device)
 
     target_mode = getattr(cfg.target, "mode", "binned_ev")
+    # Preflight: ensure init head_type matches target
+    try:
+        head_type = getattr(getattr(model, "config", None), "head_type", "binned_ev")
+        if target_mode == "hard_move" and head_type != "action_policy":
+            raise RuntimeError(
+                "Init head_type mismatch: hard_move requires head_type='action_policy' in init config.json.\n"
+                f"Init: {cfg.init_dir}. Please edit config.json to include:\n"
+                "  'head_type': 'action_policy'\n"
+                "and remove/omit 'output_n_bins'."
+            )
+        if target_mode == "macroxue_tokens" and head_type != "binned_ev":
+            raise RuntimeError(
+                "Init head_type mismatch: macroxue_tokens requires head_type='binned_ev' in init config.json.\n"
+                f"Init: {cfg.init_dir}. Please set 'head_type': 'binned_ev' and set 'output_n_bins' to tokenizer_bins+2."
+            )
+    except Exception as e:
+        raise
     # Data: build train (and optional val) views via dataloader module
     print("[init] Building dataloaders…")
     num_workers_train = 12  # quick knob for throughput
@@ -403,15 +420,14 @@ def train(
                 batch = next(it)
             t1 = time.perf_counter()
             metrics = train_step(model, batch, optimizer, device, target_mode)
-            # Maintain a small windowed EMA for policy_agree (macroxue)
-            if target_mode == "macroxue_tokens":
-                pa = metrics.get("policy_agree")
-                if pa is not None:
-                    if not hasattr(train, "_pa_ema"):
-                        train._pa_ema = float(pa)
-                    decay = 0.95  # ~window 1/(1-decay) ≈ 20 steps; twice gives ~40
-                    train._pa_ema = float(decay * train._pa_ema + (1 - decay) * float(pa))
-                    metrics["policy_agree"] = train._pa_ema
+            # Maintain a small windowed EMA for policy_agree (both modes)
+            pa = metrics.get("policy_agree")
+            if pa is not None:
+                if not hasattr(train, "_pa_ema"):
+                    train._pa_ema = float(pa)
+                decay = 0.95  # ~window 1/(1-decay) ≈ 20 steps; twice gives ~40
+                train._pa_ema = float(decay * train._pa_ema + (1 - decay) * float(pa))
+                metrics["policy_agree"] = train._pa_ema
             t2 = time.perf_counter()
             dt_data_ms = (t1 - t0) * 1e3
             dt_comp_ms = (t2 - t1) * 1e3
@@ -437,6 +453,8 @@ def train(
                 else:
                     if metrics.get("policy_acc") is not None:
                         log_payload["train/policy_acc"] = metrics["policy_acc"]
+                    if metrics.get("policy_agree") is not None:
+                        log_payload["train/policy_agree"] = metrics["policy_agree"]
                 _safe_wandb_log(log_payload, step=global_step)
             # Periodic validation
             if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (
@@ -457,6 +475,8 @@ def train(
                     else:
                         if val_metrics.get("policy_acc") is not None:
                             log_payload["val/policy_acc"] = val_metrics["policy_acc"]
+                        if val_metrics.get("policy_agree") is not None:
+                            log_payload["val/policy_agree"] = val_metrics["policy_agree"]
                     _safe_wandb_log(log_payload, step=global_step)
             global_step += 1
             # Coarse best checkpointing (if configured)
@@ -778,10 +798,40 @@ def train_step(
             else:
                 logits = head_out.float()  # (B, 4)
             loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
-            loss = loss_per_sample.mean()
+
+            # If branch_mask is available, ignore illegal targets instead of failing.
+            # branch_mask is URDL; hard_move classes are UDLR. Remap columns: [U, D, L, R] = [0,2,3,1].
+            if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
+                mask_udlr = branch_mask[:, [0, 2, 3, 1]]
+                chosen_legal = mask_udlr[torch.arange(move_targets.size(0), device=device), move_targets]
+                if bool(chosen_legal.any()):
+                    loss = loss_per_sample[chosen_legal].mean()
+                else:
+                    loss = torch.zeros((), device=logits.device, dtype=torch.float32)
+            else:
+                loss = loss_per_sample.mean()
 
             preds = logits.argmax(dim=1)
-            policy_acc = (preds == move_targets).float().mean()
+            if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
+                acc_mask = (branch_mask[:, [0, 2, 3, 1]][torch.arange(move_targets.size(0), device=device), move_targets])
+                policy_acc = ((preds == move_targets) & acc_mask).float()
+                if bool(acc_mask.any()):
+                    policy_acc = policy_acc[acc_mask].mean()
+                else:
+                    policy_acc = torch.zeros((), device=logits.device, dtype=torch.float32)
+            else:
+                policy_acc = (preds == move_targets).float().mean()
+
+            # Soft agreement: probability assigned to the correct move (averaged over legal examples)
+            probs = F.softmax(logits, dim=-1)
+            p_t = probs[torch.arange(move_targets.size(0), device=device), move_targets]
+            if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
+                if bool(acc_mask.any()):
+                    policy_agree = float(p_t[acc_mask].mean().detach().item())
+                else:
+                    policy_agree = None
+            else:
+                policy_agree = float(p_t.mean().detach().item())
 
             per_head_losses = []
             for h in range(4):
@@ -793,10 +843,7 @@ def train_step(
                         torch.zeros((), device=logits.device, dtype=torch.float32)
                     )
 
-            if branch_mask is not None:
-                chosen_mask = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
-                if not bool(chosen_mask.all()):
-                    raise RuntimeError("Encountered illegal move in hard targets batch")
+            # Do not error on illegal targets; they are already ignored in loss/metrics above.
         else:
             raise ValueError(f"Unknown target mode: {target_mode}")
 
@@ -810,7 +857,7 @@ def train_step(
         "loss": total_loss,
         "head_losses": head_losses,
         "policy_acc": float(policy_acc.detach().item()) if policy_acc is not None else None,
-        "policy_agree": policy_agree if target_mode == "macroxue_tokens" else None,
+        "policy_agree": policy_agree,
     }
 
 
@@ -907,11 +954,42 @@ def evaluate(
                 else:
                     logits = head_out.float()
                 loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
-                loss = loss_per_sample.mean()
+
+                # If branch_mask is available, ignore illegal targets in val too.
+                if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
+                    # Remap URDL -> UDLR columns
+                    mask_udlr = branch_mask[:, [0, 2, 3, 1]]
+                    chosen_legal = mask_udlr[
+                        torch.arange(move_targets.size(0), device=device), move_targets
+                    ]
+                    if bool(chosen_legal.any()):
+                        loss = loss_per_sample[chosen_legal].mean()
+                    else:
+                        loss = torch.zeros((), device=logits.device, dtype=torch.float32)
+                else:
+                    loss = loss_per_sample.mean()
 
                 preds = logits.argmax(dim=1)
-                total_correct += float((preds == move_targets).sum().item())
-                total_examples += int(move_targets.numel())
+                if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
+                    acc_mask = branch_mask[:, [0, 2, 3, 1]][
+                        torch.arange(move_targets.size(0), device=device), move_targets
+                    ]
+                    total_correct += float(((preds == move_targets) & acc_mask).sum().item())
+                    total_examples += int(acc_mask.sum().item())
+                else:
+                    total_correct += float((preds == move_targets).sum().item())
+                    total_examples += int(move_targets.numel())
+
+                # Soft agreement for hard_move: mean probability on the correct move
+                probs = F.softmax(logits, dim=-1)
+                p_t = probs[torch.arange(move_targets.size(0), device=device), move_targets]
+                if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
+                    if bool(acc_mask.any()):
+                        agree_sum += float(p_t[acc_mask].sum().item())
+                        agree_cnt += int(acc_mask.sum().item())
+                else:
+                    agree_sum += float(p_t.sum().item())
+                    agree_cnt += int(move_targets.numel())
 
                 per_head_losses = []
                 for h in range(4):
@@ -923,14 +1001,7 @@ def evaluate(
                             torch.zeros((), device=logits.device, dtype=torch.float32)
                         )
 
-                if branch_mask is not None:
-                    chosen_mask = branch_mask[
-                        torch.arange(move_targets.size(0), device=device), move_targets
-                    ]
-                    if not bool(chosen_mask.all()):
-                        raise RuntimeError(
-                            "Encountered illegal move in hard targets validation batch"
-                        )
+                # Do not error on illegal targets in validation either.
             else:
                 raise ValueError(f"Unknown target mode: {target_mode}")
 

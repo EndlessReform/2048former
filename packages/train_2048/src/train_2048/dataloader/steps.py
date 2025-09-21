@@ -532,24 +532,36 @@ def make_collate_steps(
     if target_mode == "binned_ev" and binner is None:
         raise ValueError("Binner is required when target_mode='binned_ev'")
 
-    import ai_2048 as a2  # lazy import
-
     def _collate(batch_indices: Sequence[int]):
         import numpy as _np
 
         idxs = _np.asarray(batch_indices, dtype=_np.int64)
-        exps_buf, dirs, evs = a2.batch_from_steps(dataset.get_rows, idxs, parallel=True)
+        batch = dataset.get_rows(idxs)
 
-        # Tokens from exponents buffer
-        exps = _np.frombuffer(exps_buf, dtype=_np.uint8).reshape(-1, 16)
+        # Decode packed boards → (N,16) exponents (mirror macroxue helper)
+        def _unpack_board_to_exps_u8(packed: _np.ndarray, *, mask65536: Optional[_np.ndarray] = None) -> _np.ndarray:
+            arr = packed.astype(_np.uint64, copy=False)
+            n = int(arr.shape[0])
+            out = _np.empty((n, 16), dtype=_np.uint8)
+            for i in range(16):
+                out[:, i] = ((arr >> (4 * i)) & _np.uint64(0xF)).astype(_np.uint8, copy=False)
+            if mask65536 is not None:
+                m = mask65536.astype(_np.uint16, copy=False)
+                for i in range(16):
+                    sel = ((m >> i) & _np.uint16(1)) != 0
+                    if _np.any(sel):
+                        out[sel, i] = _np.uint8(16)
+            return out
+
+        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
+        exps = _unpack_board_to_exps_u8(batch['board'], mask65536=mask65536)
         tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
 
-        # EVs and legality mask from ev_legal bitfield (Up=1, Right=8, Down=2, Left=4)
-        if not isinstance(evs, _np.ndarray):
-            evs = _np.asarray(evs, dtype=_np.float32)
-        evs = evs.astype(_np.float32, copy=False)
-
-        batch = dataset.get_rows(idxs)
+        # EVs from dataset (URDL order), float32
+        if 'branch_evs' in batch.dtype.names:
+            evs = batch['branch_evs'].astype(_np.float32, copy=False)
+        else:
+            evs = _np.zeros((len(idxs), 4), dtype=_np.float32)
         if 'ev_legal' in batch.dtype.names:
             bits = batch['ev_legal'].astype(_np.uint8, copy=False)
             # Dataset packer sets ev_legal bits as URDL order with sequential bits
@@ -581,7 +593,17 @@ def make_collate_steps(
             out["branch_bin_targets"] = binner.bin_values(branch_values).long()
             out["n_bins"] = int(binner.n_bins)
         else:  # hard_move
-            dirs_arr = _np.asarray(dirs, dtype=_np.int64)
+            if 'move_dir' not in batch.dtype.names:
+                raise KeyError("move_dir missing from steps.npy for hard_move target")
+            # Move directions from dataset in URDL numeric codes (Up=0, Right=1, Down=2, Left=3)
+            dirs_arr = batch['move_dir'].astype(_np.int64, copy=False)
+            # Previous single-head policy used class order UDLR (Up, Down, Left, Right).
+            # ai_2048/batch_from_steps returns URDL (0,1,2,3 = Up,Right,Down,Left).
+            # Permute to UDLR to match historical order for hard targets.
+            # Mapping old->new: 0->0 (U), 1->3 (R->last), 2->1 (D), 3->2 (L)
+            perm = _np.array([0, 3, 1, 2], dtype=_np.int64)
+            if dirs_arr.size:
+                dirs_arr = perm[dirs_arr]
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
         return out
 
@@ -644,6 +666,38 @@ def build_steps_dataloaders(
     else:
         train_indices = _indices_from_run_ids(ds_train, train_rids)
     val_indices = _indices_from_run_ids(ds_train, val_rids) if val_rids is not None else None
+
+    # Optional: apply step-index window filtering (inclusive) if provided in config
+    if ('step_index_min' in locals() and step_index_min is not None) or ('step_index_max' in locals() and step_index_max is not None):
+        import numpy as _np
+        smin_i = int(step_index_min) if step_index_min is not None else None
+        smax_i = int(step_index_max) if step_index_max is not None else None
+        def _filter_by_step_index(idx: _np.ndarray) -> _np.ndarray:
+            if idx is None or idx.size == 0:
+                return idx
+            parts: list[_np.ndarray] = []
+            for s_idx, shard in enumerate(ds_train.shards):
+                offset = int(ds_train.cum_counts[s_idx])
+                lo = offset
+                hi = int(ds_train.cum_counts[s_idx + 1])
+                mask = (idx >= lo) & (idx < hi)
+                if not mask.any():
+                    continue
+                local = (idx[mask] - offset).astype(_np.int64, copy=False)
+                step_idx = shard['step_index'][local].astype(_np.int64, copy=False)
+                keep = _np.ones_like(local, dtype=bool)
+                if smin_i is not None:
+                    keep &= step_idx >= smin_i
+                if smax_i is not None:
+                    keep &= step_idx <= smax_i
+                parts.append((local[keep] + offset).astype(_np.int64, copy=False))
+            if not parts:
+                return _np.empty((0,), dtype=_np.int64)
+            return _np.concatenate(parts)
+        if train_indices is not None:
+            train_indices = _filter_by_step_index(train_indices)
+        if val_indices is not None:
+            val_indices = _filter_by_step_index(val_indices)
 
     ds_train.indices = train_indices
     if target_mode == "macroxue_tokens":
