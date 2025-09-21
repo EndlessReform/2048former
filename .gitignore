@@ -13,6 +13,7 @@ datasets*
 macroxue_raws
 inits
 output
+out
 *.a2pack
 checkpoints
 profiles
