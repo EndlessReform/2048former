@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{info, warn};
-use npyz::{DType, Field, TypeStr, WriterBuilder, NpyWriter};
+use npyz::{DType, Field, NpyWriter, TypeStr, WriterBuilder};
 use rayon::prelude::*;
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -30,6 +30,16 @@ pub struct PackSummary {
     pub runs: usize,
     pub steps: usize,
     pub shards: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct MergeOptions {
+    pub left_dir: PathBuf,
+    pub right_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub rows_per_shard: Option<usize>,
+    pub overwrite: bool,
+    pub delete_inputs: bool,
 }
 
 #[repr(C)]
@@ -107,6 +117,20 @@ struct RunInput {
     steps_path: PathBuf,
 }
 
+fn is_meta_filename(name: &str) -> bool {
+    name.ends_with(".meta.json") || name.ends_with(".meta.json.gz")
+}
+
+fn meta_base_name(name: &str) -> Option<&str> {
+    if let Some(stem) = name.strip_suffix(".meta.json") {
+        Some(stem)
+    } else if let Some(stem) = name.strip_suffix(".meta.json.gz") {
+        Some(stem)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RunOutput {
     summary: RunSummary,
@@ -120,6 +144,14 @@ struct RunSummary {
     steps: usize,
     max_score: u64,
     highest_tile: u32,
+}
+
+#[derive(Debug)]
+struct DatasetInfo {
+    runs: Vec<RunSummary>,
+    steps_files: Vec<PathBuf>,
+    valuation_names: Vec<String>,
+    total_steps: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,14 +291,7 @@ pub fn pack_dataset(opts: PackOptions) -> Result<PackSummary> {
     }
 
     info!("Discovered {} runs", runs.len());
-    let pb = ProgressBar::new(runs.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] {wide_bar} {pos}/{len} ({eta})",
-        )
-        .unwrap()
-        .progress_chars("█▉▊▋▌▍▎▏  "),
-    );
+    let pb = default_progress_bar(runs.len() as u64);
 
     let encoder = Arc::new(ValuationEncoder::new());
 
@@ -334,10 +359,12 @@ fn discover_runs(root: &Path) -> Result<Vec<RunInput>> {
             Some(n) => n,
             None => continue,
         };
-        if !name.ends_with(".meta.json") {
+        if !is_meta_filename(name) {
             continue;
         }
-        let steps_path = candidate_steps_path(path);
+        let Some(steps_path) = candidate_steps_path(path) else {
+            continue;
+        };
         if !steps_path.is_file() {
             warn!(
                 "Skipping meta file {} because {} is missing",
@@ -355,17 +382,39 @@ fn discover_runs(root: &Path) -> Result<Vec<RunInput>> {
     Ok(runs)
 }
 
-fn candidate_steps_path(meta_path: &Path) -> PathBuf {
-    let file_name = meta_path.file_name().and_then(|s| s.to_str()).unwrap();
-    let base = file_name.strip_suffix(".meta.json").unwrap_or(file_name);
+fn candidate_steps_path(meta_path: &Path) -> Option<PathBuf> {
+    let file_name = meta_path.file_name().and_then(|s| s.to_str())?;
+    let base = meta_base_name(file_name)?;
     let mut steps = meta_path.to_path_buf();
     steps.set_file_name(format!("{base}.jsonl.gz"));
-    steps
+    Some(steps)
+}
+
+fn read_json_text(path: &Path) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("gz"))
+        .unwrap_or(false)
+    {
+        let mut gz = GzDecoder::new(file);
+        let mut buf = String::new();
+        gz.read_to_string(&mut buf)
+            .with_context(|| format!("failed to decompress {}", path.display()))?;
+        Ok(buf)
+    } else {
+        let mut reader = BufReader::new(file);
+        let mut buf = String::new();
+        reader
+            .read_to_string(&mut buf)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(buf)
+    }
 }
 
 fn process_run(run: RunInput, run_id: u32, encoder: &ValuationEncoder) -> Result<RunOutput> {
-    let meta_content = fs::read_to_string(&run.meta_path)
-        .with_context(|| format!("failed to read {}", run.meta_path.display()))?;
+    let meta_content = read_json_text(&run.meta_path)?;
     let meta: MetaRecord = serde_json::from_str(&meta_content)
         .with_context(|| format!("failed to parse {}", run.meta_path.display()))?;
 
@@ -489,6 +538,18 @@ fn gather_branch_evs(map: &HashMap<String, Option<f32>>) -> ([f32; 4], u8) {
     (evs, mask)
 }
 
+fn default_progress_bar(len: u64) -> ProgressBar {
+    let pb = ProgressBar::new(len);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] {wide_bar} {pos}/{len} ({eta})",
+        )
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb
+}
+
 fn write_steps_stream(
     outputs: &mut [RunOutput],
     out_dir: &Path,
@@ -500,170 +561,196 @@ fn write_steps_stream(
         warn!("No steps to write; skipping steps.npy");
         return Ok(0);
     }
-    let per_shard = rows_per_shard.unwrap_or(total_steps);
-    if per_shard == 0 {
-        bail!("rows_per_shard must be > 0");
-    }
-    let shard_count = (total_steps + per_shard - 1) / per_shard;
-    let mut shard_idx = 0usize;
-    let mut remaining_total = total_steps;
-
-    let mut active: Option<ShardWriter> = None;
-    let chunk_cap = per_shard.min(65_536).max(1_024);
-    let mut chunk: Vec<StepRow> = Vec::with_capacity(chunk_cap);
-
-    let flush_chunk = |chunk: &mut Vec<StepRow>,
-                           active: &mut Option<ShardWriter>,
-                           shard_idx: &mut usize,
-                           remaining_total: &mut usize|
-     -> Result<()> {
-        let mut start = 0usize;
-        while start < chunk.len() {
-            if active.is_none() {
-                if *shard_idx >= shard_count {
-                    bail!("exceeded expected shard count while writing steps.npy");
-                }
-                let rows_this_shard = if shard_count == 1 {
-                    *remaining_total
-                } else if *shard_idx == shard_count - 1 {
-                    *remaining_total
-                } else {
-                    per_shard
-                };
-                *active = Some(ShardWriter::new(
-                    out_dir,
-                    *shard_idx,
-                    shard_count,
-                    rows_this_shard,
-                    overwrite,
-                )?);
-            }
-
-            let writer = active.as_mut().expect("active shard must exist");
-            let take = writer.remaining.min(chunk.len() - start);
-            let slice = &chunk[start..start + take];
-            writer.write(slice)?;
-            start += take;
-            *remaining_total = remaining_total.saturating_sub(take);
-
-            if writer.is_complete() {
-                let finished = active.take().unwrap();
-                finished.finish()?;
-                *shard_idx += 1;
-            }
+    if let Some(limit) = rows_per_shard {
+        if limit == 0 {
+            bail!("rows_per_shard must be > 0 when specified");
         }
-        chunk.clear();
-        Ok(())
-    };
+    }
 
+    let mut writer = StepsWriter::new(out_dir, rows_per_shard, overwrite)?;
     for out in outputs.iter_mut() {
-        for step in out.steps.drain(..) {
-            chunk.push(step);
-            if chunk.len() >= chunk_cap {
-                flush_chunk(
-                    &mut chunk,
-                    &mut active,
-                    &mut shard_idx,
-                    &mut remaining_total,
-                )?;
+        if !out.steps.is_empty() {
+            writer.write(&out.steps)?;
+            out.steps.clear();
+        }
+    }
+    writer.finish()
+}
+
+struct StepsWriter {
+    out_dir: PathBuf,
+    rows_per_shard: Option<usize>,
+    overwrite: bool,
+    shard_idx: usize,
+    shards_written: usize,
+    current: Option<ShardWriter>,
+    cleaned: bool,
+}
+
+impl StepsWriter {
+    fn new(out_dir: &Path, rows_per_shard: Option<usize>, overwrite: bool) -> Result<Self> {
+        Ok(Self {
+            out_dir: out_dir.to_path_buf(),
+            rows_per_shard,
+            overwrite,
+            shard_idx: 0,
+            shards_written: 0,
+            current: None,
+            cleaned: false,
+        })
+    }
+
+    fn prepare(&mut self) -> Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if self.overwrite {
+            let remove = |path: PathBuf| -> Result<()> {
+                if path.exists() {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("failed to remove {}", path.display()))?;
+                }
+                Ok(())
+            };
+            remove(self.out_dir.join("steps.npy"))?;
+            for entry in fs::read_dir(&self.out_dir)
+                .with_context(|| format!("failed to read {}", self.out_dir.display()))?
+            {
+                let entry = entry?;
+                let name = entry.file_name();
+                if let Some(name_str) = name.to_str() {
+                    if name_str.starts_with("steps-") && name_str.ends_with(".npy") {
+                        fs::remove_file(entry.path()).with_context(|| {
+                            format!("failed to remove {}", entry.path().display())
+                        })?;
+                    }
+                }
+            }
+        } else {
+            if self.out_dir.join("steps.npy").exists() {
+                bail!(
+                    "steps.npy already exists in {} (use --overwrite)",
+                    self.out_dir.display()
+                );
+            }
+            let numbered_exists = fs::read_dir(&self.out_dir)
+                .with_context(|| format!("failed to read {}", self.out_dir.display()))?
+                .filter_map(|e| e.ok())
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|n| n.starts_with("steps-") && n.ends_with(".npy"))
+                        .unwrap_or(false)
+                });
+            if numbered_exists {
+                bail!(
+                    "found existing steps-*.npy in {} (use --overwrite)",
+                    self.out_dir.display()
+                );
             }
         }
+        self.cleaned = true;
+        Ok(())
     }
 
-    if !chunk.is_empty() {
-        flush_chunk(
-            &mut chunk,
-            &mut active,
-            &mut shard_idx,
-            &mut remaining_total,
-        )?;
-    }
-
-    if let Some(writer) = active.take() {
-        if !writer.is_complete() {
-            return Err(anyhow!(
-                "final shard incomplete: {} rows remaining",
-                writer.remaining
-            ));
+    fn ensure_writer(&mut self) -> Result<()> {
+        if self.current.is_some() {
+            return Ok(());
         }
-        writer.finish()?;
-        shard_idx += 1;
+        self.prepare()?;
+        let shard = ShardWriter::new(&self.out_dir, self.shard_idx, self.rows_per_shard)?;
+        self.current = Some(shard);
+        Ok(())
     }
 
-    if shard_idx != shard_count {
-        return Err(anyhow!(
-            "expected {} shard(s) but wrote {}",
-            shard_count,
-            shard_idx
-        ));
+    fn write(&mut self, rows: &[StepRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut start = 0usize;
+        while start < rows.len() {
+            self.ensure_writer()?;
+            let limit = self.rows_per_shard.unwrap_or(usize::MAX);
+            let shard = self.current.as_mut().expect("active shard must exist");
+            let written = shard.write(&rows[start..], limit)?;
+            if written == 0 {
+                bail!("failed to make progress while writing steps.npy");
+            }
+            start += written;
+            if shard.is_full(limit) {
+                let shard_state = self.current.take().unwrap();
+                shard_state.finish()?;
+                self.shards_written += 1;
+                self.shard_idx += 1;
+            }
+        }
+        Ok(())
     }
 
-    Ok(shard_count)
+    fn finish(mut self) -> Result<usize> {
+        if let Some(shard) = self.current.take() {
+            shard.finish()?;
+            self.shards_written += 1;
+        }
+        if self.shards_written == 0 {
+            warn!(
+                "No steps were written; no steps.npy produced in {}",
+                self.out_dir.display()
+            );
+        }
+        Ok(self.shards_written)
+    }
 }
 
 struct ShardWriter {
     writer: NpyWriter<StepRow, BufWriter<File>>,
     tmp_path: PathBuf,
     final_path: PathBuf,
-    remaining: usize,
+    rows_written: usize,
+    limit: Option<usize>,
 }
 
 impl ShardWriter {
-    fn new(
-        out_dir: &Path,
-        shard_idx: usize,
-        total_shards: usize,
-        rows: usize,
-        overwrite: bool,
-    ) -> Result<Self> {
-        let final_name = if total_shards == 1 {
-            "steps.npy".to_string()
-        } else {
+    fn new(out_dir: &Path, shard_idx: usize, limit: Option<usize>) -> Result<Self> {
+        let final_name = if limit.is_some() {
             format!("steps-{shard_idx:05}.npy")
+        } else {
+            "steps.npy".to_string()
         };
         let final_path = out_dir.join(final_name);
-        if final_path.exists() {
-            if overwrite {
-                fs::remove_file(&final_path)
-                    .with_context(|| format!("failed to remove {}", final_path.display()))?;
-            } else {
-                bail!(
-                    "steps file {} exists (use --overwrite)",
-                    final_path.display()
-                );
-            }
-        }
         let tmp_path = final_path.with_extension("npy.tmp");
         let file = File::create(&tmp_path)
             .with_context(|| format!("failed to create {}", tmp_path.display()))?;
         let writer = npyz::WriteOptions::new()
             .dtype(StepRow::dtype())
-            .shape(&[rows as u64])
             .writer(BufWriter::new(file))
-            .begin_nd()?;
+            .begin_1d()?;
         Ok(Self {
             writer,
             tmp_path,
             final_path,
-            remaining: rows,
+            rows_written: 0,
+            limit,
         })
     }
 
-    fn write(&mut self, rows: &[StepRow]) -> Result<()> {
-        if rows.len() > self.remaining {
-            bail!(
-                "attempted to write {} rows but only {} remaining in shard",
-                rows.len(),
-                self.remaining
-            );
+    fn write(&mut self, rows: &[StepRow], limit: usize) -> Result<usize> {
+        let remaining = limit.saturating_sub(self.rows_written);
+        let take = if self.limit.is_some() {
+            rows.len().min(remaining)
+        } else {
+            rows.len()
+        };
+        if take > 0 {
+            self.writer.extend(rows[..take].iter().copied())?;
+            self.rows_written += take;
         }
-        self.writer.extend(rows.iter().copied())?;
-        self.remaining -= rows.len();
-        Ok(())
+        Ok(take)
     }
 
-    fn is_complete(&self) -> bool {
-        self.remaining == 0
+    fn is_full(&self, limit: usize) -> bool {
+        self.limit.is_some() && self.rows_written >= limit
     }
 
     fn finish(self) -> Result<()> {
@@ -683,6 +770,267 @@ impl ShardWriter {
         })?;
         Ok(())
     }
+}
+
+pub fn merge_datasets(opts: MergeOptions) -> Result<PackSummary> {
+    if opts.rows_per_shard == Some(0) {
+        bail!("rows_per_shard must be > 0 when specified");
+    }
+    if !opts.left_dir.exists() {
+        bail!("left dataset '{}' does not exist", opts.left_dir.display());
+    }
+    if !opts.right_dir.exists() {
+        bail!(
+            "right dataset '{}' does not exist",
+            opts.right_dir.display()
+        );
+    }
+    fs::create_dir_all(&opts.output_dir)
+        .with_context(|| format!("failed to create output dir {}", opts.output_dir.display()))?;
+
+    let left = load_dataset_info(&opts.left_dir)?;
+    let right = load_dataset_info(&opts.right_dir)?;
+
+    let mut new_runs = Vec::with_capacity(left.runs.len() + right.runs.len());
+    let mut left_map = HashMap::new();
+    let mut right_map = HashMap::new();
+    let mut next_id: u32 = 0;
+
+    for run in &left.runs {
+        left_map.insert(run.run_id, next_id);
+        let mut updated = run.clone();
+        updated.run_id = next_id;
+        new_runs.push(updated);
+        next_id += 1;
+    }
+    for run in &right.runs {
+        right_map.insert(run.run_id, next_id);
+        let mut updated = run.clone();
+        updated.run_id = next_id;
+        new_runs.push(updated);
+        next_id += 1;
+    }
+
+    let mut valuation_names = left.valuation_names.clone();
+    let mut valuation_ids: HashMap<String, u8> = HashMap::new();
+    for (idx, name) in valuation_names.iter().enumerate() {
+        valuation_ids.insert(name.clone(), idx as u8);
+    }
+    for name in right.valuation_names.iter() {
+        if !valuation_ids.contains_key(name) {
+            let id = valuation_names.len() as u8;
+            valuation_names.push(name.clone());
+            valuation_ids.insert(name.clone(), id);
+        }
+    }
+
+    let total_steps = left.total_steps + right.total_steps;
+
+    let mut pb = if total_steps > 0 {
+        let pb = default_progress_bar(total_steps as u64);
+        pb.set_message("merging steps");
+        Some(pb)
+    } else {
+        None
+    };
+
+    let mut writer = StepsWriter::new(&opts.output_dir, opts.rows_per_shard, opts.overwrite)?;
+    stream_dataset(&left, &left_map, &valuation_ids, &mut writer, pb.as_ref())?;
+    stream_dataset(&right, &right_map, &valuation_ids, &mut writer, pb.as_ref())?;
+    let shards = writer.finish()?;
+
+    if let Some(pb) = &pb {
+        pb.finish_with_message("merge complete");
+    }
+
+    write_metadata(&opts.output_dir, &new_runs, opts.overwrite)?;
+    write_valuation_types(&opts.output_dir, &valuation_names, opts.overwrite)?;
+
+    if opts.delete_inputs {
+        let output_canon = fs::canonicalize(&opts.output_dir)
+            .with_context(|| format!("failed to canonicalize {}", opts.output_dir.display()))?;
+        for dir in [&opts.left_dir, &opts.right_dir] {
+            let canon = fs::canonicalize(dir)
+                .with_context(|| format!("failed to canonicalize {}", dir.display()))?;
+            if canon == output_canon {
+                bail!(
+                    "refusing to delete input '{}' because it matches output directory",
+                    dir.display()
+                );
+            }
+        }
+        fs::remove_dir_all(&opts.left_dir)
+            .with_context(|| format!("failed to remove {}", opts.left_dir.display()))?;
+        fs::remove_dir_all(&opts.right_dir)
+            .with_context(|| format!("failed to remove {}", opts.right_dir.display()))?;
+    }
+
+    Ok(PackSummary {
+        runs: new_runs.len(),
+        steps: total_steps,
+        shards,
+    })
+}
+
+fn load_dataset_info(dir: &Path) -> Result<DatasetInfo> {
+    let steps_files = collect_step_files(dir)?;
+    if steps_files.is_empty() {
+        bail!("no steps.npy files found in {}", dir.display());
+    }
+    let runs = load_runs(dir)?;
+    if runs.is_empty() {
+        bail!("metadata.db in {} has no runs", dir.display());
+    }
+    let valuation_names = load_valuation_names(dir)?;
+    let total_steps = runs.iter().map(|r| r.steps).sum();
+    Ok(DatasetInfo {
+        runs,
+        steps_files,
+        valuation_names,
+        total_steps,
+    })
+}
+
+fn collect_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let single = dir.join("steps.npy");
+    if single.exists() {
+        files.push(single);
+    }
+    let mut shards: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("failed to read {}", dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if name.starts_with("steps-") && name.ends_with(".npy") {
+                Some(entry.path())
+            } else {
+                None
+            }
+        })
+        .collect();
+    shards.sort();
+    files.extend(shards);
+    Ok(files)
+}
+
+fn load_runs(dir: &Path) -> Result<Vec<RunSummary>> {
+    let path = dir.join("metadata.db");
+    if !path.exists() {
+        bail!("missing metadata.db in {}", dir.display());
+    }
+    let conn =
+        Connection::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT id, seed, steps, max_score, highest_tile FROM runs ORDER BY id ASC")
+        .with_context(|| format!("failed to prepare query for {}", path.display()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(RunSummary {
+                run_id: row.get::<_, i64>(0)? as u32,
+                seed: row.get::<_, i64>(1)? as u64,
+                steps: row.get::<_, i64>(2)? as usize,
+                max_score: row.get::<_, i64>(3)? as u64,
+                highest_tile: row.get::<_, i64>(4)? as u32,
+            })
+        })
+        .with_context(|| format!("failed to query runs from {}", path.display()))?;
+    let mut summaries = Vec::new();
+    for row in rows {
+        summaries.push(row?);
+    }
+    Ok(summaries)
+}
+
+fn load_valuation_names(dir: &Path) -> Result<Vec<String>> {
+    let path = dir.join("valuation_types.json");
+    if !path.exists() {
+        bail!("missing valuation_types.json in {}", dir.display());
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let map: HashMap<String, u8> = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if map.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max_id = map
+        .values()
+        .copied()
+        .max()
+        .ok_or_else(|| anyhow!("valuation_types.json has no entries"))?;
+    let mut names = vec![String::new(); max_id as usize + 1];
+    for (name, id) in map {
+        let slot = names
+            .get_mut(id as usize)
+            .ok_or_else(|| anyhow!("valuation id {} out of range", id))?;
+        *slot = name;
+    }
+    if names.iter().any(|s| s.is_empty()) {
+        bail!("valuation_types.json is sparse or has missing indices");
+    }
+    Ok(names)
+}
+
+fn stream_dataset(
+    dataset: &DatasetInfo,
+    run_map: &HashMap<u32, u32>,
+    valuation_ids: &HashMap<String, u8>,
+    writer: &mut StepsWriter,
+    pb: Option<&ProgressBar>,
+) -> Result<usize> {
+    const CHUNK: usize = 131_072;
+    let mut total_rows = 0usize;
+    let names = &dataset.valuation_names;
+    for path in &dataset.steps_files {
+        let file = File::open(path)
+            .with_context(|| format!("failed to open steps shard {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let npy = npyz::NpyFile::new(&mut reader)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut data = npy
+            .data::<StepRow>()
+            .map_err(|err| anyhow!("{}: {err}", path.display()))?;
+        let mut chunk = Vec::with_capacity(CHUNK);
+        while let Some(row) = data.next() {
+            let mut row =
+                row.with_context(|| format!("failed to decode row in {}", path.display()))?;
+            let new_run = run_map
+                .get(&row.run_id)
+                .ok_or_else(|| anyhow!("missing run_id {} mapping", row.run_id))?;
+            row.run_id = *new_run;
+            let name = names.get(row.valuation_type as usize).ok_or_else(|| {
+                anyhow!(
+                    "valuation_type {} out of range for {}",
+                    row.valuation_type,
+                    path.display()
+                )
+            })?;
+            let new_id = valuation_ids
+                .get(name)
+                .ok_or_else(|| anyhow!("unknown valuation '{}' during merge", name))?;
+            row.valuation_type = *new_id;
+            chunk.push(row);
+            if chunk.len() >= CHUNK {
+                total_rows += chunk.len();
+                writer.write(&chunk)?;
+                if let Some(pb) = pb {
+                    pb.inc(chunk.len() as u64);
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            total_rows += chunk.len();
+            writer.write(&chunk)?;
+            if let Some(pb) = pb {
+                pb.inc(chunk.len() as u64);
+            }
+            chunk.clear();
+        }
+    }
+    Ok(total_rows)
 }
 
 fn write_metadata(out_dir: &Path, runs: &[RunSummary], overwrite: bool) -> Result<()> {

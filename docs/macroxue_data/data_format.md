@@ -131,7 +131,7 @@ This preserves compatibility with `packages/train_2048.dataloader`, which expect
 
 ### Packing utility
 
-`crates/dataset-packer` bundles a CLI that walks the raw Macroxue drops, pairs each `*.meta.json` with the matching `*.jsonl.gz`, and emits the aligned artifacts:
+`crates/dataset-packer` bundles a CLI that walks the raw Macroxue drops, pairs each `*.meta.json` **or** `*.meta.json.gz` with the matching `*.jsonl.gz`, and emits the aligned artifacts:
 
 ```bash
 cargo run -p dataset-packer -- pack --input /path/to/raw --output /tmp/macroxue-pack --workers 8 --shard-rows 10000000 --overwrite
@@ -143,6 +143,13 @@ Outputs:
 - `valuation_types.json`: index → valuation-name lookup used by `valuation_type`.
 
 `--shard-rows` is optional today but provides the extension point for splitting the dataset without rewriting the packer. Progress is reported via `indicatif`, logging is standard `env_logger`, and the heavy lifting (JSON parsing, board packing) runs under `rayon`.
+
+Merging two packed datasets (reindexing `run_id`s, unifying valuation enums, and optionally deleting the sources once the merge succeeds) uses the same binary:
+
+```bash
+cargo run -p dataset-packer -- merge --left datasets/macroxue/d6 --right datasets/macroxue/d7 \
+    --output datasets/macroxue/merged --shard-rows 10000000 --overwrite --delete-inputs
+```
 
 #### On Rust
 
