@@ -95,6 +95,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     device_for_server = args.server_device or ("cuda" if torch.cuda.is_available() else "cpu")
     env = os.environ.copy()
     env.setdefault("INFER_2048_LOG", "0")
+    # One-shot parity dump files (first batch only)
+    dump_dir = Path("bench_runs/parity")
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    srv_tokens = str(dump_dir / "server_tokens.npy")
+    srv_logits = str(dump_dir / "server_logits.npy")
+    env["INFER_2048_DUMP_TOKENS_PATH"] = srv_tokens
+    env["INFER_2048_DUMP_LOGITS_PATH"] = srv_logits
     cmd = [
         "uv", "run", "infer-2048",
         "--init", args.init,
@@ -125,6 +132,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         mismatches = 0
         conf = np.zeros((4,4), dtype=np.int64)
         B = max(1, int(args.batch))
+        dumped = False
         for off in range(0, n, B):
             sel = idxs[off : off + B]
             batch = ds.get_rows(sel)
@@ -166,6 +174,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             mismatches += int((server_idx != offline_idx).sum())
             for t, p in zip(offline_idx.tolist(), server_idx.tolist()):
                 conf[int(t), int(p)] += 1
+
+            # Parity check (first batch only): dump offline tokens/logits and compare with server dumps
+            if not dumped:
+                off_tokens = exps.copy()
+                np.save(dump_dir / "offline_tokens.npy", off_tokens)
+                with torch.inference_mode():
+                    _, ho = model(tokens)
+                    if isinstance(ho, (list, tuple)):
+                        off_logits = np.stack([t.float().cpu().numpy() for t in ho], axis=1)
+                    else:
+                        off_logits = ho.float().cpu().numpy()
+                np.save(dump_dir / "offline_logits.npy", off_logits)
+                # Try to read server dumps
+                try:
+                    st = np.load(srv_tokens)
+                    print("Parity tokens equal:", np.array_equal(st, off_tokens))
+                except Exception:
+                    pass
+                try:
+                    sl = np.load(srv_logits)
+                    print("Parity logits shape server vs offline:", getattr(sl, 'shape', None), off_logits.shape)
+                    if isinstance(sl, np.ndarray) and sl.shape == off_logits.shape:
+                        print("Parity logits allclose:", np.allclose(sl, off_logits, atol=1e-5, rtol=1e-5))
+                except Exception:
+                    pass
+                dumped = True
 
         print(
             f"Checked {n} boards; server vs offline argmax mismatches: {mismatches} ({mismatches / max(1,n):.4f})"

@@ -20,6 +20,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         help="Torch compile mode (e.g., reduce-overhead, max-autotune, or none to disable)",
     )
     p.add_argument(
+        "--force-fp32",
+        action="store_true",
+        help="Force FP32 (disable bf16 preference and compilation)",
+    )
+    p.add_argument(
         "--warmup-sizes",
         default="",
         help="Comma-separated batch sizes to warm up (e.g., 256,1024)",
@@ -58,7 +63,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 init_dir=args.init,
                 bind=bind,
                 device=args.device,
-                compile_mode=compile_mode,
+                compile_mode=(None if args.force_fp32 else compile_mode),
+                force_fp32=bool(args.force_fp32),
                 warmup_sizes=warmups,
                 dynamic_batch=args.dynamic_batch,
             )

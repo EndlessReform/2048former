@@ -63,6 +63,10 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         # Reusable pinned host buffer for tokens to enable async H2D copies.
         # Allocated lazily and grown geometrically to avoid realloc thrash.
         self._tokens_cpu = None  # type: Optional[torch.Tensor]
+        # Optional one-shot dumps for debugging input/outputs parity
+        self._dump_tokens_path = os.environ.get("INFER_2048_DUMP_TOKENS_PATH")
+        self._dump_logits_path = os.environ.get("INFER_2048_DUMP_LOGITS_PATH")
+        self._dump_done = False
 
     async def Infer(self, request, context):  # type: ignore[override]
         t0 = time.perf_counter()
@@ -118,6 +122,16 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             tokens = self._tokens_cpu[:B].to(device=model_device, dtype=torch.long, non_blocking=True)
             vlog("[server] tokens staged (pinned) and moved to device")
 
+            # Optional: dump the first batch's input tokens (exponents) exactly once
+            if (self._dump_tokens_path or self._dump_logits_path) and not self._dump_done:
+                try:
+                    if self._dump_tokens_path:
+                        # Dump uint8 exponents and item ids for alignment
+                        np.save(self._dump_tokens_path, np_view.copy())
+                        np.save(self._dump_tokens_path + ".ids.npy", np.asarray(item_ids, dtype=np.int64))
+                except Exception as _e:
+                    pass
+
             # Forward once to obtain hidden states and logits/policy
             prev_mode = self.model.training
             self.model.eval()
@@ -131,6 +145,18 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                     policy_probs = F.softmax(policy_logits, dim=-1)
                 if return_embedding:
                     board_repr = hidden_states.mean(dim=1)  # (B, H)
+
+                # Optional: dump the first batch's raw logits once
+                if (self._dump_logits_path or self._dump_tokens_path) and not self._dump_done:
+                    try:
+                        if not is_binned and self._dump_logits_path:
+                            np.save(self._dump_logits_path, policy_logits.to("cpu").numpy())
+                        elif is_binned and self._dump_logits_path:
+                            arr = np.stack([t.to("cpu").numpy() for t in head_out], axis=1)
+                            np.save(self._dump_logits_path, arr)
+                    except Exception:
+                        pass
+                    self._dump_done = True
 
             outputs: list[inference_pb2.Output] = []
             emb_dim: int = 0
@@ -241,6 +267,7 @@ async def serve_async(
     bind: str,
     device: Optional[str],
     compile_mode: Optional[str] = "reduce-overhead",
+    force_fp32: bool = False,
     warmup_sizes: Optional[List[int]] = None,
     dynamic_batch: bool = False,
 ) -> None:
@@ -266,8 +293,8 @@ async def serve_async(
     model, _ = prepare_model_for_inference(
         model,
         device=device,
-        prefer_bf16=True,
-        compile_mode=compile_mode,
+        prefer_bf16=(False if force_fp32 else True),
+        compile_mode=(None if force_fp32 else compile_mode),
     )
 
     # Optional warmup to establish dynamic batch behavior before serving

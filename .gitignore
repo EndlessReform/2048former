@@ -17,6 +17,7 @@ out
 *.a2pack
 checkpoints
 profiles
+*.npy
 
 # inference
 bench_runs
