@@ -3,7 +3,28 @@ use crate::feeder::Bins;
 use ai_2048::engine::Move;
 use rand::distributions::Distribution;
 
-pub(crate) fn select_move_max_p1(bins: &Bins, legal: &[bool; 4]) -> Option<Move> {
+fn map_idx(idx: usize, order: &config::HeadOrder) -> Move {
+    match order {
+        config::HeadOrder::UDLR => match idx {
+            0 => Move::Up,
+            1 => Move::Down,
+            2 => Move::Left,
+            _ => Move::Right,
+        },
+        config::HeadOrder::URDL => match idx {
+            0 => Move::Up,
+            1 => Move::Right,
+            2 => Move::Down,
+            _ => Move::Left,
+        },
+    }
+}
+
+pub(crate) fn select_move_max_p1(
+    bins: &Bins,
+    legal: &[bool; 4],
+    order: config::HeadOrder,
+) -> Option<Move> {
     if bins.len() != 4 {
         return None;
     }
@@ -36,12 +57,7 @@ pub(crate) fn select_move_max_p1(bins: &Bins, legal: &[bool; 4]) -> Option<Move>
         }
         Some(bi)
     })?;
-    Some(match idx {
-        0 => Move::Up,
-        1 => Move::Down,
-        2 => Move::Left,
-        _ => Move::Right,
-    })
+    Some(map_idx(idx, &order))
 }
 
 fn select_move_softmax(
@@ -49,6 +65,7 @@ fn select_move_softmax(
     legal: &[bool; 4],
     temperature: f32,
     rng: &mut rand::rngs::StdRng,
+    order: config::HeadOrder,
 ) -> Option<Move> {
     if bins.len() != 4 {
         return None;
@@ -68,7 +85,7 @@ fn select_move_softmax(
         p1[i] = *head.get(one_idx).unwrap_or(&0.0);
     }
     if !any_legal {
-        return select_move_max_p1(bins, legal);
+        return select_move_max_p1(bins, legal, order);
     }
     let t = if temperature.is_finite() && temperature > 0.0 {
         temperature
@@ -94,19 +111,14 @@ fn select_move_softmax(
         weights[i] = z.exp();
     }
     if weights.iter().all(|&w| w == 0.0) {
-        return select_move_max_p1(bins, legal);
+        return select_move_max_p1(bins, legal, order);
     }
     let dist = match rand::distributions::WeightedIndex::new(&weights) {
         Ok(d) => d,
-        Err(_) => return select_move_max_p1(bins, legal),
+        Err(_) => return select_move_max_p1(bins, legal, order),
     };
     let idx = dist.sample(rng);
-    Some(match idx {
-        0 => Move::Up,
-        1 => Move::Down,
-        2 => Move::Left,
-        _ => Move::Right,
-    })
+    Some(map_idx(idx, &order))
 }
 
 fn select_move_top_p_top_k(
@@ -116,6 +128,7 @@ fn select_move_top_p_top_k(
     top_k: usize,
     temperature: f32,
     rng: &mut rand::rngs::StdRng,
+    order: config::HeadOrder,
 ) -> Option<Move> {
     if bins.len() != 4 {
         return None;
@@ -144,16 +157,11 @@ fn select_move_top_p_top_k(
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)?;
-        return Some(match idx {
-            0 => Move::Up,
-            1 => Move::Down,
-            2 => Move::Left,
-            _ => Move::Right,
-        });
+        return Some(map_idx(idx, &order));
     }
     let sum_s: f64 = scores.iter().sum();
     if sum_s <= 0.0 {
-        return select_move_max_p1(bins, legal);
+        return select_move_max_p1(bins, legal, order);
     }
     let mut w: Vec<(usize, f64)> = (0..4)
         .filter(|&i| legal[i])
@@ -174,7 +182,7 @@ fn select_move_top_p_top_k(
         }
     }
     if nucleus.is_empty() {
-        return select_move_max_p1(bins, legal);
+        return select_move_max_p1(bins, legal, order);
     }
     let k = top_k.max(1).min(nucleus.len());
     nucleus.truncate(k);
@@ -197,20 +205,15 @@ fn select_move_top_p_top_k(
         weights.push(z.exp());
     }
     if weights.iter().all(|&x| x == 0.0) {
-        return select_move_max_p1(bins, legal);
+        return select_move_max_p1(bins, legal, order);
     }
     let dist = match rand::distributions::WeightedIndex::new(&weights) {
         Ok(d) => d,
-        Err(_) => return select_move_max_p1(bins, legal),
+        Err(_) => return select_move_max_p1(bins, legal, order),
     };
     let pick = dist.sample(rng);
     let idx = nucleus[pick].0;
-    Some(match idx {
-        0 => Move::Up,
-        1 => Move::Down,
-        2 => Move::Left,
-        _ => Move::Right,
-    })
+    Some(map_idx(idx, &order))
 }
 
 fn select_move_tail_agg_simple(
@@ -218,6 +221,7 @@ fn select_move_tail_agg_simple(
     legal: &[bool; 4],
     alpha_p2: f32,
     beta_p3: f32,
+    order: config::HeadOrder,
 ) -> Option<Move> {
     if bins.len() != 4 {
         return None;
@@ -254,12 +258,7 @@ fn select_move_tail_agg_simple(
         }
     }
     let idx = best_i?;
-    Some(match idx {
-        0 => Move::Up,
-        1 => Move::Down,
-        2 => Move::Left,
-        _ => Move::Right,
-    })
+    Some(map_idx(idx, &order))
 }
 
 fn select_move_tail_agg_adv(
@@ -267,6 +266,7 @@ fn select_move_tail_agg_adv(
     legal: &[bool; 4],
     extra_bins: usize,
     decay: f32,
+    order: config::HeadOrder,
 ) -> Option<Move> {
     if bins.len() != 4 {
         return None;
@@ -302,12 +302,7 @@ fn select_move_tail_agg_adv(
         }
     }
     let idx = best_i?;
-    Some(match idx {
-        0 => Move::Up,
-        1 => Move::Down,
-        2 => Move::Left,
-        _ => Move::Right,
-    })
+    Some(map_idx(idx, &order))
 }
 
 fn select_move_tail_agg_conf(
@@ -316,13 +311,14 @@ fn select_move_tail_agg_conf(
     alpha: f32,
     beta: f32,
     gamma: f32,
+    order: config::HeadOrder,
 ) -> Option<Move> {
     if bins.len() != 4 {
         return None;
     }
     let n_bins = bins[0].len();
     if n_bins < 2 {
-        return select_move_max_p1(bins, legal);
+        return select_move_max_p1(bins, legal, config::HeadOrder::UDLR);
     }
     let one_idx = n_bins - 1; // p1
     let two_idx = n_bins - 2; // p2
@@ -344,21 +340,9 @@ fn select_move_tail_agg_conf(
             m = 0.0;
         }
         // w(m) = alpha / (1 + beta*m)^gamma
-        let a = if alpha.is_finite() && alpha >= 0.0 {
-            alpha
-        } else {
-            0.20
-        };
-        let b = if beta.is_finite() && beta >= 0.0 {
-            beta
-        } else {
-            10.0
-        };
-        let g = if gamma.is_finite() && gamma > 0.0 {
-            gamma
-        } else {
-            1.0
-        };
+        let a = if alpha.is_finite() && alpha >= 0.0 { alpha } else { 0.20 };
+        let b = if beta.is_finite() && beta >= 0.0 { beta } else { 10.0 };
+        let g = if gamma.is_finite() && gamma > 0.0 { gamma } else { 1.0 };
         let denom = 1.0 + b * m;
         let w = if denom > 0.0 { a / denom.powf(g) } else { a };
         let s = p1 + w * p2;
@@ -368,12 +352,7 @@ fn select_move_tail_agg_conf(
         }
     }
     let idx = best_i?;
-    Some(match idx {
-        0 => Move::Up,
-        1 => Move::Down,
-        2 => Move::Left,
-        _ => Move::Right,
-    })
+    Some(map_idx(idx, &order))
 }
 
 pub(crate) fn select_move(
@@ -381,35 +360,36 @@ pub(crate) fn select_move(
     legal: &[bool; 4],
     sampling: &config::SamplingStrategy,
     rng: &mut rand::rngs::StdRng,
+    order: config::HeadOrder,
 ) -> Option<Move> {
     match sampling.kind {
-        config::SamplingStrategyKind::Argmax => select_move_max_p1(bins, legal),
+        config::SamplingStrategyKind::Argmax => select_move_max_p1(bins, legal, order),
         config::SamplingStrategyKind::Softmax => {
             let t = sampling.temperature_or_default() as f32;
-            select_move_softmax(bins, legal, t, rng)
+            select_move_softmax(bins, legal, t, rng, order)
         }
         config::SamplingStrategyKind::TopPTopK => {
             let p = sampling.top_p_or_default() as f32;
             let k = sampling.top_k_or_default();
             let t = sampling.temperature_or_default() as f32;
-            select_move_top_p_top_k(bins, legal, p, k, t, rng)
+            select_move_top_p_top_k(bins, legal, p, k, t, rng, order)
         }
         config::SamplingStrategyKind::TailAgg => {
             let extra = sampling.tail_bins_or_zero();
             if extra > 0 {
                 let decay = sampling.tail_decay_or_default() as f32;
-                select_move_tail_agg_adv(bins, legal, extra, decay)
+                select_move_tail_agg_adv(bins, legal, extra, decay, order)
             } else {
                 let a = sampling.alpha_p2_or_default() as f32;
                 let b = sampling.beta_p3_or_default() as f32;
-                select_move_tail_agg_simple(bins, legal, a, b)
+                select_move_tail_agg_simple(bins, legal, a, b, order)
             }
         }
         config::SamplingStrategyKind::TailAggConf => {
             let a = sampling.conf_alpha_or_default() as f32;
             let b = sampling.conf_beta_or_default() as f32;
             let g = sampling.conf_gamma_or_default() as f32;
-            select_move_tail_agg_conf(bins, legal, a, b, g)
+            select_move_tail_agg_conf(bins, legal, a, b, g, order)
         }
     }
 }

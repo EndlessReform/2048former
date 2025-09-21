@@ -46,7 +46,7 @@ attention_dropout_prob = 0.0
 dataset_dir = "datasets/macroxue/d6_1b"
 tokenizer_path = "out/tokenizer.json"
 mmap_mode = true
-num_steps = 100_000
+num_steps = 50_000
 
 val_run_pct = 0.01
 val_split_seed = 42

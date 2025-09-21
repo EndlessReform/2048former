@@ -480,11 +480,14 @@ def make_collate_macroxue(
             p[evs >= vt_knots[-1]] = 1.0
             percentiles[mask] = np.clip(p, 0.0, 1.0)
 
+        # Legality bits from dataset-packer are set as 1<<idx for actions in
+        # URDL order: Up=1 (1<<0), Right=2 (1<<1), Down=4 (1<<2), Left=8 (1<<3).
+        # Build mask in the same URDL column order to align with branch_evs.
         legal_mask = np.stack([
-            (ev_legal & 1) != 0,
-            (ev_legal & 8) != 0, # right
-            (ev_legal & 2) != 0, # down
-            (ev_legal & 4) != 0, # left
+            (ev_legal & 1) != 0,  # Up   -> bit 1<<0
+            (ev_legal & 2) != 0,  # Right-> bit 1<<1
+            (ev_legal & 4) != 0,  # Down -> bit 1<<2
+            (ev_legal & 8) != 0,  # Left -> bit 1<<3
         ], axis=1)
 
         # Mark illegal as -inf so they never win
@@ -549,11 +552,14 @@ def make_collate_steps(
         batch = dataset.get_rows(idxs)
         if 'ev_legal' in batch.dtype.names:
             bits = batch['ev_legal'].astype(_np.uint8, copy=False)
+            # Dataset packer sets ev_legal bits as URDL order with sequential bits
+            # Up=1 (1<<0), Right=2 (1<<1), Down=4 (1<<2), Left=8 (1<<3).
+            # Build mask columns in the same URDL order.
             legal = _np.stack([
-                (bits & 1) != 0,   # Up -> col 0
-                (bits & 8) != 0,   # Right -> col 1
-                (bits & 2) != 0,   # Down -> col 2
-                (bits & 4) != 0,   # Left -> col 3
+                (bits & 1) != 0,   # Up   -> bit 1<<0
+                (bits & 2) != 0,   # Right-> bit 1<<1
+                (bits & 4) != 0,   # Down -> bit 1<<2
+                (bits & 8) != 0,   # Left -> bit 1<<3
             ], axis=1)
         else:
             # Fallback: treat finite EVs as legal if mask not present

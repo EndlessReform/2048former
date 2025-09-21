@@ -73,6 +73,15 @@ def write_toml(d: dict, path: Path) -> None:
             emit_table(fp, "sampling", d["sampling"])  # expects {strategy: "Argmax"}
         if "orchestrator" in d:
             orch = d["orchestrator"].copy()
+            # Emit simple orchestrator keys (e.g., head_order, argmax_only, inline_embeddings, fixed_seed, random_seeds)
+            simple = {
+                k: v
+                for k, v in orch.items()
+                if k not in {"connection", "batch", "report"}
+                and isinstance(v, (int, float, str, bool))
+            }
+            if simple:
+                emit_table(fp, "orchestrator", simple)
             if "connection" in orch:
                 emit_table(fp, "orchestrator.connection", orch["connection"])  # uds_path/tcp_addr
             if "batch" in orch:

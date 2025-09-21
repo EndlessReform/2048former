@@ -21,6 +21,7 @@ pub struct GameActor {
     pub board: Board,
     pub seed: u64,
     pub sampling: config::SamplingStrategy,
+    pub head_order: config::HeadOrder,
     pub step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
     pub cancel: CancellationToken,
     pub step_budget: Option<StepBudget>,
@@ -78,6 +79,7 @@ impl GameActor {
         handle: FeederHandle,
         seed: u64,
         sampling: config::SamplingStrategy,
+        head_order: config::HeadOrder,
         step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
         cancel: CancellationToken,
         step_budget: Option<StepBudget>,
@@ -93,6 +95,7 @@ impl GameActor {
             board,
             seed,
             sampling,
+            head_order,
             step_tx,
             cancel,
             step_budget,
@@ -136,8 +139,9 @@ impl GameActor {
                     }
                 }
             };
-            // Compute legal mask and select move according to configured sampling strategy
-            let legal = legal_mask(self.board);
+            // Compute legal mask in the configured head order and select move
+            let order = self.head_order.clone();
+            let legal = legal_mask(self.board, order.clone());
             let mv = match inference {
                 InferenceOutput::Bins(bins) => {
                     // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
@@ -146,15 +150,19 @@ impl GameActor {
                     let outside_window =
                         (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
                     if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
-                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
                     } else if outside_window {
-                        strategies::select_move_max_p1(&bins, &legal)
+                        strategies::select_move_max_p1(&bins, &legal, order)
                     } else {
-                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
                     }
                 }
                 InferenceOutput::Argmax { head, .. } => {
-                    let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
+                    // Map head index according to configured order
+                    let dirs = match self.head_order {
+                        config::HeadOrder::UDLR => [Move::Up, Move::Down, Move::Left, Move::Right],
+                        config::HeadOrder::URDL => [Move::Up, Move::Right, Move::Down, Move::Left],
+                    };
                     let idx = head as usize;
                     if let Some(&choice) = dirs.get(idx) {
                         if legal.get(idx).copied().unwrap_or(false) {
@@ -192,20 +200,23 @@ impl GameActor {
 }
 
 fn board_to_exponents(b: Board) -> [u8; 16] {
-    // ai_2048 packs 16 nibbles in a u64. To match the Python `to_exponents()`
-    // row-major ordering expected by the model, map MSB-first to (row, col).
-    // That is, nibble 15 -> index 0 (top-left), ..., nibble 0 -> index 15 (bottom-right).
+    // ai_2048 packs 16 nibbles in a u64 as LSB-first where nibble i corresponds
+    // to cell i in row-major order. Training data (dataset-packer and collate)
+    // decode using this LSB-first convention, so mirror it here.
     let raw = b.raw();
     let mut out = [0u8; 16];
     for idx in 0..16 {
-        let nib = 15 - idx; // MSB-first
-        out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
+        out[idx] = ((raw >> (idx * 4)) & 0xF) as u8;
     }
     out
 }
 
-fn legal_mask(board: Board) -> [bool; 4] {
-    let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
+fn legal_mask(board: Board, order: config::HeadOrder) -> [bool; 4] {
+    // Produce mask in the same order as heads according to configured mapping
+    let dirs = match order {
+        config::HeadOrder::UDLR => [Move::Up, Move::Down, Move::Left, Move::Right],
+        config::HeadOrder::URDL => [Move::Up, Move::Right, Move::Down, Move::Left],
+    };
     let mut mask = [false; 4];
     for (i, &m) in dirs.iter().enumerate() {
         let after = GameEngine::make_move(board, m);

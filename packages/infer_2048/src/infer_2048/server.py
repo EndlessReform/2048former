@@ -139,10 +139,23 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                 best_p1, best_head = torch.max(p1_cpu, dim=1)
                 argmax_heads = [int(h) for h in best_head.tolist()]
                 argmax_p1 = [float(v) for v in best_p1.tolist()]
+                if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
+                    try:
+                        n_bins = int(head_probs_t[0].shape[-1]) if head_probs_t else -1
+                        p1_first = p1_cpu[0].tolist() if p1_cpu.shape[0] > 0 else []
+                        vlog(f"[server] DEBUG p1 (argmax_only) n_bins={n_bins} p1[0]={p1_first} best={argmax_heads[0] if argmax_heads else None}")
+                    except Exception:
+                        pass
             else:
                 probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
                 probs_cpu = probs_all.to("cpu", non_blocking=False)
                 probs_list: list[list[list[float]]] = probs_cpu.tolist()
+                if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
+                    try:
+                        p1_first = [float(probs_list[0][h][-1]) for h in range(len(probs_list[0]))]
+                        vlog(f"[server] DEBUG p1 (bins) n_bins={len(probs_list[0][0])} p1[0]={p1_first} best={int(np.argmax(np.array(p1_first)))}")
+                    except Exception:
+                        pass
 
                 if return_embedding:
                     br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()

@@ -26,13 +26,38 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     with cfg_path.open("r", encoding="utf-8") as f:
         enc_cfg_dict = json.load(f)
 
+    # If weights exist, peek shapes to adjust config before constructing model.
+    weights_path = init_path / "model.safetensors"
+    state = None
+    if weights_path.is_file():
+        s = safe_load_file(str(weights_path))
+        state = normalize_state_dict_keys(s)
+
+        # Infer head type and dimensions
+        head_type = enc_cfg_dict.get("head_type", "binned_ev")
+        if any(k.startswith("policy_head.") for k in state.keys()):
+            head_type = "action_policy"
+        elif any(k.startswith("ev_heads.0.") for k in state.keys()):
+            head_type = "binned_ev"
+        enc_cfg_dict["head_type"] = head_type
+
+        # Infer output_n_bins for binned_ev from first head weight if present
+        if head_type == "binned_ev":
+            w0 = state.get("ev_heads.0.weight")
+            if w0 is not None and hasattr(w0, "shape") and len(w0.shape) == 2:
+                out_dim = int(w0.shape[0])
+                enc_cfg_dict["output_n_bins"] = out_dim
+
+        # Infer vocab size from embedding if present (ensure >= current)
+        tok = state.get("tok_emb.weight")
+        if tok is not None and hasattr(tok, "shape") and len(tok.shape) == 2:
+            vocab = int(tok.shape[0])
+            enc_cfg_dict["input_vocab_size"] = max(int(enc_cfg_dict.get("input_vocab_size", 16)), vocab)
+
     enc_cfg = EncoderConfig.model_validate(enc_cfg_dict)
     model = Encoder(enc_cfg)
 
-    weights_path = init_path / "model.safetensors"
-    if weights_path.is_file():
-        state = safe_load_file(str(weights_path))
-        state = normalize_state_dict_keys(state)
+    if state is not None:
         try:
             model.load_state_dict(state, strict=True)
         except Exception:
@@ -61,4 +86,3 @@ def normalize_state_dict_keys(state: dict) -> dict:
                     changed = True
         out[nk] = v
     return out
-

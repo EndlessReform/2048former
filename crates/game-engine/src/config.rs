@@ -198,6 +198,9 @@ pub struct Orchestrator {
     /// If true, request argmax-only responses from the inference server.
     #[serde(default)]
     pub argmax_only: bool,
+    /// Order of heads in model output. Defaults to legacy [Up, Down, Left, Right].
+    #[serde(default)]
+    pub head_order: Option<HeadOrder>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -238,6 +241,7 @@ impl Default for Orchestrator {
             fixed_seed: None,
             random_seeds: false,
             argmax_only: false,
+            head_order: None,
         }
     }
 }
@@ -266,6 +270,20 @@ impl Config {
         file.read_to_string(&mut contents)?;
         let cfg: Self = toml::from_str(&contents)?;
         Ok(cfg)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub enum HeadOrder {
+    /// Legacy engine order: [Up, Down, Left, Right]
+    UDLR,
+    /// Macroxue dataset/training order: [Up, Right, Down, Left]
+    URDL,
+}
+
+impl Orchestrator {
+    pub fn head_order_or_default(&self) -> HeadOrder {
+        self.head_order.clone().unwrap_or(HeadOrder::UDLR)
     }
 }
 

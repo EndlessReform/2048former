@@ -42,6 +42,12 @@ strategy = "Argmax"
 uds_path = "/tmp/2048_infer.sock"
 # tcp_addr = "http://127.0.0.1:50051"
 
+[orchestrator]
+# Head order mapping for model heads → moves.
+# Use "URDL" for Macroxue-trained checkpoints (Up, Right, Down, Left).
+# Use "UDLR" for legacy checkpoints (default if omitted).
+head_order = "URDL"
+
 [orchestrator.batch]
 # Time-based flush interval for micro-batches (microseconds)
 flush_us = 500
