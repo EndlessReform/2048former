@@ -14,7 +14,7 @@ from .binning import BinningConfig
 class TargetConfig(BaseModel):
     """Configure which supervision target to use during training."""
 
-    mode: Literal["binned_ev", "hard_move"] = "binned_ev"
+    mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
 
 
 def _find_repo_root() -> Path:
@@ -36,6 +36,8 @@ def _find_repo_root() -> Path:
 class DatasetConfig(BaseModel):
     # Root directory containing steps.npy and metadata.db
     dataset_dir: str = "./dataset"
+    # Path to the tokenizer spec file (only for macroxue_tokens mode)
+    tokenizer_path: Optional[str] = None
     # Optional: SQL to define the universe of runs (training+validation)
     run_sql: Optional[str] = None
     sql_params: list[object] = Field(default_factory=list)
@@ -47,6 +49,22 @@ class DatasetConfig(BaseModel):
     # Option B: random run split when >0; ignored if val_run_sql provided
     val_run_pct: float = 0.0
     val_split_seed: int = 42
+    # Optional flag to load ``steps.npy`` via ``np.load(mmap_mode='r')``.
+    # When ``True`` the dataset will map the file into memory and only read
+    # slices as needed. This is useful for very large datasets that would
+    # otherwise exhaust RAM.
+    mmap_mode: bool = False
+    # Shuffling strategy for full-dataset epochs (when num_steps is None):
+    # - If False, iterate sequentially (fast, minimal memory)
+    # - If True, use buffered shuffle to avoid materializing a full permutation
+    shuffle: bool = False
+    shuffle_buffer_size: int = 1_000_000
+    # Validation limits
+    # Cap validation to a fixed number of steps (batches). When >0, overrides val_steps_pct.
+    val_num_steps: Optional[int] = None
+    # Alternatively, derive validation steps as a fraction of training steps per epoch
+    # (e.g., 0.1 = 10% as many validation steps as training). Ignored if val_num_steps is set.
+    val_steps_pct: float = 0.0
 
     # Choose either fixed steps or epochs. If both provided, steps takes priority.
     num_steps: Optional[int] = None
@@ -75,9 +93,24 @@ class DatasetConfig(BaseModel):
         if v < 0:
             raise ValueError("dataset.val_every must be >= 0 (0 disables)")
         return v
+    @field_validator("val_steps_pct")
+    @classmethod
+    def _val_steps_pct_range(cls, v: float) -> float:
+        if v < 0.0 or v > 1.0:
+            if v != 0.0:
+                raise ValueError("dataset.val_steps_pct must be in [0,1] (0 disables)")
+        return v
 
     def resolved_dataset_dir(self) -> str:
         p = Path(self.dataset_dir)
+        if not p.is_absolute():
+            p = _find_repo_root() / p
+        return str(p)
+
+    def resolved_tokenizer_path(self) -> Optional[str]:
+        if self.tokenizer_path is None:
+            return None
+        p = Path(self.tokenizer_path)
         if not p.is_absolute():
             p = _find_repo_root() / p
         return str(p)
@@ -240,6 +273,8 @@ class TrainingConfig(BaseModel):
 
     # Misc
     seed: int = 0
+    # Debug/toggles
+    compile_enabled: bool = True
 
     @classmethod
     def from_toml(cls, path: str) -> "TrainingConfig":

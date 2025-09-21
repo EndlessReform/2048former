@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple
 
 from safetensors.torch import save_file as safe_save_file
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -13,7 +14,7 @@ import torch.distributed as dist
 import time, json, math
 
 from .config import TrainingConfig, load_encoder_from_init, normalize_state_dict_keys
-from .dataloader import build_dataloaders
+from .dataloader import build_steps_dataloaders
 
 
 def _format_postfix(
@@ -25,10 +26,14 @@ def _format_postfix(
 ) -> str:
     loss = float(metrics.get("loss", 0.0))
     base = f"loss={loss:.4f}"
-    if target_mode == "binned_ev":
+    if target_mode in ("binned_ev", "macroxue_tokens"):
         head_losses = metrics.get("head_losses") or [0.0, 0.0, 0.0, 0.0]
         u, d, l, r = [float(x) for x in head_losses]
         base += f"  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}"
+        if target_mode == "macroxue_tokens":
+            pa = metrics.get("policy_agree")
+            if pa is not None:
+                base += f"  agree={float(pa) * 100:.1f}%"
     else:
         acc = metrics.get("policy_acc")
         if acc is not None:
@@ -53,12 +58,77 @@ def train(
     device = torch.device(device_str)
 
     # Model
+    print(f"[init] Loading model from init: {cfg.init_dir}")
     model = load_encoder_from_init(cfg.init_dir)
     if device.type == "cuda":
+        print("[init] Moving model to CUDA (bf16)…")
         model = model.to(device=device, dtype=torch.bfloat16)
     else:
+        print(f"[init] Moving model to device: {device_str}…")
         model = model.to(device)
-    model = torch.compile(model, mode="reduce-overhead")
+
+    target_mode = getattr(cfg.target, "mode", "binned_ev")
+    # Data: build train (and optional val) views via dataloader module
+    print("[init] Building dataloaders…")
+    num_workers_train = 12  # quick knob for throughput
+    dl_train, dl_val, per_epoch_steps = build_steps_dataloaders(
+        dataset_dir=cfg.dataset.resolved_dataset_dir(),
+        binner=None, # TODO
+        target_mode=target_mode,
+        batch_size=cfg.batch.batch_size,
+        train_num_steps=cfg.dataset.num_steps,
+        seed=cfg.seed,
+        shuffle_buffer_size=getattr(cfg.dataset, "shuffle_buffer_size", 1_000_000),
+        val_num_steps=getattr(cfg.dataset, "val_num_steps", None),
+        val_steps_pct=getattr(cfg.dataset, "val_steps_pct", 0.0),
+        tokenizer_path=cfg.dataset.resolved_tokenizer_path(),
+        run_sql=cfg.dataset.run_sql,
+        sql_params=cfg.dataset.sql_params,
+        val_run_sql=cfg.dataset.val_run_sql,
+        val_sql_params=cfg.dataset.val_sql_params,
+        val_run_pct=cfg.dataset.val_run_pct,
+        val_split_seed=cfg.dataset.val_split_seed,
+        num_workers_train=num_workers_train,
+        mmap_mode=cfg.dataset.mmap_mode,
+    )
+    print(
+        f"[init] Dataloaders ready: per_epoch_steps={per_epoch_steps} "
+        f"train_workers={num_workers_train} batch_size={cfg.batch.batch_size}"
+    )
+
+    if target_mode == "macroxue_tokens":
+        # Prefer spec-based n_classes to avoid iterating the dataloader (mmap stalls)
+        n_bins_spec = None
+        try:
+            from train_2048.tokenization.macroxue import MacroxueTokenizerSpec
+            spec_path = cfg.dataset.resolved_tokenizer_path()
+            if spec_path:
+                spec = MacroxueTokenizerSpec.from_json(Path(spec_path))
+                n_bins_spec = int(len(spec.delta_edges) - 1)
+        except Exception:
+            n_bins_spec = None
+
+        if n_bins_spec is not None:
+            n_classes = n_bins_spec + 2  # +winner +illegal
+            print(f"[init] Using tokenizer spec for n_classes: {n_classes}")
+        else:
+            print("[init] Inspecting first batch to size output heads…")
+            sample_batch = next(iter(dl_train))
+            n_classes = int(sample_batch["n_classes"])  # fallback
+        if model.config.output_n_bins != n_classes:
+            print(f"Resizing model output heads from {model.config.output_n_bins} to {n_classes}")
+            model.config.output_n_bins = n_classes
+            for i in range(4):
+                model.ev_heads[i] = nn.Linear(model.config.hidden_size, n_classes)
+            model = model.to(device)
+        print(f"[init] n_classes={n_classes} (including winner+illegal)")
+
+    if getattr(cfg, "compile_enabled", True):
+        print("[init] Compiling model…")
+        model = torch.compile(model, mode="reduce-overhead")
+        print("[init] Model compile complete.")
+    else:
+        print("[init] Compile disabled (cfg.compile_enabled=False). Running eager.")
 
     # Optimizer
     opt_cfg = cfg.hyperparameters.optimizer
@@ -174,13 +244,6 @@ def train(
         optimizer = MuonWithAuxAdam(param_groups)
     else:
         raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
-
-    target_mode = getattr(cfg.target, "mode", "binned_ev")
-    # Data: build train (and optional val) views via dataloader module
-    num_workers_train = 12  # quick knob for throughput
-    dl_train, dl_val, per_epoch_steps = build_dataloaders(
-        cfg, num_workers_train=num_workers_train
-    )
 
     # Training
     model.train()
@@ -320,6 +383,15 @@ def train(
                 batch = next(it)
             t1 = time.perf_counter()
             metrics = train_step(model, batch, optimizer, device, target_mode)
+            # Maintain a small windowed EMA for policy_agree (macroxue)
+            if target_mode == "macroxue_tokens":
+                pa = metrics.get("policy_agree")
+                if pa is not None:
+                    if not hasattr(train, "_pa_ema"):
+                        train._pa_ema = float(pa)
+                    decay = 0.95  # ~window 1/(1-decay) ≈ 20 steps; twice gives ~40
+                    train._pa_ema = float(decay * train._pa_ema + (1 - decay) * float(pa))
+                    metrics["policy_agree"] = train._pa_ema
             t2 = time.perf_counter()
             dt_data_ms = (t1 - t0) * 1e3
             dt_comp_ms = (t2 - t1) * 1e3
@@ -333,7 +405,7 @@ def train(
                     "train/data_time_ms": dt_data_ms,
                     "train/compute_time_ms": dt_comp_ms,
                 }
-                if target_mode == "binned_ev":
+                if target_mode in ("binned_ev", "macroxue_tokens"):
                     log_payload.update(
                         {
                             "train/loss_u": metrics["head_losses"][0],
@@ -353,7 +425,7 @@ def train(
                 val_metrics = evaluate(model, dl_val, device, target_mode)
                 if wandb_run is not None:
                     log_payload = {"val/loss": val_metrics["loss"]}
-                    if target_mode == "binned_ev":
+                    if target_mode in ("binned_ev", "macroxue_tokens"):
                         log_payload.update(
                             {
                                 "val/loss_u": val_metrics["head_losses"][0],
@@ -412,7 +484,7 @@ def train(
                             "train/data_time_ms": dt_data_ms,
                             "train/compute_time_ms": dt_comp_ms,
                         }
-                        if target_mode == "binned_ev":
+                        if target_mode in ("binned_ev", "macroxue_tokens"):
                             log_payload.update(
                                 {
                                     "train/loss_u": metrics["head_losses"][0],
@@ -432,7 +504,7 @@ def train(
                         val_metrics = evaluate(model, dl_val, device, target_mode)
                         if wandb_run is not None:
                             log_payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
-                            if target_mode == "binned_ev":
+                            if target_mode in ("binned_ev", "macroxue_tokens"):
                                 log_payload.update(
                                     {
                                         "val/loss_u": val_metrics["head_losses"][0],
@@ -493,7 +565,7 @@ def train(
                             "train/data_time_ms": dt_data_ms,
                             "train/compute_time_ms": dt_comp_ms,
                         }
-                        if target_mode == "binned_ev":
+                        if target_mode in ("binned_ev", "macroxue_tokens"):
                             log_payload.update(
                                 {
                                     "train/loss_u": metrics["head_losses"][0],
@@ -513,7 +585,7 @@ def train(
                         val_metrics = evaluate(model, dl_val, device, target_mode)
                         if wandb_run is not None:
                             log_payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
-                            if target_mode == "binned_ev":
+                            if target_mode in ("binned_ev", "macroxue_tokens"):
                                 log_payload.update(
                                     {
                                         "val/loss_u": val_metrics["head_losses"][0],
@@ -602,10 +674,55 @@ def train_step(
 
     policy_acc = None
 
+    # Proactive bounds checks to surface clear Python errors instead of device asserts
+    vocab = getattr(getattr(model, "tok_emb", None), "num_embeddings", None)
+    if vocab is not None and tokens.numel():
+        tmin = int(tokens.min().item())
+        tmax = int(tokens.max().item())
+        if tmin < 0 or tmax >= int(vocab):
+            raise RuntimeError(
+                f"Token id out of range: min={tmin} max={tmax} vocab={int(vocab)}"
+            )
+
     with autocast:
         _hs, head_out = model(tokens)
 
-        if target_mode == "binned_ev":
+        if target_mode == "macroxue_tokens":
+            targets = batch["targets"].to(device, non_blocking=True)
+            # Validate targets within [0, n_classes)
+            if isinstance(head_out, (list, tuple)):
+                for h in range(4):
+                    n_classes = int(head_out[h].shape[-1])
+                    tgt_h = targets[:, h]
+                    if tgt_h.numel():
+                        tmin = int(tgt_h.min().item())
+                        tmax = int(tgt_h.max().item())
+                        if tmin < 0 or tmax >= n_classes:
+                            raise RuntimeError(
+                                f"Target out of range for head {h}: min={tmin} max={tmax} n_classes={n_classes}"
+                            )
+            per_head_losses = []
+            # Winner agreement accumulators
+            agree_sum = torch.zeros((), device=device, dtype=torch.float32)
+            agree_cnt = 0
+            for h in range(4):
+                logits_h = head_out[h].float()
+                tgt_h = targets[:, h]
+                loss_h = F.cross_entropy(logits_h, tgt_h)
+                per_head_losses.append(loss_h)
+
+                # Compute winner-bin probability on winner head
+                n_classes = logits_h.shape[-1]
+                winner_idx = n_classes - 1
+                win_mask = (tgt_h == winner_idx)
+                if win_mask.any():
+                    probs = F.softmax(logits_h[win_mask], dim=-1)[:, winner_idx]
+                    agree_sum = agree_sum + probs.sum()
+                    agree_cnt += int(win_mask.sum().item())
+            loss = sum(per_head_losses)
+            policy_agree = float((agree_sum / max(1, agree_cnt)).detach().item()) if agree_cnt > 0 else None
+
+        elif target_mode == "binned_ev":
             if "branch_bin_targets" not in batch:
                 raise KeyError("branch_bin_targets missing from batch for binned_ev target")
             if branch_mask is None:
@@ -671,6 +788,7 @@ def train_step(
         "loss": total_loss,
         "head_losses": head_losses,
         "policy_acc": float(policy_acc.detach().item()) if policy_acc is not None else None,
+        "policy_agree": policy_agree if target_mode == "macroxue_tokens" else None,
     }
 
 
@@ -689,6 +807,8 @@ def evaluate(
     n_batches = 0
     total_correct = 0.0
     total_examples = 0
+    agree_sum = 0.0
+    agree_cnt = 0
 
     if device.type == "cuda":
         autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -711,7 +831,25 @@ def evaluate(
         with autocast:
             _hs, head_out = model(tokens)
 
-            if target_mode == "binned_ev":
+            if target_mode == "macroxue_tokens":
+                targets = batch["targets"].to(device, non_blocking=True)
+                per_head_losses = []
+                for h in range(4):
+                    logits_h = head_out[h].float()
+                    tgt_h = targets[:, h]
+                    loss_h = F.cross_entropy(logits_h, tgt_h)
+                    per_head_losses.append(loss_h)
+                    # Winner agreement
+                    n_classes = logits_h.shape[-1]
+                    winner_idx = n_classes - 1
+                    win_mask = (tgt_h == winner_idx)
+                    if win_mask.any():
+                        probs = F.softmax(logits_h[win_mask], dim=-1)[:, winner_idx]
+                        agree_sum += float(probs.sum().item())
+                        agree_cnt += int(win_mask.sum().item())
+                loss = sum(per_head_losses)
+
+            elif target_mode == "binned_ev":
                 if "branch_bin_targets" not in batch:
                     raise KeyError(
                         "branch_bin_targets missing from batch for binned_ev target"
@@ -784,14 +922,15 @@ def evaluate(
         model.train()
 
     if n_batches == 0:
-        return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None}
+        return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None, "policy_agree": None}
 
     avg_loss = float(total_loss / n_batches)
     avg_heads = (total_heads / n_batches).tolist()
     policy_acc = None
     if target_mode == "hard_move" and total_examples > 0:
         policy_acc = float(total_correct / total_examples)
-    return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": policy_acc}
+    policy_agree = (agree_sum / agree_cnt) if (agree_cnt > 0) else None
+    return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": policy_acc, "policy_agree": policy_agree}
 
 
 def _save_checkpoint(model: torch.nn.Module, path: Path) -> Path:

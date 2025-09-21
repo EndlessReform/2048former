@@ -1,0 +1,63 @@
+init_dir = "inits/v2/10m"
+checkpoint_dir = "checkpoints"
+seed = 42
+
+# TODO remove this
+# compile_enabled = false
+
+[wandb]
+enabled = true
+project = "train-2048-macroxue-32bin"
+entity = ""
+run_name = ""
+tags = []
+mode = "online"                       # online | offline | disabled
+report_every = 50                     # log to W&B every N steps (>=1)
+
+[target]
+mode = "macroxue_tokens"
+
+[hyperparameters]
+learning_rate = 6e-4
+
+[hyperparameters.lr_schedule]
+name = "warmup-stable-decay" # constant | warmup-stable-decay
+warmup_steps = 1500
+# decay_steps = 0
+# Alternatively, specify a percentage of total steps for cooldown/decay
+cooldown_pct = 0.1 # e.g., last 10% of steps
+min_lr_ratio = 0.1
+
+[hyperparameters.optimizer]
+name = "adamw"      # adamw | muon
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.98
+eps = 1e-8
+
+[batch]
+batch_size = 1536
+
+[dropout]
+dropout_prob = 0.03
+attention_dropout_prob = 0.0
+
+[dataset]
+dataset_dir = "datasets/macroxue/d6_1b"
+tokenizer_path = "out/tokenizer.json"
+mmap_mode = true
+num_steps = 100_000
+
+val_run_pct = 0.01
+val_split_seed = 42
+
+val_every = 5_000
+
+[checkpoint]
+# Save every epoch (keep all). Epoch count is small.
+every_epochs = 1
+# Optionally save a best checkpoint every N steps based on validation loss.
+# This is a coarse interval to avoid frequent disk writes.
+save_best_every_steps = 10000
+# Require a small improvement to update the best to reduce churn.
+best_min_delta = 0.002

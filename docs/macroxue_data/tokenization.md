@@ -33,7 +33,7 @@ Recommended Δ-Bin Grid (percentile space)
 - Full-precision edges and per-bin occupancies are in `out/bin_grid_report.json` (`scheme == "quantile_32"`). Version the spec whenever the grid is regenerated.
 
 Tokenization Procedure (per state)
-- Map each legal branch EV with the frozen ECDF to get percentiles `p_a`.
+- Map each legal branch EV with the frozen ECDF to get percentiles `p_a`. Training dataloader uses `np.searchsorted(..., side="right")` to mirror the CLI encoder.
 - Emit `[WINNER]_{a*}` for the best action `a*`.
 - For each legal loser `a`:
   - Compute `Δ_a = p* - p_a`.

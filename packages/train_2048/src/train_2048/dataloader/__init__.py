@@ -38,6 +38,7 @@ def build_dataloaders(
         val_run_pct=float(getattr(ds_cfg, "val_run_pct", 0.0) or 0.0),
         val_split_seed=int(getattr(ds_cfg, "val_split_seed", 42) or 42),
         num_workers_train=num_workers_train,
+        mmap_mode=getattr(ds_cfg, "mmap_mode", False),
     )
 
 
