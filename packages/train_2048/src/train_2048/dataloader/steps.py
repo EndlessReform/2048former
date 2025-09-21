@@ -650,11 +650,13 @@ def build_steps_dataloaders(
     print(f"[data] Building DataLoader(train): workers={num_workers_train} batch_size={batch_size}")
     prefetch_train = 8 if num_workers_train > 0 else None
     train_sampler = None
+    is_streaming = False
     if train_num_steps is not None and int(train_num_steps) > 0:
         total_len = len(ds_train)
         total_samples = int(train_num_steps) * int(batch_size)
         print(f"[data] Using streaming sampler: total_samples={total_samples} over dataset_len={total_len}")
         train_sampler = StreamingRandomSampler(total_len, total_samples, seed=seed)
+        is_streaming = True
     elif train_indices is None:
         # Full-dataset epoch, avoid massive randperm by using a bounded-memory shuffler
         total_len = len(ds_train)
@@ -689,8 +691,10 @@ def build_steps_dataloaders(
         max_val_steps = None
         if val_num_steps is not None and int(val_num_steps) > 0:
             max_val_steps = int(val_num_steps)
-        elif val_steps_pct and val_steps_pct > 0.0 and train_num_steps:
-            max_val_steps = int(max(1, round(float(train_num_steps) * float(val_steps_pct))))
+        elif val_steps_pct and val_steps_pct > 0.0:
+            # Derive from actual planned train steps this epoch
+            planned_train_steps = int(train_num_steps) if (train_num_steps is not None and int(train_num_steps) > 0) else int(ceil(int(meta_train_steps) / max(1, int(batch_size))))
+            max_val_steps = int(max(1, round(float(planned_train_steps) * float(val_steps_pct))))
         if max_val_steps is not None:
             total_val = len(ds_val)
             total_samples = int(max_val_steps) * int(batch_size)
@@ -708,7 +712,7 @@ def build_steps_dataloaders(
             prefetch_factor=prefetch_val if prefetch_val is not None else 2,
         )
 
-    if train_sampler is not None:
+    if is_streaming:
         per_epoch_steps = int(train_num_steps)
     else:
         # Prefer metadata count to avoid scanning steps.npy

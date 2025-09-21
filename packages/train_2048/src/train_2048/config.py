@@ -275,6 +275,8 @@ class TrainingConfig(BaseModel):
     seed: int = 0
     # Debug/toggles
     compile_enabled: bool = True
+    # If true, also dump .pt checkpoints with optimizer state early and every 100k steps.
+    dangerous_just_checkpoint: bool = False
 
     @classmethod
     def from_toml(cls, path: str) -> "TrainingConfig":

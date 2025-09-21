@@ -329,6 +329,26 @@ def train(
     # Best checkpoint tracking (evaluated at coarse intervals)
     best_val_loss = float("inf")
 
+    def _dangerous_dump_pt(step: int) -> None:
+        if not getattr(cfg, "dangerous_just_checkpoint", False):
+            return
+        if step <= 0:
+            return
+        if step < 1000 or (step % 100_000) == 0:
+            pt = {
+                "global_step": int(step),
+                "model": normalize_state_dict_keys(model.state_dict()),
+                "optimizer": optimizer.state_dict(),
+                "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
+                "training_config": cfg.model_dump(),
+            }
+            path = run_ckpt_dir / f"dangerous-step-{step:08d}.pt"
+            try:
+                torch.save(pt, str(path))
+                print(f"[ckpt] Dumped dangerous pt checkpoint: {path}")
+            except Exception as e:
+                print(f"[ckpt] Failed to write dangerous pt checkpoint at step {step}: {e}")
+
     def _maybe_save_best(step: int, epoch: Optional[int] = None) -> None:
         """Save a 'model-best.safetensors' at coarse intervals based on val loss.
         Not tied to general val cadence to avoid frequent writes.
@@ -520,6 +540,8 @@ def train(
                     global_step += 1
                     # Coarse best checkpointing (if configured)
                     _maybe_save_best(global_step, epoch)
+                    # Aggressive optimizer+model dumps if requested
+                    _dangerous_dump_pt(global_step)
                 # Epoch-end checkpoint (keep all)
                 if (
                     getattr(cfg, "checkpoint", None) is not None
