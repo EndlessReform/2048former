@@ -12,6 +12,7 @@ uds_path = "/tmp/2048_infer.sock"
 [orchestrator]
 # IMPORTANT: Legacy single-head policy uses UDLR (Up, Down, Left, Right)
 head_order = "UDLR"
+board_mapping = "MSB"
 # Force argmax-only requests so the server returns only the best head index
 argmax_only = true
 

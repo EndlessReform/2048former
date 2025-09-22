@@ -31,6 +31,7 @@ def build_dataloaders(
         binner=binner,
         target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
+        tokenizer_path=ds_cfg.resolved_tokenizer_path(),
         run_sql=getattr(ds_cfg, "run_sql", None),
         sql_params=getattr(ds_cfg, "sql_params", None),
         val_run_sql=getattr(ds_cfg, "val_run_sql", None),
@@ -41,6 +42,11 @@ def build_dataloaders(
         mmap_mode=getattr(ds_cfg, "mmap_mode", False),
         step_index_min=getattr(ds_cfg, "step_index_min", None),
         step_index_max=getattr(ds_cfg, "step_index_max", None),
+        shuffle=bool(getattr(ds_cfg, "shuffle", False)),
+        shuffle_buffer_size=int(getattr(ds_cfg, "shuffle_buffer_size", 1_000_000) or 1_000_000),
+        train_num_steps=getattr(ds_cfg, "num_steps", None),
+        val_num_steps=getattr(ds_cfg, "val_num_steps", None),
+        val_steps_pct=float(getattr(ds_cfg, "val_steps_pct", 0.0) or 0.0),
     )
 
 

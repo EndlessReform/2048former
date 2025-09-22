@@ -27,9 +27,15 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
         enc_cfg_dict = json.load(f)
 
     # If weights exist, peek shapes to adjust config before constructing model.
-    weights_path = init_path / "model.safetensors"
+    # Prefer best checkpoint when present.
+    weight_candidates = [
+        init_path / "model-best.safetensors",
+        init_path / "model.safetensors",
+        init_path / "model-final.safetensors",
+    ]
+    weights_path = next((p for p in weight_candidates if p.is_file()), None)
     state = None
-    if weights_path.is_file():
+    if weights_path is not None and weights_path.is_file():
         s = safe_load_file(str(weights_path))
         state = normalize_state_dict_keys(s)
 

@@ -4,7 +4,7 @@ checkpoint_dir = "checkpoints"
 seed = 0
 
 [wandb]
-enabled = true
+enabled = false
 project = "train-2048-hard-target"
 entity = ""
 run_name = ""
@@ -18,7 +18,7 @@ muon_lr = 2e-2
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay
-warmup_steps = 400
+warmup_steps = 1500
 cooldown_pct = 0.2
 min_lr_ratio = 0.1
 
@@ -30,7 +30,7 @@ beta2 = 0.98
 eps = 1e-8
 
 [batch]
-batch_size = 1536
+batch_size = 1024
 # micro_batch_size = 256
 
 [dropout]
@@ -49,7 +49,9 @@ dataset_dir = "./datasets/ds_v4_full-game"
 # sql_params = [50_000, 2_000_000]
 
 # Drive by epochs
-num_epochs = 3
+# num_epochs = 3
+num_steps = 100_000
+mmap_mode = false
 
 # Validation: disjoint by runs. Here, use a fixed percentage split.
 val_run_pct = 0.02

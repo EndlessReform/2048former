@@ -34,8 +34,8 @@ def _legal_mask_from_board(board) -> torch.Tensor:  # (1,4) bool
     base_vals = list(board.to_values())
     mask: list[bool] = []
     dummy_rng = Rng(0)
-    # Head/move order aligns with training: [Up, Right, Down, Left]
-    order = [Move.UP, Move.RIGHT, Move.DOWN, Move.LEFT]
+    # Standardized project order: UDLR (Up, Down, Left, Right)
+    order = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
     for mv in order:
         nb = board.make_move(mv, rng=dummy_rng)
         mask.append(list(nb.to_values()) != base_vals)
@@ -116,7 +116,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             break
         head_probs = forward_distributions(model, tokens, set_eval=True)
         idx = _select_move_from_probs(head_probs, legal_mask)
-        mv = [Move.UP, Move.RIGHT, Move.DOWN, Move.LEFT][idx]
+        # Map selected head index (UDLR) to engine Move
+        mv = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT][idx]
         board = board.make_move(mv, rng=rng)
         moves += 1
 

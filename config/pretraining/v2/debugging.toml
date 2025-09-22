@@ -31,7 +31,7 @@ beta2 = 0.98
 eps = 1e-8
 
 [batch]
-batch_size = 16
+batch_size = 1024
 
 [dropout]
 dropout_prob = 0.03
@@ -40,7 +40,7 @@ attention_dropout_prob = 0.0
 [dataset]
 dataset_dir = "datasets/macroxue/d6_1b"
 mmap_mode = true
-num_steps = 10
+num_steps = 1000
 # Limit step range to reduce endgame oversampling
 step_index_min = 0
 step_index_max = 5000

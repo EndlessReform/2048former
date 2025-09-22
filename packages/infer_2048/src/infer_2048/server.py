@@ -67,6 +67,10 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         self._dump_tokens_path = os.environ.get("INFER_2048_DUMP_TOKENS_PATH")
         self._dump_logits_path = os.environ.get("INFER_2048_DUMP_LOGITS_PATH")
         self._dump_done = False
+        # Some legacy checkpoints used URDL head ordering during training. Allow
+        # reordering to the canonical UDLR for serving via env toggle.
+        # Accepted: 'UDLR' (default) or 'URDL'.
+        self._model_head_order = os.environ.get("INFER_2048_MODEL_HEAD_ORDER", "UDLR").upper()
 
     async def Infer(self, request, context):  # type: ignore[override]
         t0 = time.perf_counter()
@@ -137,11 +141,21 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             self.model.eval()
             with torch.inference_mode():
                 hidden_states, head_out = self.model(tokens)
-                is_binned = isinstance(head_out, (list, tuple))
-                if is_binned:
+                # Normalize model outputs to canonical UDLR order if needed
+                if isinstance(head_out, (list, tuple)):
+                    # Binned heads: list length 4
+                    if self._model_head_order == "URDL":
+                        # Reorder URDL -> UDLR: [0,2,3,1]
+                        head_out = [head_out[i] for i in (0, 2, 3, 1)]
+                    is_binned = True
                     head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in head_out]
                 else:
+                    # Single 4-way policy head
                     policy_logits = head_out.float()  # (B,4)
+                    if self._model_head_order == "URDL":
+                        # Columns: URDL -> UDLR
+                        policy_logits = policy_logits.index_select(1, torch.tensor([0, 2, 3, 1], device=policy_logits.device))
+                    is_binned = False
                     policy_probs = F.softmax(policy_logits, dim=-1)
                 if return_embedding:
                     board_repr = hidden_states.mean(dim=1)  # (B, H)
@@ -166,16 +180,28 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
 
             if argmax_only:
                 if is_binned:
-                    p1_tensor = torch.stack([hp[:, -1] for hp in head_probs_t], dim=1)
-                    p1_cpu = p1_tensor.to(dtype=torch.float32, device="cpu", non_blocking=False)
-                    best_p1, best_head = torch.max(p1_cpu, dim=1)
+                    # Use p1 (last bin) by default; permit tail2 scoring via env override.
+                    use_tail2 = os.environ.get("INFER_2048_TAIL2", "0") != "0"
+                    if use_tail2:
+                        tails = []
+                        for hp in head_probs_t:
+                            n = int(hp.shape[-1])
+                            if n >= 2:
+                                tails.append((hp[:, -1] + hp[:, -2]).float())
+                            else:
+                                tails.append(hp[:, -1].float())
+                        score_tensor = torch.stack(tails, dim=1)
+                    else:
+                        score_tensor = torch.stack([hp[:, -1] for hp in head_probs_t], dim=1)
+                    p_cpu = score_tensor.to(dtype=torch.float32, device="cpu", non_blocking=False)
+                    best_p, best_head = torch.max(p_cpu, dim=1)
                     argmax_heads = [int(h) for h in best_head.tolist()]
-                    argmax_p1 = [float(v) for v in best_p1.tolist()]
+                    argmax_p1 = [float(v) for v in best_p.tolist()]
                     if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
                         try:
                             n_bins = int(head_probs_t[0].shape[-1]) if head_probs_t else -1
-                            p1_first = p1_cpu[0].tolist() if p1_cpu.shape[0] > 0 else []
-                            vlog(f"[server] DEBUG p1 (argmax_only) n_bins={n_bins} p1[0]={p1_first} best={argmax_heads[0] if argmax_heads else None}")
+                            first = p_cpu[0].tolist() if p_cpu.shape[0] > 0 else []
+                            vlog(f"[server] DEBUG score (argmax_only) n_bins={n_bins} score[0]={first} best={argmax_heads[0] if argmax_heads else None}")
                         except Exception:
                             pass
                 else:

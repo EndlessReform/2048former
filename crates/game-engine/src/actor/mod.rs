@@ -22,6 +22,7 @@ pub struct GameActor {
     pub seed: u64,
     pub sampling: config::SamplingStrategy,
     pub head_order: config::HeadOrder,
+    pub board_map: config::BoardMapping,
     pub step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
     pub cancel: CancellationToken,
     pub step_budget: Option<StepBudget>,
@@ -80,6 +81,7 @@ impl GameActor {
         seed: u64,
         sampling: config::SamplingStrategy,
         head_order: config::HeadOrder,
+        board_map: config::BoardMapping,
         step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
         cancel: CancellationToken,
         step_budget: Option<StepBudget>,
@@ -96,6 +98,7 @@ impl GameActor {
             seed,
             sampling,
             head_order,
+            board_map,
             step_tx,
             cancel,
             step_budget,
@@ -118,7 +121,7 @@ impl GameActor {
                 }
             }
             let id = ((self.game_id as u64) << 32) | seq;
-            let board_bytes = board_to_exponents(self.board);
+            let board_bytes = board_to_exponents(self.board, self.board_map.clone());
             // Record step row (pre-move state) for dataset
             if let Some(tx) = &self.step_tx {
                 let _ = tx.try_send(DsStepRow {
@@ -199,14 +202,24 @@ impl GameActor {
     }
 }
 
-fn board_to_exponents(b: Board) -> [u8; 16] {
-    // ai_2048 packs 16 nibbles in a u64 as LSB-first where nibble i corresponds
-    // to cell i in row-major order. Training data (dataset-packer and collate)
-    // decode using this LSB-first convention, so mirror it here.
+fn board_to_exponents(b: Board, map: config::BoardMapping) -> [u8; 16] {
+    // Map packed nibbles into row-major token exponents per configured mapping.
+    // - LSB: nibble i -> cell i (modern, matches dataset packer)
+    // - MSB: nibble (15 - i) -> cell i (legacy)
     let raw = b.raw();
     let mut out = [0u8; 16];
-    for idx in 0..16 {
-        out[idx] = ((raw >> (idx * 4)) & 0xF) as u8;
+    match map {
+        config::BoardMapping::LSB => {
+            for idx in 0..16 {
+                out[idx] = ((raw >> (idx * 4)) & 0xF) as u8;
+            }
+        }
+        config::BoardMapping::MSB => {
+            for idx in 0..16 {
+                let nib = 15 - idx;
+                out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
+            }
+        }
     }
     out
 }

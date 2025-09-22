@@ -8,9 +8,18 @@ import numpy as np
 import sqlite3
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
+from .collate import (
+    make_collate_macroxue,
+    make_collate_steps,
+)
 
 from ..binning import Binner
 from ..tokenization.macroxue import MacroxueTokenizerSpec
+from ..tokenization.base import (
+    BoardCodec,
+    remap_labels_urdl_to_udlr,
+    reorder_cols_urdl_to_udlr,
+)
 
 
 class StepsDataset(Dataset):
@@ -171,69 +180,179 @@ class BufferedShuffleSampler(Sampler[int]):
     def __len__(self) -> int:
         return self.dataset_len
 
-        # Resolve the indices to iterate over. Avoid constructing a giant
-        # arange by default; defer to a None sentinel which means "all rows".
-        if indices is None:
-            self.indices = None  # meaning: 0..total_rows-1
-        else:
-            self.indices = _np.asarray(indices, dtype=_np.int64)
 
-    def __len__(self) -> int:  # type: ignore[override]
-        # Report full length even when indices=None so Samplers/DataLoader can size
-        total = int(self.cum_counts[-1])
-        if self.indices is None:
-            return total
-        return int(self.indices.size)
+class FilteredBufferedShuffleSampler(Sampler[int]):
+    """Shuffle indices with a ring buffer, keeping only eligible step_index.
 
-    def __getitem__(self, idx: int) -> int:  # type: ignore[override]
-        # Return the global step index; slicing happens in collate
-        if self.indices is None:
-            return int(idx)
-        return int(self.indices[int(idx)])
+    Iterates the dataset once per epoch, streaming through shards and
+    enqueuing indices whose ``step_index`` falls within the inclusive window
+    [step_index_min, step_index_max].
+    """
 
-    # ------------------------------------------------------------------
-    # Helper to fetch a batch of rows from the lazy shards.
-    # ------------------------------------------------------------------
-    def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
-        """Return a structured array of rows for the given global indices.
+    def __init__(
+        self,
+        dataset: "StepsDataset",
+        *,
+        buffer_size: int = 1_000_000,
+        seed: int = 42,
+        step_index_min: Optional[int] = None,
+        step_index_max: Optional[int] = None,
+        chunk_size: int = 1_000_000,
+    ) -> None:
+        if buffer_size <= 0:
+            raise ValueError("buffer_size must be > 0")
+        self.dataset = dataset
+        self.buffer_size = int(min(max(1, buffer_size), max(1, len(dataset))))
+        self.seed = int(seed)
+        self.smin = step_index_min
+        self.smax = step_index_max
+        self.chunk_size = int(max(1, chunk_size))
+        # Cache eligible count lazily
+        self._eligible_count: Optional[int] = None
 
-        Parameters
-        ----------
-        global_indices:
-            1‑D array of global step indices.
-        """
+    def _eligible_index_generator(self):
         import numpy as _np
+        ds = self.dataset
+        for s_idx, shard in enumerate(ds.shards):
+            offset = int(ds.cum_counts[s_idx])
+            N = shard.shape[0]
+            # Iterate in chunks to cap memory bandwidth
+            for lo in range(0, N, self.chunk_size):
+                hi = min(N, lo + self.chunk_size)
+                step_idx = shard['step_index'][lo:hi].astype(_np.int64, copy=False)
+                keep = _np.ones(step_idx.shape[0], dtype=bool)
+                if self.smin is not None:
+                    keep &= step_idx >= int(self.smin)
+                if self.smax is not None:
+                    keep &= step_idx <= int(self.smax)
+                if not keep.any():
+                    continue
+                local = _np.flatnonzero(keep)
+                global_idx = local + (offset + lo)
+                for g in global_idx.tolist():
+                    yield int(g)
 
-        # Sort indices to read from shards sequentially
-        sorter = np.argsort(global_indices)
-        sorted_global_indices = global_indices[sorter]
+    def __iter__(self):
+        import numpy as _np
+        rng = _np.random.default_rng(self.seed)
+        gen = self._eligible_index_generator()
+        B = self.buffer_size
+        # Fill buffer
+        buffer = []
+        try:
+            for _ in range(B):
+                buffer.append(next(gen))
+        except StopIteration:
+            pass
+        if not buffer:
+            return iter(())
+        buffer = _np.asarray(buffer, dtype=_np.int64)
+        # Replace-yield loop
+        for nxt in gen:
+            j = int(rng.integers(0, buffer.shape[0]))
+            yield int(buffer[j])
+            buffer[j] = int(nxt)
+        # Drain remaining in random order
+        rng.shuffle(buffer)
+        for g in buffer.tolist():
+            yield int(g)
 
-        # Determine which shard each index belongs to
-        shard_idx = _np.searchsorted(self.cum_counts, sorted_global_indices, side="right") - 1
-        local_idx = sorted_global_indices - self.cum_counts[shard_idx]
+    def __len__(self) -> int:
+        if self._eligible_count is not None:
+            return int(self._eligible_count)
+        # Compute and cache
+        total = 0
+        for s_idx, shard in enumerate(self.dataset.shards):
+            step_idx = shard['step_index']
+            if self.smin is not None and self.smax is not None:
+                mask = (step_idx >= int(self.smin)) & (step_idx <= int(self.smax))
+                total += int(np.count_nonzero(mask))
+            elif self.smin is not None:
+                total += int(np.count_nonzero(step_idx >= int(self.smin)))
+            elif self.smax is not None:
+                total += int(np.count_nonzero(step_idx <= int(self.smax)))
+            else:
+                total += int(step_idx.shape[0])
+        self._eligible_count = int(total)
+        return int(total)
 
-        # Gather rows from each shard
-        rows = []
-        for s in np.unique(shard_idx):
-            mask = shard_idx == s
-            rows.append(self.shards[s][local_idx[mask]])
 
-        sorted_rows = _np.concatenate(rows)
+class FilteredStreamingSampler(Sampler[int]):
+    """Random sampling with replacement over eligible indices.
 
-        # Unsort the rows to match original order of global_indices
-        unsort_sorter = np.empty_like(sorter)
-        unsort_sorter[sorter] = np.arange(global_indices.size)
+    Maintains a ring buffer of eligible indices sourced by scanning shards
+    with a step_index window, and yields exactly ``total_samples`` draws.
+    """
 
-        return sorted_rows[unsort_sorter]
+    def __init__(
+        self,
+        dataset: "StepsDataset",
+        total_samples: int,
+        *,
+        seed: int = 42,
+        step_index_min: Optional[int] = None,
+        step_index_max: Optional[int] = None,
+        buffer_size: int = 1_000_000,
+        chunk_size: int = 1_000_000,
+    ) -> None:
+        if total_samples <= 0:
+            raise ValueError("total_samples must be > 0")
+        self.dataset = dataset
+        self.total_samples = int(total_samples)
+        self.seed = int(seed)
+        self.smin = step_index_min
+        self.smax = step_index_max
+        self.buffer_size = int(max(1, buffer_size))
+        self.chunk_size = int(max(1, chunk_size))
 
+    def _eligible_index_generator(self):
+        import numpy as _np
+        ds = self.dataset
+        for s_idx, shard in enumerate(ds.shards):
+            offset = int(ds.cum_counts[s_idx])
+            N = shard.shape[0]
+            for lo in range(0, N, self.chunk_size):
+                hi = min(N, lo + self.chunk_size)
+                step_idx = shard['step_index'][lo:hi].astype(_np.int64, copy=False)
+                keep = _np.ones(step_idx.shape[0], dtype=bool)
+                if self.smin is not None:
+                    keep &= step_idx >= int(self.smin)
+                if self.smax is not None:
+                    keep &= step_idx <= int(self.smax)
+                if not keep.any():
+                    continue
+                local = _np.flatnonzero(keep)
+                global_idx = local + (offset + lo)
+                for g in global_idx.tolist():
+                    yield int(g)
 
-    def get_run_ids(self) -> np.ndarray:
-        """Return an array of run_id values for all steps.
+    def __iter__(self):
+        import numpy as _np
+        rng = _np.random.default_rng(self.seed)
+        gen = self._eligible_index_generator()
+        # Fill buffer
+        buf_list = []
+        try:
+            for _ in range(self.buffer_size):
+                buf_list.append(next(gen))
+        except StopIteration:
+            pass
+        if not buf_list:
+            return iter(())
+        buffer = _np.asarray(buf_list, dtype=_np.int64)
+        # Replacement sampling with ongoing refresh
+        for _ in range(self.total_samples):
+            j = int(rng.integers(0, buffer.shape[0]))
+            yield int(buffer[j])
+            try:
+                nxt = next(gen)
+                buffer[j] = int(nxt)
+            except StopIteration:
+                # No more new eligible indices; keep sampling from buffer
+                pass
 
-        This loads only the ``run_id`` column from each shard, avoiding a full
-        materialisation of the dataset.
-        """
-        return np.concatenate([s['run_id'] for s in self.shards])
+    def __len__(self) -> int:
+        return self.total_samples
 
 
 def _select_run_ids(
@@ -294,15 +413,29 @@ def _select_run_ids(
 
 
 def _sum_steps_for_ids(conn: sqlite3.Connection, run_ids: Optional[np.ndarray]) -> int:
-    """Return sum(steps) for the given run ids using metadata.db only.
+    """Return sum of step counts for the given run ids using metadata.db only.
 
-    When ``run_ids`` is None, sums over all runs.
+    Back-compat note: historical schemas used different column names:
+      - steps (new)
+      - num_steps (older)
+      - num_moves (legacy)
+    We probe in that order.
     """
-    cur = conn.execute("SELECT id, steps FROM runs")
+    rows: list[tuple[int, int]] = []
+    for col in ("steps", "num_steps", "num_moves"):
+        try:
+            cur = conn.execute(f"SELECT id, {col} FROM runs")
+            rows = [(int(rid), int(cnt or 0)) for (rid, cnt) in cur]
+            if rows:
+                break
+        except Exception:
+            continue
+    if not rows:
+        return 0
     if run_ids is None:
-        return int(sum(int(steps or 0) for (_id, steps) in cur))
+        return int(sum(cnt for (_id, cnt) in rows))
     sel = set(int(x) for x in run_ids.tolist())
-    return int(sum(int(steps or 0) for (_id, steps) in cur if _id in sel))
+    return int(sum(cnt for (_id, cnt) in rows if _id in sel))
 
 
 def _indices_from_run_ids(dataset: StepsDataset, run_ids: np.ndarray) -> np.ndarray:
@@ -358,256 +491,7 @@ def _indices_excluding_run_ids(dataset: StepsDataset, exclude_run_ids: np.ndarra
     return out.astype(np.int64, copy=False)
 
 
-def make_collate_macroxue(
-    dataset: StepsDataset,
-    tokenizer_path: str,
-) -> Callable:
-    """Collate function for macroxue tokenization.
 
-    Returns a dictionary with winner and margin targets.
-    """
-    spec = MacroxueTokenizerSpec.from_json(Path(tokenizer_path))
-    knots = {vt: np.array(k) for vt, k in spec.ecdf_knots.items()}
-    delta_edges = np.array(spec.delta_edges)
-    n_bins = len(delta_edges) - 1
-    illegal_token = n_bins
-    winner_token = n_bins + 1
-
-    # Precompute valuation type mapping (dataset id -> spec index).
-    # We try to read dataset_dir/valuation_types.json to align enums.
-    # Fallback to identity mapping if not found.
-    vt_name_to_spec_idx = {name: i for i, name in enumerate(spec.valuation_types)}
-    ds_vt_mapping: Optional[dict[int, int]] = None
-    try:
-        import json as _json  # lazy
-        vt_path = Path(dataset.dataset_dir) / "valuation_types.json"
-        if vt_path.is_file():
-            payload = _json.loads(vt_path.read_text())
-            # Support either list[str] or dict[str,int->str]
-            if isinstance(payload, list):
-                ds_id_to_name = {int(i): str(name) for i, name in enumerate(payload)}
-            elif isinstance(payload, dict):
-                ds_id_to_name = {int(k): str(v) for k, v in payload.items()}
-            else:
-                raise TypeError("valuation_types.json must be list or dict")
-            tmp_map: dict[int, int] = {}
-            for ds_id, name in ds_id_to_name.items():
-                if name not in vt_name_to_spec_idx:
-                    # Spec and dataset disagree — fail early
-                    raise KeyError(
-                        f"Valuation type '{name}' (id {ds_id}) missing from tokenizer spec"
-                    )
-                tmp_map[ds_id] = vt_name_to_spec_idx[name]
-            ds_vt_mapping = tmp_map
-    except Exception:
-        # Silent fallback; identity will be used below
-        ds_vt_mapping = None
-
-    def _unpack_board_to_exps_u8(packed: np.ndarray, *, mask65536: Optional[np.ndarray] = None) -> np.ndarray:
-        # packed: (N,) uint64 with 16 packed 4-bit tiles, LSB = cell 0
-        arr = packed.astype(np.uint64, copy=False)
-        n = int(arr.shape[0])
-        out = np.empty((n, 16), dtype=np.uint8)
-        for i in range(16):
-            out[:, i] = ((arr >> (4 * i)) & np.uint64(0xF)).astype(np.uint8, copy=False)
-        # Correct exponents for 2**16 tiles if mask present. Keep exponent 16
-        # so callers can configure the model vocab to 17 (0..16).
-        if mask65536 is not None:
-            m = mask65536.astype(np.uint16, copy=False)
-            for i in range(16):
-                sel = ((m >> i) & np.uint16(1)) != 0
-                if np.any(sel):
-                    out[sel, i] = np.uint8(16)
-        return out
-
-    def _collate(batch_indices: Sequence[int]):
-        import numpy as _np
-
-        idxs = _np.asarray(batch_indices, dtype=_np.int64)
-        batch = dataset.get_rows(idxs)
-
-        # Decode packed boards → (N,16) exponents without ai_2048 dependency
-        if 'board' not in batch.dtype.names:
-            raise KeyError("Expected 'board' field in steps.npy for macroxue dataset")
-        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
-        exps = _unpack_board_to_exps_u8(batch['board'], mask65536=mask65536)
-        tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
-
-        branch_evs = batch["branch_evs"]
-        valuation_types = batch["valuation_type"].astype(_np.int64, copy=False)
-        ev_legal = batch["ev_legal"]
-
-        percentiles = np.zeros_like(branch_evs, dtype=np.float32)
-
-        # If dataset->spec mapping is available, remap ids; else assume identity
-        if ds_vt_mapping is not None:
-            vt_spec_ids = _np.empty_like(valuation_types)
-            if valuation_types.size:
-                uniq = _np.unique(valuation_types)
-                for ds_id in uniq.tolist():
-                    if ds_id not in ds_vt_mapping:
-                        raise KeyError(f"Dataset valuation_type id {ds_id} missing from mapping")
-                    vt_spec_ids[valuation_types == ds_id] = int(ds_vt_mapping[ds_id])
-        else:
-            vt_spec_ids = valuation_types  # assume consistent enum ordering
-
-        for vt_name, vt_id in vt_name_to_spec_idx.items():
-            mask = vt_spec_ids == vt_id
-            if not np.any(mask):
-                continue
-
-            vt_knots = knots[vt_name]
-            evs = branch_evs[mask]
-
-            # Vectorized replication of tokenizer._percentile_from_knots
-            idx = np.searchsorted(vt_knots, evs, side="right")  # in [0, len]
-            n = len(vt_knots) - 1
-            p = np.zeros_like(evs, dtype=np.float32)
-            # In-range where 0 < idx < len(knots)
-            valid = (idx > 0) & (idx < len(vt_knots))
-            if np.any(valid):
-                lo = vt_knots[idx[valid] - 1]
-                hi = vt_knots[idx[valid]]
-                ratio = np.divide(
-                    evs[valid] - lo,
-                    hi - lo,
-                    out=np.zeros_like(evs[valid]),
-                    where=(hi > lo),
-                )
-                p[valid] = (idx[valid] - 1 + ratio) / n
-            # Below/above bounds
-            p[evs <= vt_knots[0]] = 0.0
-            p[evs >= vt_knots[-1]] = 1.0
-            percentiles[mask] = np.clip(p, 0.0, 1.0)
-
-        # Legality bits from dataset-packer are set as 1<<idx for actions in
-        # URDL order: Up=1 (1<<0), Right=2 (1<<1), Down=4 (1<<2), Left=8 (1<<3).
-        # Build mask in the same URDL column order to align with branch_evs.
-        legal_mask = np.stack([
-            (ev_legal & 1) != 0,  # Up   -> bit 1<<0
-            (ev_legal & 2) != 0,  # Right-> bit 1<<1
-            (ev_legal & 4) != 0,  # Down -> bit 1<<2
-            (ev_legal & 8) != 0,  # Left -> bit 1<<3
-        ], axis=1)
-
-        # Mark illegal as -inf so they never win
-        percentiles = percentiles.astype(np.float32, copy=False)
-        percentiles[~legal_mask] = -np.inf
-
-        winner_indices = np.argmax(percentiles, axis=1)
-        winner_percentiles = np.max(percentiles, axis=1, keepdims=True)
-
-        # For illegal moves, set delta to 1 (max bin) so they map to ILLEGAL later
-        deltas = np.clip(winner_percentiles - percentiles, 0, 1)
-        # Digitize using right-inclusive edges, consistent with tokenizer._digitize
-        # idx = bisect_right(edges, delta) - 1, then clamp to [0, len(edges)-2]
-        margin_bins = np.searchsorted(delta_edges, deltas, side="right") - 1
-        margin_bins = np.clip(margin_bins, 0, n_bins - 1)
-
-        targets = margin_bins.astype(np.int64, copy=False)
-        # Assign ILLEGAL class for illegal actions
-        targets[~legal_mask] = illegal_token
-        # Winner action gets WINNER class
-        rows = np.arange(len(idxs), dtype=np.int64)
-        targets[rows, winner_indices] = winner_token
-
-        return {
-            "tokens": tokens,
-            "targets": torch.from_numpy(targets.copy()).long(),
-            "n_classes": n_bins + 2,
-        }
-
-    return _collate
-
-
-def make_collate_steps(
-    target_mode: str,
-    dataset: StepsDataset,
-    binner: Optional[Binner],
-) -> Callable:
-    """Collate function that gathers tokens/mask/values and builds training targets."""
-
-    if target_mode not in {"binned_ev", "hard_move"}:
-        raise ValueError(f"Unknown target mode: {target_mode}")
-    if target_mode == "binned_ev" and binner is None:
-        raise ValueError("Binner is required when target_mode='binned_ev'")
-
-    def _collate(batch_indices: Sequence[int]):
-        import numpy as _np
-
-        idxs = _np.asarray(batch_indices, dtype=_np.int64)
-        batch = dataset.get_rows(idxs)
-
-        # Decode packed boards → (N,16) exponents (mirror macroxue helper)
-        def _unpack_board_to_exps_u8(packed: _np.ndarray, *, mask65536: Optional[_np.ndarray] = None) -> _np.ndarray:
-            arr = packed.astype(_np.uint64, copy=False)
-            n = int(arr.shape[0])
-            out = _np.empty((n, 16), dtype=_np.uint8)
-            for i in range(16):
-                out[:, i] = ((arr >> (4 * i)) & _np.uint64(0xF)).astype(_np.uint8, copy=False)
-            if mask65536 is not None:
-                m = mask65536.astype(_np.uint16, copy=False)
-                for i in range(16):
-                    sel = ((m >> i) & _np.uint16(1)) != 0
-                    if _np.any(sel):
-                        out[sel, i] = _np.uint8(16)
-            return out
-
-        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
-        exps = _unpack_board_to_exps_u8(batch['board'], mask65536=mask65536)
-        tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
-
-        # EVs from dataset (URDL order), float32
-        if 'branch_evs' in batch.dtype.names:
-            evs = batch['branch_evs'].astype(_np.float32, copy=False)
-        else:
-            evs = _np.zeros((len(idxs), 4), dtype=_np.float32)
-        if 'ev_legal' in batch.dtype.names:
-            bits = batch['ev_legal'].astype(_np.uint8, copy=False)
-            # Dataset packer sets ev_legal bits as URDL order with sequential bits
-            # Up=1 (1<<0), Right=2 (1<<1), Down=4 (1<<2), Left=8 (1<<3).
-            # Build mask columns in the same URDL order.
-            legal = _np.stack([
-                (bits & 1) != 0,   # Up   -> bit 1<<0
-                (bits & 2) != 0,   # Right-> bit 1<<1
-                (bits & 4) != 0,   # Down -> bit 1<<2
-                (bits & 8) != 0,   # Left -> bit 1<<3
-            ], axis=1)
-        else:
-            # Fallback: treat finite EVs as legal if mask not present
-            legal = _np.isfinite(evs)
-
-        evs_clean = (evs * legal.astype(_np.float32, copy=False)).astype(_np.float32, copy=False)
-
-        branch_values = torch.from_numpy(evs_clean.copy())  # (N,4) float32
-        branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))  # (N,4) bool
-
-        out = {
-            "tokens": tokens,
-            "branch_mask": branch_mask,
-            "branch_values": branch_values,
-        }
-        if target_mode == "binned_ev":
-            assert binner is not None  # for type checkers
-            binner.to_device(branch_values.device)
-            out["branch_bin_targets"] = binner.bin_values(branch_values).long()
-            out["n_bins"] = int(binner.n_bins)
-        else:  # hard_move
-            if 'move_dir' not in batch.dtype.names:
-                raise KeyError("move_dir missing from steps.npy for hard_move target")
-            # Move directions from dataset in URDL numeric codes (Up=0, Right=1, Down=2, Left=3)
-            dirs_arr = batch['move_dir'].astype(_np.int64, copy=False)
-            # Previous single-head policy used class order UDLR (Up, Down, Left, Right).
-            # ai_2048/batch_from_steps returns URDL (0,1,2,3 = Up,Right,Down,Left).
-            # Permute to UDLR to match historical order for hard targets.
-            # Mapping old->new: 0->0 (U), 1->3 (R->last), 2->1 (D), 3->2 (L)
-            perm = _np.array([0, 3, 1, 2], dtype=_np.int64)
-            if dirs_arr.size:
-                dirs_arr = perm[dirs_arr]
-            out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
-        return out
-
-    return _collate
 
 
 def build_steps_dataloaders(
@@ -617,8 +501,10 @@ def build_steps_dataloaders(
     batch_size: int,
     *,
     tokenizer_path: Optional[str] = None,
+    ev_tokenizer: Optional[object] = None,
     train_num_steps: Optional[int] = None,
     seed: int = 42,
+    shuffle: bool = False,
     shuffle_buffer_size: int = 1_000_000,
     val_num_steps: Optional[int] = None,
     val_steps_pct: float = 0.0,
@@ -630,6 +516,8 @@ def build_steps_dataloaders(
     val_split_seed: int = 42,
     num_workers_train: int = 12,
     mmap_mode: bool = False,
+    step_index_min: Optional[int] = None,
+    step_index_max: Optional[int] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], int]:
     """Create train/val DataLoaders from steps.npy + metadata.db.
 
@@ -668,7 +556,7 @@ def build_steps_dataloaders(
     val_indices = _indices_from_run_ids(ds_train, val_rids) if val_rids is not None else None
 
     # Optional: apply step-index window filtering (inclusive) if provided in config
-    if ('step_index_min' in locals() and step_index_min is not None) or ('step_index_max' in locals() and step_index_max is not None):
+    if (step_index_min is not None) or (step_index_max is not None):
         import numpy as _np
         smin_i = int(step_index_min) if step_index_min is not None else None
         smax_i = int(step_index_max) if step_index_max is not None else None
@@ -705,7 +593,7 @@ def build_steps_dataloaders(
             raise ValueError("tokenizer_path is required for macroxue_tokens mode")
         collate = make_collate_macroxue(ds_train, tokenizer_path)
     else:
-        collate = make_collate_steps(target_mode, ds_train, binner)
+        collate = make_collate_steps(target_mode, ds_train, binner, ev_tokenizer=ev_tokenizer)
 
     print(f"[data] Building DataLoader(train): workers={num_workers_train} batch_size={batch_size}")
     prefetch_train = 8 if num_workers_train > 0 else None
@@ -714,14 +602,40 @@ def build_steps_dataloaders(
     if train_num_steps is not None and int(train_num_steps) > 0:
         total_len = len(ds_train)
         total_samples = int(train_num_steps) * int(batch_size)
-        print(f"[data] Using streaming sampler: total_samples={total_samples} over dataset_len={total_len}")
-        train_sampler = StreamingRandomSampler(total_len, total_samples, seed=seed)
+        if step_index_min is not None or step_index_max is not None:
+            print(
+                f"[data] Using filtered streaming sampler: samples={total_samples} buffer={shuffle_buffer_size} step_index in [{step_index_min},{step_index_max}]"
+            )
+            train_sampler = FilteredStreamingSampler(
+                ds_train,
+                total_samples,
+                seed=seed,
+                step_index_min=step_index_min,
+                step_index_max=step_index_max,
+                buffer_size=int(shuffle_buffer_size),
+            )
+        else:
+            print(f"[data] Using streaming sampler: total_samples={total_samples} over dataset_len={total_len}")
+            train_sampler = StreamingRandomSampler(total_len, total_samples, seed=seed)
         is_streaming = True
+    elif train_indices is None and (step_index_min is not None or step_index_max is not None):
+        print(
+            f"[data] Using filtered buffered shuffle: buffer={shuffle_buffer_size} step_index in [{step_index_min},{step_index_max}]"
+        )
+        train_sampler = FilteredBufferedShuffleSampler(
+            ds_train,
+            buffer_size=int(shuffle_buffer_size),
+            seed=seed,
+            step_index_min=step_index_min,
+            step_index_max=step_index_max,
+        )
     elif train_indices is None:
-        # Full-dataset epoch, avoid massive randperm by using a bounded-memory shuffler
-        total_len = len(ds_train)
-        print(f"[data] Using buffered shuffle: dataset_len={total_len} buffer_size={shuffle_buffer_size}")
-        train_sampler = BufferedShuffleSampler(total_len, buffer_size=int(shuffle_buffer_size), seed=seed)
+        if shuffle:
+            total_len = len(ds_train)
+            print(f"[data] Using buffered shuffle: dataset_len={total_len} buffer_size={shuffle_buffer_size}")
+            train_sampler = BufferedShuffleSampler(total_len, buffer_size=int(shuffle_buffer_size), seed=seed)
+        else:
+            train_sampler = None
     dl_train = DataLoader(
         ds_train,
         batch_size=batch_size,
@@ -731,7 +645,7 @@ def build_steps_dataloaders(
         collate_fn=collate,
         pin_memory=True,
         persistent_workers=True if num_workers_train > 0 else False,
-        prefetch_factor=prefetch_train if prefetch_train is not None else 2,
+        prefetch_factor=prefetch_train,
     )
 
     dl_val: Optional[DataLoader] = None
@@ -745,7 +659,7 @@ def build_steps_dataloaders(
                 raise ValueError("tokenizer_path is required for macroxue_tokens mode")
             collate_v = make_collate_macroxue(ds_val, tokenizer_path)
         else:
-            collate_v = make_collate_steps(target_mode, ds_val, binner)
+            collate_v = make_collate_steps(target_mode, ds_val, binner, ev_tokenizer=ev_tokenizer)
         # Optionally cap validation steps via a sampler
         val_sampler = None
         max_val_steps = None
@@ -769,7 +683,7 @@ def build_steps_dataloaders(
             collate_fn=collate_v,
             pin_memory=True,
             persistent_workers=True if num_workers_val > 0 else False,
-            prefetch_factor=prefetch_val if prefetch_val is not None else 2,
+            prefetch_factor=prefetch_val,
         )
 
     if is_streaming:

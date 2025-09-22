@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Callable
 from pathlib import Path
 import math
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -10,6 +11,8 @@ from tqdm import tqdm
 
 from .config import TrainingConfig, load_encoder_from_init
 from .dataloader import build_steps_dataloaders
+from .tokenization.ev_binning import EVBinnerTokenizer
+from .binning import BinningConfig
 from .objectives import make_objective
 from .checkpointing import (
     create_run_dir,
@@ -42,16 +45,12 @@ def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, t
     return base
 
 
-def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
-    device = torch.device(device_str)
-
-    # Init model
-    model = load_encoder_from_init(cfg.init_dir)
-    model = model.to(device=(device if device.type != "cuda" else device), dtype=(torch.bfloat16 if device.type == "cuda" else None))
-
-    # Data
-    target_mode = getattr(cfg.target, "mode", "binned_ev")
-    dl_train, dl_val, per_epoch_steps = build_steps_dataloaders(
+def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Optional[DataLoader], int]:
+    ev_tok = None
+    if target_mode == "binned_ev":
+        # Standardize EV tokenization via EVTokenizer wrapper
+        ev_tok = EVBinnerTokenizer(BinningConfig(**cfg.binning.model_dump()))
+    return build_steps_dataloaders(
         dataset_dir=cfg.dataset.resolved_dataset_dir(),
         binner=None,
         target_mode=target_mode,
@@ -62,6 +61,7 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
         val_num_steps=getattr(cfg.dataset, "val_num_steps", None),
         val_steps_pct=getattr(cfg.dataset, "val_steps_pct", 0.0),
         tokenizer_path=cfg.dataset.resolved_tokenizer_path(),
+        ev_tokenizer=ev_tok,
         run_sql=cfg.dataset.run_sql,
         sql_params=cfg.dataset.sql_params,
         val_run_sql=cfg.dataset.val_run_sql,
@@ -72,25 +72,28 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
         mmap_mode=cfg.dataset.mmap_mode,
     )
 
-    # Objective
+
+def init_model(cfg: TrainingConfig, device: torch.device, *, target_mode: str, dl_train: Optional[DataLoader]):
+    model = load_encoder_from_init(cfg.init_dir)
+    model = model.to(device=(device if device.type != "cuda" else device), dtype=(torch.bfloat16 if device.type == "cuda" else None))
     objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
-
-    # Compile
     if getattr(cfg, "compile_enabled", True):
         model = torch.compile(model, mode="reduce-overhead")
+    return model, objective
 
-    # Optimizer
+
+def init_optimizer(model: torch.nn.Module, cfg: TrainingConfig) -> torch.optim.Optimizer:
     opt_cfg = cfg.hyperparameters.optimizer
     if opt_cfg.name == "adamw":
-        optimizer = torch.optim.AdamW(
+        return torch.optim.AdamW(
             model.parameters(),
             lr=cfg.hyperparameters.learning_rate,
             betas=(opt_cfg.beta1, opt_cfg.beta2),
             eps=opt_cfg.eps,
             weight_decay=opt_cfg.weight_decay,
         )
-    elif opt_cfg.name == "muon":
+    if opt_cfg.name == "muon":
         from muon import MuonWithAuxAdam  # type: ignore
 
         def _is_norm_param(name: str, p: torch.nn.Parameter) -> bool:
@@ -123,17 +126,11 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
             dict(params=adam_decay, use_muon=False, lr=adam_lr, betas=(opt_cfg.beta1, opt_cfg.beta2), eps=opt_cfg.eps, weight_decay=opt_cfg.weight_decay),
             dict(params=adam_no_decay, use_muon=False, lr=adam_lr, betas=(opt_cfg.beta1, opt_cfg.beta2), eps=opt_cfg.eps, weight_decay=0.0),
         ]
-        optimizer = MuonWithAuxAdam(param_groups)
-    else:
-        raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
+        return MuonWithAuxAdam(param_groups)
+    raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
-    model.train()
 
-    # Steps/epochs
-    fixed_steps = cfg.dataset.num_steps or 0
-    epochs = cfg.dataset.num_epochs or 1
-    total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
-
+def make_scheduler(cfg: TrainingConfig, optimizer: torch.optim.Optimizer, total_steps: int) -> tuple[Callable[[int], float], Callable[[float], float], dict]:
     lr_cfg = cfg.hyperparameters.lr_schedule
     base_lrs = [pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups]
 
@@ -144,14 +141,14 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
             return int(math.ceil(total * float(lr_cfg.cooldown_pct)))
         return int(lr_cfg.decay_steps or 0)
 
-    decay_steps = _compute_decay_steps(total_steps)
     warmup_steps = int(lr_cfg.warmup_steps or 0)
     warmup_steps = max(0, min(warmup_steps, max(total_steps, 0)))
+    decay_steps = _compute_decay_steps(total_steps)
     decay_steps = max(0, min(decay_steps, max(total_steps - warmup_steps, 0)))
     stable_steps = max(0, total_steps - warmup_steps - decay_steps)
     decay_start_step = warmup_steps + stable_steps
 
-    def _lr_scale_for_step(step_idx: int) -> float:
+    def scale_for_step(step_idx: int) -> float:
         if lr_cfg.name == "constant" or total_steps <= 0:
             return 1.0
         if warmup_steps > 0 and step_idx < warmup_steps:
@@ -165,36 +162,97 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
         frac = float(pos) / float(decay_steps)
         return 1.0 - (1.0 - lr_cfg.min_lr_ratio) * frac
 
-    def _apply_lr(scale: float) -> float:
+    def apply(scale: float) -> float:
         for pg, base_lr in zip(optimizer.param_groups, base_lrs):
             pg["lr"] = float(base_lr) * float(scale)
         return optimizer.param_groups[0]["lr"]
 
-    # Checkpoint dir and configs
+    meta = dict(decay_steps=decay_steps, warmup_steps=warmup_steps, stable_steps=stable_steps, decay_start_step=decay_start_step)
+    return scale_for_step, apply, meta
+
+
+def _wandb_log(data: Dict[str, float | int], step: int) -> None:
+    try:
+        import wandb  # type: ignore
+        wandb.log(data, step=step)
+    except Exception:
+        pass
+
+
+def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: float, target_mode: str, *, epoch: Optional[int], dt_data_ms: float, dt_comp_ms: float) -> Dict[str, float | int]:
+    payload: Dict[str, float | int] = {"train/loss": float(metrics["loss"]), "train/lr": float(lr), "train/data_time_ms": float(dt_data_ms), "train/compute_time_ms": float(dt_comp_ms)}
+    if epoch is not None:
+        payload["train/epoch"] = int(epoch)
+    if target_mode in ("binned_ev", "macroxue_tokens"):
+        hl = metrics["head_losses"]
+        payload.update({"train/loss_u": float(hl[0]), "train/loss_d": float(hl[1]), "train/loss_l": float(hl[2]), "train/loss_r": float(hl[3])})
+    else:
+        if metrics.get("policy_acc") is not None:
+            payload["train/policy_acc"] = float(metrics["policy_acc"])
+        if metrics.get("policy_agree") is not None:
+            payload["train/policy_agree"] = float(metrics["policy_agree"])  # type: ignore[arg-type]
+    return payload
+
+
+def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mode: str, *, epoch: Optional[int]) -> Dict[str, float | int]:
+    payload: Dict[str, float | int] = {"val/loss": float(metrics["loss"])}
+    if epoch is not None:
+        payload["train/epoch"] = int(epoch)
+    if target_mode in ("binned_ev", "macroxue_tokens"):
+        hl = metrics["head_losses"]
+        payload.update({"val/loss_u": float(hl[0]), "val/loss_d": float(hl[1]), "val/loss_l": float(hl[2]), "val/loss_r": float(hl[3])})
+    else:
+        if metrics.get("policy_acc") is not None:
+            payload["val/policy_acc"] = float(metrics["policy_acc"])
+        if metrics.get("policy_agree") is not None:
+            payload["val/policy_agree"] = float(metrics["policy_agree"])  # type: ignore[arg-type]
+    return payload
+
+
+def _maybe_log_val(objective, model, dl_val, device, *, cfg: TrainingConfig, target_mode: str, step: int, wandb_run: Optional[object], epoch: Optional[int]) -> Optional[Dict[str, float | list[float] | None]]:
+    if dl_val is None:
+        return None
+    if (cfg.dataset.val_every or 0) <= 0:
+        return None
+    if step <= 0 or (step % int(cfg.dataset.val_every)) != 0:
+        return None
+    val_metrics = objective.evaluate(model, dl_val, device)
+    if wandb_run is not None:
+        _wandb_log(_build_val_payload(val_metrics, target_mode, epoch=epoch), step=step)
+    return val_metrics
+
+
+def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
+    device = torch.device(device_str)
+    target_mode = getattr(cfg.target, "mode", "binned_ev")
+
+    dl_train, dl_val, per_epoch_steps = init_datasets(cfg, target_mode)
+    model, objective = init_model(cfg, device, target_mode=target_mode, dl_train=dl_train)
+    optimizer = init_optimizer(model, cfg)
+
+    model.train()
+
+    fixed_steps = cfg.dataset.num_steps or 0
+    epochs = (cfg.dataset.num_epochs or 1) if fixed_steps == 0 else 1
+    steps_this_epoch = fixed_steps if fixed_steps > 0 else per_epoch_steps
+    total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
+
+    scale_for_step, apply_lr, sched_meta = make_scheduler(cfg, optimizer, total_steps)
+
     run_ckpt_dir = create_run_dir(cfg.checkpoint_dir)
     dump_training_and_model_config(run_ckpt_dir, cfg, model)
 
     global_step = 0
     pre_decay_flag = {"saved": False}
     best_tracker: Dict[str, float] = {}
-
     wandb_report_every = max(1, int(getattr(getattr(cfg, "wandb", None), "report_every", 1)))
 
-    def _safe_wandb_log(data: Dict[str, float | int], step: int) -> None:
-        try:
-            import wandb  # type: ignore
-            wandb.log(data, step=step)
-        except Exception:
-            pass
-
-    # Fixed steps mode
-    if fixed_steps > 0:
+    for epoch in range(epochs):
         it = iter(dl_train)
-        pbar = tqdm(range(fixed_steps), desc="Train", dynamic_ncols=True, total=fixed_steps)
+        pbar = tqdm(range(steps_this_epoch), desc=("Train" if fixed_steps > 0 else f"Epoch {epoch + 1}/{epochs}"), dynamic_ncols=True, total=steps_this_epoch)
         for _ in pbar:
-            maybe_save_stable(model, run_ckpt_dir, global_step=global_step, decay_steps=decay_steps, decay_start=decay_start_step, preflag=pre_decay_flag)
-            lr_now = _apply_lr(_lr_scale_for_step(global_step))
-            import time
+            maybe_save_stable(model, run_ckpt_dir, global_step=global_step, decay_steps=sched_meta["decay_steps"], decay_start=sched_meta["decay_start_step"], preflag=pre_decay_flag)
+            lr_now = apply_lr(scale_for_step(global_step))
             t0 = time.perf_counter()
             try:
                 batch = next(it)
@@ -212,114 +270,14 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
             t2 = time.perf_counter()
             pbar.set_postfix_str(_format_postfix(metrics, lr_now, target_mode, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
             if wandb_run is not None and (global_step % wandb_report_every == 0):
-                log_payload = {"train/loss": metrics["loss"], "train/lr": lr_now, "train/data_time_ms": (t1 - t0) * 1e3, "train/compute_time_ms": (t2 - t1) * 1e3}
-                if target_mode in ("binned_ev", "macroxue_tokens"):
-                    hl = metrics["head_losses"]
-                    log_payload.update({"train/loss_u": hl[0], "train/loss_d": hl[1], "train/loss_l": hl[2], "train/loss_r": hl[3]})
-                else:
-                    if metrics.get("policy_acc") is not None:
-                        log_payload["train/policy_acc"] = metrics["policy_acc"]
-                    if metrics.get("policy_agree") is not None:
-                        log_payload["train/policy_agree"] = metrics["policy_agree"]
-                _safe_wandb_log(log_payload, step=global_step)
-            if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)):
-                val_metrics = objective.evaluate(model, dl_val, device)
-                if wandb_run is not None:
-                    payload = {"val/loss": val_metrics["loss"]}
-                    if target_mode in ("binned_ev", "macroxue_tokens"):
-                        hl = val_metrics["head_losses"]
-                        payload.update({"val/loss_u": hl[0], "val/loss_d": hl[1], "val/loss_l": hl[2], "val/loss_r": hl[3]})
-                    else:
-                        if val_metrics.get("policy_acc") is not None:
-                            payload["val/policy_acc"] = val_metrics["policy_acc"]
-                        if val_metrics.get("policy_agree") is not None:
-                            payload["val/policy_agree"] = val_metrics["policy_agree"]
-                    _safe_wandb_log(payload, step=global_step)
+                _wandb_log(_build_train_payload(metrics, lr_now, target_mode, epoch=(None if fixed_steps > 0 else epoch), dt_data_ms=(t1 - t0) * 1e3, dt_comp_ms=(t2 - t1) * 1e3), step=global_step)
+            _maybe_log_val(objective, model, dl_val, device, cfg=cfg, target_mode=target_mode, step=global_step, wandb_run=wandb_run, epoch=(None if fixed_steps > 0 else epoch))
             global_step += 1
-            maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, target_mode=target_mode, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=None, best_tracker=best_tracker, wandb_run=wandb_run)
-    else:
-        for epoch in range(epochs):
-            if per_epoch_steps > 0:
-                import time
-                pbar = tqdm(range(per_epoch_steps), desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True, total=per_epoch_steps)
-                it = iter(dl_train)
-                for _ in pbar:
-                    t0 = time.perf_counter()
-                    try:
-                        batch = next(it)
-                    except StopIteration:
-                        break
-                    t1 = time.perf_counter()
-                    lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                    metrics = objective.train_step(model, batch, optimizer, device)
-                    t2 = time.perf_counter()
-                    maybe_save_stable(model, run_ckpt_dir, global_step=global_step, decay_steps=decay_steps, decay_start=decay_start_step, preflag=pre_decay_flag)
-                    pbar.set_postfix_str(_format_postfix(metrics, lr_now, target_mode, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
-                    if wandb_run is not None and (global_step % wandb_report_every == 0):
-                        payload = {"train/loss": metrics["loss"], "train/lr": lr_now, "train/epoch": epoch, "train/data_time_ms": (t1 - t0) * 1e3, "train/compute_time_ms": (t2 - t1) * 1e3}
-                        if target_mode in ("binned_ev", "macroxue_tokens"):
-                            hl = metrics["head_losses"]
-                            payload.update({"train/loss_u": hl[0], "train/loss_d": hl[1], "train/loss_l": hl[2], "train/loss_r": hl[3]})
-                        else:
-                            if metrics.get("policy_acc") is not None:
-                                payload["train/policy_acc"] = metrics["policy_acc"]
-                        _safe_wandb_log(payload, step=global_step)
-                    if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)):
-                        val_metrics = objective.evaluate(model, dl_val, device)
-                        if wandb_run is not None:
-                            payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
-                            if target_mode in ("binned_ev", "macroxue_tokens"):
-                                hl = val_metrics["head_losses"]
-                                payload.update({"val/loss_u": hl[0], "val/loss_d": hl[1], "val/loss_l": hl[2], "val/loss_r": hl[3]})
-                            else:
-                                if val_metrics.get("policy_acc") is not None:
-                                    payload["val/policy_acc"] = val_metrics["policy_acc"]
-                            _safe_wandb_log(payload, step=global_step)
-                    global_step += 1
-                    maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, target_mode=target_mode, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=epoch, best_tracker=best_tracker, wandb_run=wandb_run)
-                    dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step)
-                if getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):
-                    save_safetensors(model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors")
-            else:
-                import time
-                pbar = tqdm(desc=f"Epoch {epoch + 1}/{epochs}", dynamic_ncols=True)
-                it = iter(dl_train)
-                while True:
-                    t0 = time.perf_counter()
-                    try:
-                        batch = next(it)
-                    except StopIteration:
-                        break
-                    t1 = time.perf_counter()
-                    lr_now = _apply_lr(_lr_scale_for_step(global_step))
-                    metrics = objective.train_step(model, batch, optimizer, device)
-                    t2 = time.perf_counter()
-                    maybe_save_stable(model, run_ckpt_dir, global_step=global_step, decay_steps=decay_steps, decay_start=decay_start_step, preflag=pre_decay_flag)
-                    pbar.set_postfix_str(_format_postfix(metrics, lr_now, target_mode, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
-                    if wandb_run is not None and (global_step % wandb_report_every == 0):
-                        payload = {"train/loss": metrics["loss"], "train/lr": lr_now, "train/epoch": epoch, "train/data_time_ms": (t1 - t0) * 1e3, "train/compute_time_ms": (t2 - t1) * 1e3}
-                        if target_mode in ("binned_ev", "macroxue_tokens"):
-                            hl = metrics["head_losses"]
-                            payload.update({"train/loss_u": hl[0], "train/loss_d": hl[1], "train/loss_l": hl[2], "train/loss_r": hl[3]})
-                        else:
-                            if metrics.get("policy_acc") is not None:
-                                payload["train/policy_acc"] = metrics["policy_acc"]
-                        _safe_wandb_log(payload, step=global_step)
-                    if dl_val is not None and (cfg.dataset.val_every or 0) > 0 and (global_step > 0 and (global_step % int(cfg.dataset.val_every) == 0)):
-                        val_metrics = objective.evaluate(model, dl_val, device)
-                        if wandb_run is not None:
-                            payload = {"val/loss": val_metrics["loss"], "train/epoch": epoch}
-                            if target_mode in ("binned_ev", "macroxue_tokens"):
-                                hl = val_metrics["head_losses"]
-                                payload.update({"val/loss_u": hl[0], "val/loss_d": hl[1], "val/loss_l": hl[2], "val/loss_r": hl[3]})
-                            else:
-                                if val_metrics.get("policy_acc") is not None:
-                                    payload["val/policy_acc"] = val_metrics["policy_acc"]
-                            _safe_wandb_log(payload, step=global_step)
-                    global_step += 1
-                    maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, target_mode=target_mode, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=epoch, best_tracker=best_tracker, wandb_run=wandb_run)
-                if getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):
-                    save_safetensors(model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors")
+            maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=(None if fixed_steps > 0 else epoch), best_tracker=best_tracker, wandb_run=wandb_run)
+            if fixed_steps == 0:
+                dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step)
+        if fixed_steps == 0 and getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):
+            save_safetensors(model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors")
 
     ckpt_path = save_safetensors(model, run_ckpt_dir / "model.safetensors")
 
@@ -338,4 +296,3 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
 
 
 __all__ = ["run_training"]
-

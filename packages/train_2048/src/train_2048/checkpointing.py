@@ -61,7 +61,6 @@ def maybe_save_best(
     evaluate_fn,
     dl_val,
     device,
-    target_mode: str,
     cfg_checkpoint,
     step: int,
     epoch: Optional[int],
@@ -73,7 +72,9 @@ def maybe_save_best(
     interval = int(cfg_checkpoint.save_best_every_steps)
     if step <= 0 or (step % interval) != 0:
         return
-    val_metrics = evaluate_fn(model, dl_val, device, target_mode)
+    # `evaluate_fn` is expected to be a bound method like `objective.evaluate`,
+    # which takes (model, dl_val, device). Do not pass extra args.
+    val_metrics = evaluate_fn(model, dl_val, device)
     val_loss = float(val_metrics["loss"])
     if val_loss + float(cfg_checkpoint.best_min_delta) < best_tracker.get("best_val_loss", float("inf")):
         best_tracker["best_val_loss"] = val_loss
@@ -116,4 +117,3 @@ __all__ = [
     "maybe_save_best",
     "dangerous_dump_pt",
 ]
-

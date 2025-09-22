@@ -201,6 +201,10 @@ pub struct Orchestrator {
     /// Order of heads in model output. Defaults to legacy [Up, Down, Left, Right].
     #[serde(default)]
     pub head_order: Option<HeadOrder>,
+    /// Mapping from packed board nibbles to tokens. Defaults to LSB (modern packer & loaders).
+    /// Set to MSB for legacy checkpoints trained with the previous client mapping.
+    #[serde(default)]
+    pub board_mapping: Option<BoardMapping>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, Default)]
@@ -242,6 +246,7 @@ impl Default for Orchestrator {
             random_seeds: false,
             argmax_only: false,
             head_order: None,
+            board_mapping: None,
         }
     }
 }
@@ -281,9 +286,20 @@ pub enum HeadOrder {
     URDL,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub enum BoardMapping {
+    /// LSB-first nibble packing (nibble i -> cell i in row-major). Default.
+    LSB,
+    /// Legacy MSB-first nibble mapping used by some older clients/checkpoints.
+    MSB,
+}
+
 impl Orchestrator {
     pub fn head_order_or_default(&self) -> HeadOrder {
         self.head_order.clone().unwrap_or(HeadOrder::UDLR)
+    }
+    pub fn board_mapping_or_default(&self) -> BoardMapping {
+        self.board_mapping.clone().unwrap_or(BoardMapping::LSB)
     }
 }
 

@@ -562,6 +562,7 @@ async fn main() {
                 make_seed(started),
                 config.sampling.clone(),
                 config.orchestrator.head_order_or_default(),
+                config.orchestrator.board_mapping_or_default(),
                 Some(step_tx.clone()),
                 cancel.clone(),
                 step_budget.clone(),

@@ -51,9 +51,8 @@ class HardMove(Objective):
 
             loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
             if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
-                # URDL -> UDLR
-                mask_udlr = branch_mask[:, [0, 2, 3, 1]]
-                chosen_legal = mask_udlr[torch.arange(move_targets.size(0), device=device), move_targets]
+                # Collate already standardizes legality to UDLR; use as-is
+                chosen_legal = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
                 loss = loss_per_sample[chosen_legal].mean() if bool(chosen_legal.any()) else torch.zeros((), device=logits.device, dtype=torch.float32)
             else:
                 loss = loss_per_sample.mean()
@@ -63,7 +62,7 @@ class HardMove(Objective):
 
         preds = logits.argmax(dim=1)
         if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
-            acc_mask = branch_mask[:, [0, 2, 3, 1]][torch.arange(move_targets.size(0), device=device), move_targets]
+            acc_mask = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
             if bool(acc_mask.any()):
                 policy_acc = ((preds == move_targets) & acc_mask).float()[acc_mask].mean()
             else:
@@ -138,15 +137,14 @@ class HardMove(Objective):
                 loss_per_sample = F.cross_entropy(logits, move_targets, reduction="none")
 
                 if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
-                    mask_udlr = branch_mask[:, [0, 2, 3, 1]]
-                    chosen_legal = mask_udlr[torch.arange(move_targets.size(0), device=device), move_targets]
+                    chosen_legal = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
                     loss = loss_per_sample[chosen_legal].mean() if bool(chosen_legal.any()) else torch.zeros((), device=logits.device, dtype=torch.float32)
                 else:
                     loss = loss_per_sample.mean()
 
                 preds = logits.argmax(dim=1)
                 if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
-                    acc_mask = branch_mask[:, [0, 2, 3, 1]][torch.arange(move_targets.size(0), device=device), move_targets]
+                    acc_mask = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
                     total_correct += float(((preds == move_targets) & acc_mask).sum().item())
                     total_examples += int(acc_mask.sum().item())
                 else:
@@ -189,4 +187,3 @@ class HardMove(Objective):
 
 
 __all__ = ["HardMove"]
-

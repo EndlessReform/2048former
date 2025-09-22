@@ -32,14 +32,19 @@ pub(crate) fn select_move_max_p1(
     if n_bins == 0 {
         return None;
     }
-    let one_idx = n_bins - 1; // dedicated '1' bin at end
+    // Many training configs reserve the last bin for exact 1.0 (special_zero_one=true).
+    // This makes using only bin[-1] brittle. Use a more robust tail score: bin[-1] + bin[-2] when available.
     let mut best_i: Option<usize> = None;
     let mut best_v: f32 = f32::NEG_INFINITY;
     for (i, head) in bins.iter().enumerate() {
         if !legal[i] {
             continue;
         }
-        let p1 = *head.get(one_idx).unwrap_or(&0.0);
+        let p1 = match n_bins {
+            0 => 0.0,
+            1 => *head.get(0).unwrap_or(&0.0),
+            _ => head[n_bins - 1] + head[n_bins - 2],
+        };
         if p1 > best_v {
             best_v = p1;
             best_i = Some(i);
@@ -49,7 +54,11 @@ pub(crate) fn select_move_max_p1(
         let mut bi: usize = 0;
         let mut bv = f32::NEG_INFINITY;
         for (i, head) in bins.iter().enumerate() {
-            let p1 = *head.get(one_idx).unwrap_or(&0.0);
+            let p1 = match n_bins {
+                0 => 0.0,
+                1 => *head.get(0).unwrap_or(&0.0),
+                _ => head[n_bins - 1] + head[n_bins - 2],
+            };
             if p1 > bv {
                 bv = p1;
                 bi = i;
@@ -74,7 +83,7 @@ fn select_move_softmax(
     if n_bins == 0 {
         return None;
     }
-    let one_idx = n_bins - 1;
+    // Robust tail score (see select_move_max_p1)
     let mut p1 = [0.0f32; 4];
     let mut any_legal = false;
     for (i, head) in bins.iter().enumerate() {
@@ -82,7 +91,11 @@ fn select_move_softmax(
             continue;
         }
         any_legal = true;
-        p1[i] = *head.get(one_idx).unwrap_or(&0.0);
+        p1[i] = match n_bins {
+            0 => 0.0,
+            1 => *head.get(0).unwrap_or(&0.0),
+            _ => head[n_bins - 1] + head[n_bins - 2],
+        };
     }
     if !any_legal {
         return select_move_max_p1(bins, legal, order);
@@ -137,14 +150,18 @@ fn select_move_top_p_top_k(
     if n_bins == 0 {
         return None;
     }
-    let one_idx = n_bins - 1;
+    // Robust tail score (see select_move_max_p1)
     let mut scores = [0.0f64; 4];
     let mut legal_count = 0usize;
     for (i, head) in bins.iter().enumerate() {
         if !legal[i] {
             continue;
         }
-        let p1 = *head.get(one_idx).unwrap_or(&0.0);
+        let p1 = match n_bins {
+            0 => 0.0,
+            1 => *head.get(0).unwrap_or(&0.0),
+            _ => head[n_bins - 1] + head[n_bins - 2],
+        };
         scores[i] = p1 as f64;
         legal_count += 1;
     }
