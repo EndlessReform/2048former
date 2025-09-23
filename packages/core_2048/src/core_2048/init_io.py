@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from safetensors.torch import load_file as safe_load_file
+import torch
 
 from .model import Encoder, EncoderConfig
 
@@ -30,15 +31,36 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     # Prefer best checkpoint when present.
     weight_candidates = [
         init_path / "model-best.safetensors",
+        init_path / "model-stable.safetensors",
         init_path / "model.safetensors",
         init_path / "model-final.safetensors",
+    ]
+    pt_candidates = [
+        init_path / "model-stable.pt",
+        init_path / "model.pt",
     ]
     weights_path = next((p for p in weight_candidates if p.is_file()), None)
     state = None
     if weights_path is not None and weights_path.is_file():
         s = safe_load_file(str(weights_path))
         state = normalize_state_dict_keys(s)
+    else:
+        # Try PT bundle with {'model': state_dict, 'optimizer': ..., 'encoder_config': ...}
+        pt_path = next((p for p in pt_candidates if p.is_file()), None)
+        if pt_path is not None and pt_path.is_file():
+            try:
+                bundle = torch.load(str(pt_path), map_location="cpu")
+                maybe_state = bundle.get("model") if isinstance(bundle, dict) else None
+                if isinstance(maybe_state, dict):
+                    state = normalize_state_dict_keys(maybe_state)
+                    # If encoder config present, prefer it
+                    if isinstance(bundle.get("encoder_config"), dict):
+                        enc_cfg_dict.update(bundle["encoder_config"])  # type: ignore[arg-type]
+            except Exception:
+                pass
 
+    # If we loaded any state, infer additional config from it
+    if isinstance(state, dict):
         # Infer head type and dimensions
         head_type = enc_cfg_dict.get("head_type", "binned_ev")
         if any(k.startswith("policy_head.") for k in state.keys()):

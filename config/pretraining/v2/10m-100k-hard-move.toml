@@ -1,9 +1,10 @@
-init_dir = "inits/v2/10m_hard_target"
+# init_dir = "inits/v2/10m_hard_target"
+init_dir = "inits/v2/10m_ablations/narrow_n3_75"
 checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
-enabled = false
+enabled = true
 project = "train-2048-hard-move"
 entity = ""
 run_name = ""

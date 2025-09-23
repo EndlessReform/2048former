@@ -1,4 +1,4 @@
-init_dir = "inits/v2/10m"
+init_dir = "inits/v2/10m_ablations/narrow_n4"
 checkpoint_dir = "checkpoints"
 seed = 42
 

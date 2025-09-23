@@ -21,6 +21,7 @@ from .checkpointing import (
     maybe_save_stable,
     maybe_save_best,
     dangerous_dump_pt,
+    maybe_resume_optimizer_from_init,
 )
 
 
@@ -236,7 +237,21 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
 
     dl_train, dl_val, per_epoch_steps = init_datasets(cfg, target_mode)
     model, objective = init_model(cfg, device, target_mode=target_mode, dl_train=dl_train)
+    # Log model parameter count (pretty-printed)
+    try:
+        n_params = sum(int(p.numel()) for p in model.parameters())
+        print(f"Model parameters: {n_params:,}")
+    except Exception:
+        pass
     optimizer = init_optimizer(model, cfg)
+    # Try to resume optimizer state from init_dir (.pt bundle), if present
+    resumed_step: Optional[int] = None
+    try:
+        resumed_step = maybe_resume_optimizer_from_init(cfg.init_dir, optimizer)
+        if resumed_step is not None:
+            print(f"[resume] Optimizer resumed; starting from global_step={resumed_step}")
+    except Exception:
+        pass
 
     model.train()
 
@@ -248,9 +263,10 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     scale_for_step, apply_lr, sched_meta = make_scheduler(cfg, optimizer, total_steps)
 
     run_ckpt_dir = create_run_dir(cfg.checkpoint_dir)
+    print(f"Checkpoint directory: {run_ckpt_dir}")
     dump_training_and_model_config(run_ckpt_dir, cfg, model)
 
-    global_step = 0
+    global_step = int(resumed_step) if (resumed_step is not None) else 0
     pre_decay_flag = {"saved": False}
     best_tracker: Dict[str, float] = {}
     wandb_report_every = max(1, int(getattr(getattr(cfg, "wandb", None), "report_every", 1)))
@@ -259,7 +275,7 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
         it = iter(dl_train)
         pbar = tqdm(range(steps_this_epoch), desc=("Train" if fixed_steps > 0 else f"Epoch {epoch + 1}/{epochs}"), dynamic_ncols=True, total=steps_this_epoch)
         for _ in pbar:
-            maybe_save_stable(model, run_ckpt_dir, global_step=global_step, decay_steps=sched_meta["decay_steps"], decay_start=sched_meta["decay_start_step"], preflag=pre_decay_flag)
+            maybe_save_stable(model, run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, global_step=global_step, decay_steps=sched_meta["decay_steps"], decay_start=sched_meta["decay_start_step"], preflag=pre_decay_flag)
             lr_now = apply_lr(scale_for_step(global_step))
             t0 = time.perf_counter()
             try:
@@ -288,6 +304,7 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
             save_safetensors(model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors")
 
     ckpt_path = save_safetensors(model, run_ckpt_dir / "model.safetensors")
+    print(f"Final checkpoint saved: {ckpt_path}")
 
     if wandb_run is not None:
         try:

@@ -12,6 +12,35 @@ from safetensors.torch import save_file as safe_save_file
 from .config import normalize_state_dict_keys
 
 
+def maybe_resume_optimizer_from_init(init_dir: str, optimizer: torch.optim.Optimizer) -> Optional[int]:
+    """If an init folder contains a PT bundle, load optimizer state.
+
+    Returns the saved global_step when available, else None. Safe no-op on failure.
+    """
+    init_path = Path(init_dir)
+    pt_candidates = [
+        init_path / "model-stable.pt",
+        init_path / "model.pt",
+    ]
+    for pt in pt_candidates:
+        if pt.is_file():
+            try:
+                bundle = torch.load(str(pt), map_location="cpu")
+                if isinstance(bundle, dict) and isinstance(bundle.get("optimizer"), dict):
+                    optimizer.load_state_dict(bundle["optimizer"])  # type: ignore[arg-type]
+                    gs = bundle.get("global_step")
+                    try:
+                        gs_int = int(gs) if gs is not None else None
+                    except Exception:
+                        gs_int = None
+                    print(f"[resume] Loaded optimizer state from {pt}")
+                    return gs_int
+            except Exception as e:
+                print(f"[resume] Failed to load optimizer from {pt}: {e}")
+                return None
+    return None
+
+
 def create_run_dir(base_dir: str) -> Path:
     root = Path(base_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -44,13 +73,44 @@ def save_safetensors(model: torch.nn.Module, path: Path) -> Path:
     return path
 
 
-def maybe_save_stable(model: torch.nn.Module, run_dir: Path, *, global_step: int, decay_steps: int, decay_start: int, preflag: dict) -> None:
+def _save_stable_bundle(run_dir: Path, *, model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer], training_cfg: Optional[object], global_step: Optional[int]) -> None:
+    """Write both safetensors and a .pt bundle for stable checkpoint.
+
+    The .pt includes optimizer state to support resumption (e.g., WSD/Muon/AdamW).
+    """
+    # Primary weights (safetensors)
+    save_safetensors(model, run_dir / "model-stable.safetensors")
+    # PT bundle with optimizer + configs for easy resume
+    try:
+        payload = {
+            "global_step": (int(global_step) if global_step is not None else None),
+            "model": normalize_state_dict_keys(model.state_dict()),
+            "optimizer": (optimizer.state_dict() if optimizer is not None else None),
+            "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
+            "training_config": (training_cfg.model_dump() if training_cfg is not None else None),
+        }
+        torch.save(payload, str(run_dir / "model-stable.pt"))
+    except Exception:
+        pass
+
+
+def maybe_save_stable(
+    model: torch.nn.Module,
+    run_dir: Path,
+    *,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    training_cfg: Optional[object] = None,
+    global_step: int,
+    decay_steps: int,
+    decay_start: int,
+    preflag: dict,
+) -> None:
     if preflag.get("saved", False):
         return
     if decay_steps <= 0:
         return
     if global_step == decay_start:
-        save_safetensors(model, run_dir / "model-stable.safetensors")
+        _save_stable_bundle(run_dir, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=global_step)
         preflag["saved"] = True
 
 
@@ -116,4 +176,5 @@ __all__ = [
     "maybe_save_stable",
     "maybe_save_best",
     "dangerous_dump_pt",
+    "maybe_resume_optimizer_from_init",
 ]
