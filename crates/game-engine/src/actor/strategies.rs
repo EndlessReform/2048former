@@ -3,20 +3,13 @@ use crate::feeder::Bins;
 use ai_2048::engine::Move;
 use rand::distributions::Distribution;
 
-fn map_idx(idx: usize, order: &config::HeadOrder) -> Move {
-    match order {
-        config::HeadOrder::UDLR => match idx {
-            0 => Move::Up,
-            1 => Move::Down,
-            2 => Move::Left,
-            _ => Move::Right,
-        },
-        config::HeadOrder::URDL => match idx {
-            0 => Move::Up,
-            1 => Move::Right,
-            2 => Move::Down,
-            _ => Move::Left,
-        },
+fn map_idx(idx: usize, _order: &config::HeadOrder) -> Move {
+    // Canonical UDLR mapping
+    match idx {
+        0 => Move::Up,
+        1 => Move::Down,
+        2 => Move::Left,
+        _ => Move::Right,
     }
 }
 

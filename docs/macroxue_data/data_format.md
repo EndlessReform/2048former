@@ -104,14 +104,14 @@ STEP_ROW_DTYPE = np.dtype(
     [
         ("run_id", np.uint32),           # sequential game id
         ("step_index", np.uint32),       # index within the run
-        ("board", np.uint64),            # 16 packed 4-bit tiles (LSB = cell 0)
+        ("board", np.uint64),            # 16 packed 4-bit tiles (MSB nibble = cell 0)
         ("tile_65536_mask", np.uint16),  # bit i set when tile i stores 2**16
-        ("move_dir", np.uint8),          # 0=up, 1=right, 2=down, 3=left
+        ("move_dir", np.uint8),          # UDLR: 0=up, 1=down, 2=left, 3=right
         ("valuation_type", np.uint8),    # enum (see valuation_types.json)
-        ("ev_legal", np.uint8),          # bitfield: up/right/down/left
+        ("ev_legal", np.uint8),          # UDLR bitfield
         ("max_rank", np.uint8),          # denormalised for filtering
         ("seed", np.uint32),             # PRNG seed that generated the run
-        ("branch_evs", np.float32, (4,)),# EVs for [up, right, down, left]
+        ("branch_evs", np.float32, (4,)),# EVs [up, down, left, right]
     ],
     align=True,
 )

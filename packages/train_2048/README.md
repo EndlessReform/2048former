@@ -30,3 +30,25 @@ uv run python -m train_2048.tokenization.macroxue
 ```
 
 This will process the raw game state data (by default, from `datasets/raws/macroxue_d6_240g_tokenization/**/*.jsonl.gz`) and generate the `out/tokenizer.json` file.
+
+## Output Head Format (Macroxue)
+
+When training with `target.mode = "macroxue_tokens"`, each of the four per‑move heads (UDLR) predicts a categorical distribution over classes derived from the tokenizer. The class layout is standardized to match existing v1 semantics (worst → best):
+
+- Head order: UDLR everywhere (data, training, inference).
+- Number of classes per head: `n_classes = loser_bins + 2`, where `loser_bins = len(delta_edges) - 1` from `tokenizer.json`.
+- Class indices per head:
+  - `0` — ILLEGAL (move does not change the board)
+  - `1 .. loser_bins` — margin bins ordered from worst → best
+  - `loser_bins + 1` — WINNER (top action; “p1” bin)
+
+Notes and rationale:
+
+- The tokenizer computes ECDF‑based percentiles per valuation type and quantile‑based `delta_edges` for loser margins only. Collation maps those margins to ascending class indices so that higher indices always mean better options (consistent with v1 binned EV heads).
+- During training, each head uses cross‑entropy against these per‑branch class targets. Winner bins typically concentrate probability mass near the last class.
+- During inference, selection logic reads the last class (`p1`) per head for argmax decisions and optional tail aggregation; this layout matches the server/client expectations.
+
+Quick usage:
+
+- Train (example): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml`
+- The tokenizer path is configured at `dataset.tokenizer_path` and must point to a `tokenizer.json` generated as above.

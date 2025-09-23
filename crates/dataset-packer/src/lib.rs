@@ -193,11 +193,12 @@ enum MoveName {
 
 impl MoveName {
     fn code(self) -> u8 {
+        // Canonical UDLR indexing: Up=0, Down=1, Left=2, Right=3
         match self {
             MoveName::Up => 0,
-            MoveName::Right => 1,
-            MoveName::Down => 2,
-            MoveName::Left => 3,
+            MoveName::Down => 1,
+            MoveName::Left => 2,
+            MoveName::Right => 3,
         }
     }
 }
@@ -347,6 +348,85 @@ pub fn pack_dataset(opts: PackOptions) -> Result<PackSummary> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    use tempfile::tempdir;
+
+    fn pack_board_msb_ref(cells: &[u8; 16]) -> (u64, u16) {
+        let mut acc = 0u64;
+        let mut mask = 0u16;
+        for (i, &exp) in cells.iter().enumerate() {
+            let mut nib = exp;
+            if nib >= 16 {
+                mask |= 1 << i;
+                nib = 15;
+            }
+            let shift = (15 - i) * 4;
+            acc |= (nib as u64 & 0xF) << shift;
+        }
+        (acc, mask)
+    }
+
+    #[test]
+    fn round_trip_jsonl_to_step_row_msb_udlr() {
+        // Prepare a tiny gzipped JSONL with one step
+        let dir = tempdir().unwrap();
+        let steps_path = dir.path().join("one.jsonl.gz");
+        let mut enc = GzEncoder::new(std::fs::File::create(&steps_path).unwrap(), Compression::default());
+        // exponents 0..15 with a 16 at position 5 to test mask; move is "right"; branch evs UDLR with Right None (illegal)
+        let mut board: Vec<u8> = (0u8..16u8).collect();
+        board[5] = 16u8; // force a 65536 tile at index 5
+        let record = serde_json::json!({
+            "seed": 123u64,
+            "step_index": 0u32,
+            "move": "right",
+            "valuation_type": "search",
+            "board": board,
+            "branch_evs": {"up": 0.9, "down": 0.7, "left": 0.3, "right": null},
+        });
+        let line = serde_json::to_string(&record).unwrap();
+        enc.write_all(line.as_bytes()).unwrap();
+        enc.write_all(b"\n").unwrap();
+        enc.finish().unwrap();
+
+        let meta = MetaRecord {
+            seed: 123u64,
+            num_moves: 1,
+            score: 0,
+            highest_tile: 0,
+            max_rank: Some(0),
+        };
+        let enc_v = ValuationEncoder::new();
+        let (rows, any_legal) = parse_steps_file(&steps_path, 1u32, &meta, &enc_v).unwrap();
+        assert!(any_legal, "expected at least one legal branch in test record");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+
+        // Verify board packing MSB + 65536 mask behavior
+        let mut cell_arr = [0u8; 16];
+        for i in 0..16 { cell_arr[i] = i as u8; }
+        // Force a 16 at index 5 in our reference as parse path clamps >=16 to 15 and sets mask
+        cell_arr[5] = 16u8;
+        let (exp_board, exp_mask) = pack_board_msb_ref(&cell_arr);
+        assert_eq!(row.board, exp_board);
+        assert_eq!(row.tile_65536_mask, exp_mask);
+
+        // Verify move_dir UDLR encoding (Right = 3)
+        assert_eq!(row.move_dir, 3u8);
+        // Verify branch EVs UDLR order and legality mask UDLR (Right illegal -> bit 3 cleared)
+        // ORDER: [Up, Down, Left, Right]
+        assert!((row.branch_evs[0] - 0.9).abs() < 1e-6);
+        assert!((row.branch_evs[1] - 0.7).abs() < 1e-6);
+        assert!((row.branch_evs[2] - 0.3).abs() < 1e-6);
+        assert!((row.branch_evs[3] - 0.0).abs() < 1e-6);
+        // ev_legal bits: Up(1) + Down(2) + Left(4) = 0b0111 = 7
+        assert_eq!(row.ev_legal, 0b0111u8);
+    }
+}
 fn discover_runs(root: &Path) -> Result<Vec<RunInput>> {
     let mut runs = Vec::new();
     for entry in walkdir::WalkDir::new(root) {
@@ -512,6 +592,7 @@ fn parse_steps_file(
 }
 
 fn pack_board(cells: &[u8; 16]) -> (u64, u16) {
+    // Canonical MSB-first nibble order: cell 0 -> bits 63..60, ..., cell 15 -> bits 3..0
     let mut acc = 0u64;
     let mut mask = 0u16;
     for (idx, &exp) in cells.iter().enumerate() {
@@ -520,13 +601,15 @@ fn pack_board(cells: &[u8; 16]) -> (u64, u16) {
             mask |= 1 << idx;
             nibble = 15;
         }
-        acc |= (nibble as u64 & 0xF) << (idx * 4);
+        let shift = (15 - idx) * 4;
+        acc |= (nibble as u64 & 0xF) << shift;
     }
     (acc, mask)
 }
 
 fn gather_branch_evs(map: &HashMap<String, Option<f32>>) -> ([f32; 4], u8) {
-    const ORDER: [&str; 4] = ["up", "right", "down", "left"];
+    // Canonical branch order: UDLR (Up, Down, Left, Right)
+    const ORDER: [&str; 4] = ["up", "down", "left", "right"];
     let mut evs = [0.0f32; 4];
     let mut mask = 0u8;
     for (idx, key) in ORDER.iter().enumerate() {

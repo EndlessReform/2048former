@@ -39,9 +39,8 @@ The loader infers the head type if `head_type` is missing by inspecting keys:
 - If keys start with `ev_heads.0.` → binned_ev
 
 Additional notes
-- Token order is the board’s 16 exponents in row‑major cell order (LSB‑first packing in dataset).
-- For Macroxue tokens, the orchestrator’s head order should be `URDL`, and argmax over the WINNER bin (last class) is the default.
-- For legacy hard move policy, class order is `UDLR`.
+- Token order is the board’s 16 exponents in row‑major cell order using MSB‑first nibble packing in a u64.
+- Canonical branch/head order is UDLR (Up, Down, Left, Right) across dataset, training, and inference.
 
 Examples
 
@@ -73,4 +72,3 @@ Binned EV (macroxue tokens, 32 loser bins → 34 classes)
   "head_type": "binned_ev",
   "output_n_bins": 34
 }
-

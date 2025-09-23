@@ -162,10 +162,7 @@ impl GameActor {
                 }
                 InferenceOutput::Argmax { head, .. } => {
                     // Map head index according to configured order
-                    let dirs = match self.head_order {
-                        config::HeadOrder::UDLR => [Move::Up, Move::Down, Move::Left, Move::Right],
-                        config::HeadOrder::URDL => [Move::Up, Move::Right, Move::Down, Move::Left],
-                    };
+                    let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
                     let idx = head as usize;
                     if let Some(&choice) = dirs.get(idx) {
                         if legal.get(idx).copied().unwrap_or(false) {
@@ -202,34 +199,20 @@ impl GameActor {
     }
 }
 
-fn board_to_exponents(b: Board, map: config::BoardMapping) -> [u8; 16] {
-    // Map packed nibbles into row-major token exponents per configured mapping.
-    // - LSB: nibble i -> cell i (modern, matches dataset packer)
-    // - MSB: nibble (15 - i) -> cell i (legacy)
+fn board_to_exponents(b: Board, _map: config::BoardMapping) -> [u8; 16] {
+    // Canonical MSB-first mapping: cell i reads nibble (15 - i)
     let raw = b.raw();
     let mut out = [0u8; 16];
-    match map {
-        config::BoardMapping::LSB => {
-            for idx in 0..16 {
-                out[idx] = ((raw >> (idx * 4)) & 0xF) as u8;
-            }
-        }
-        config::BoardMapping::MSB => {
-            for idx in 0..16 {
-                let nib = 15 - idx;
-                out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
-            }
-        }
+    for idx in 0..16 {
+        let nib = 15 - idx;
+        out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
     }
     out
 }
 
-fn legal_mask(board: Board, order: config::HeadOrder) -> [bool; 4] {
-    // Produce mask in the same order as heads according to configured mapping
-    let dirs = match order {
-        config::HeadOrder::UDLR => [Move::Up, Move::Down, Move::Left, Move::Right],
-        config::HeadOrder::URDL => [Move::Up, Move::Right, Move::Down, Move::Left],
-    };
+fn legal_mask(board: Board, _order: config::HeadOrder) -> [bool; 4] {
+    // Produce mask in UDLR order
+    let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
     let mut mask = [false; 4];
     for (i, &m) in dirs.iter().enumerate() {
         let after = GameEngine::make_move(board, m);

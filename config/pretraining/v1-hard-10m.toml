@@ -50,7 +50,7 @@ dataset_dir = "./datasets/ds_v4_full-game"
 
 # Drive by epochs
 # num_epochs = 3
-num_steps = 100_000
+num_steps = 50_000
 mmap_mode = false
 
 # Validation: disjoint by runs. Here, use a fixed percentage split.

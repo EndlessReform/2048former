@@ -67,10 +67,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         self._dump_tokens_path = os.environ.get("INFER_2048_DUMP_TOKENS_PATH")
         self._dump_logits_path = os.environ.get("INFER_2048_DUMP_LOGITS_PATH")
         self._dump_done = False
-        # Some legacy checkpoints used URDL head ordering during training. Allow
-        # reordering to the canonical UDLR for serving via env toggle.
-        # Accepted: 'UDLR' (default) or 'URDL'.
-        self._model_head_order = os.environ.get("INFER_2048_MODEL_HEAD_ORDER", "UDLR").upper()
+        # Canonical branch/head order is UDLR everywhere. No per-model reordering.
 
     async def Infer(self, request, context):  # type: ignore[override]
         t0 = time.perf_counter()
@@ -141,20 +138,14 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             self.model.eval()
             with torch.inference_mode():
                 hidden_states, head_out = self.model(tokens)
-                # Normalize model outputs to canonical UDLR order if needed
+                # Outputs are already in canonical UDLR order
                 if isinstance(head_out, (list, tuple)):
                     # Binned heads: list length 4
-                    if self._model_head_order == "URDL":
-                        # Reorder URDL -> UDLR: [0,2,3,1]
-                        head_out = [head_out[i] for i in (0, 2, 3, 1)]
                     is_binned = True
                     head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in head_out]
                 else:
-                    # Single 4-way policy head
+                    # Single 4-way policy head (UDLR)
                     policy_logits = head_out.float()  # (B,4)
-                    if self._model_head_order == "URDL":
-                        # Columns: URDL -> UDLR
-                        policy_logits = policy_logits.index_select(1, torch.tensor([0, 2, 3, 1], device=policy_logits.device))
                     is_binned = False
                     policy_probs = F.softmax(policy_logits, dim=-1)
                 if return_embedding:
@@ -218,34 +209,56 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                             pass
             else:
                 if not is_binned:
-                    await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Non-argmax requests are not supported for action_policy models; set orchestrator.argmax_only=true")
-                probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
-                probs_cpu = probs_all.to("cpu", non_blocking=False)
-                probs_list: list[list[list[float]]] = probs_cpu.tolist()
-                if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
-                    try:
-                        p1_first = [float(probs_list[0][h][-1]) for h in range(len(probs_list[0]))]
-                        vlog(f"[server] DEBUG p1 (bins) n_bins={len(probs_list[0][0])} p1[0]={p1_first} best={int(np.argmax(np.array(p1_first)))}")
-                    except Exception:
-                        pass
+                    # Support non-argmax for action_policy by returning per-move probabilities
+                    # encoded as 4 heads with a single-bin probability each. The Rust client
+                    # treats n_bins==1 as p1-only and can apply Softmax/TopP over heads.
+                    pol_cpu = policy_probs.to(dtype=torch.float32, device="cpu", non_blocking=False)
+                    probs_list: list[list[float]] = pol_cpu.tolist()  # shape (B,4)
+                    if os.environ.get("INFER_2048_DUMP_POLICY", "0") != "0":
+                        try:
+                            first = probs_list[0] if len(probs_list) > 0 else []
+                            vlog(f"[server] DEBUG policy (full) probs[0]={first}")
+                        except Exception:
+                            pass
 
-                if return_embedding:
-                    br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
-                    emb_dim = int(br_cpu.shape[1])
-                    embeddings_concat = br_cpu.numpy().tobytes()
+                    if return_embedding:
+                        br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
+                        emb_dim = int(br_cpu.shape[1])
+                        embeddings_concat = br_cpu.numpy().tobytes()
                     outputs = [
                         inference_pb2.Output(
-                            heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
+                            heads=[inference_pb2.HeadProbs(probs=[p]) for p in probs_list[i]]
                         )
                         for i in range(B)
                     ]
                 else:
-                    outputs = [
-                        inference_pb2.Output(
-                            heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
-                        )
-                        for i in range(B)
-                    ]
+                    probs_all = torch.stack(head_probs_t, dim=1)  # (B, 4, n_bins)
+                    probs_cpu = probs_all.to("cpu", non_blocking=False)
+                    probs_list: list[list[list[float]]] = probs_cpu.tolist()
+                    if os.environ.get("INFER_2048_DUMP_P1", "0") != "0":
+                        try:
+                            p1_first = [float(probs_list[0][h][-1]) for h in range(len(probs_list[0]))]
+                            vlog(f"[server] DEBUG p1 (bins) n_bins={len(probs_list[0][0])} p1[0]={p1_first} best={int(np.argmax(np.array(p1_first)))}")
+                        except Exception:
+                            pass
+
+                    if return_embedding:
+                        br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
+                        emb_dim = int(br_cpu.shape[1])
+                        embeddings_concat = br_cpu.numpy().tobytes()
+                        outputs = [
+                            inference_pb2.Output(
+                                heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
+                            )
+                            for i in range(B)
+                        ]
+                    else:
+                        outputs = [
+                            inference_pb2.Output(
+                                heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
+                            )
+                            for i in range(B)
+                        ]
             # Restore training state
             self.model.train(prev_mode)
             vlog("[server] response materialized")

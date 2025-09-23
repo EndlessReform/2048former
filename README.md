@@ -116,12 +116,12 @@ idxs = np.flatnonzero(mask)
 exps_buf, dirs, evs = a2.batch_from_steps(steps, idxs, parallel=True)
 exps = np.frombuffer(exps_buf, dtype=np.uint8).reshape(-1, 16)
 
-# EV encoding (branches)
-# - Order: Up=0, Down=1, Left=2, Right=3
+# EV encoding (branches, UDLR canonical)
+# - Order: Up=0, Down=1, Left=2, Right=3 (UDLR)
 # - ev_values are normalized to [0,1]; chosen branch is exactly 1.0
-# - ev_legal is a u8 bitmask (Up=1, Down=2, Left=4, Right=8)
+# - ev_legal is a u8 bitmask (UDLR: Up=1, Down=2, Left=4, Right=8)
 #   Illegal branches also store 0.0 in ev_values, so use the mask
-# Tip: expand mask to (N,4) and zero-out illegal entries
+# Tip: expand mask to (N,4) and zero-out illegal entries (UDLR)
 mask_bits = steps['ev_legal'][idxs]
 legal = np.stack([
     (mask_bits & 1) != 0,   # Up

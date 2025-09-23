@@ -7,11 +7,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-from train_2048.tokenization.base import (
-    remap_labels_urdl_to_udlr,
-    reorder_cols_urdl_to_udlr,
-    BoardCodec,
-)
+from train_2048.tokenization.base import BoardCodec
 from train_2048.dataloader.steps import make_collate_steps, make_collate_macroxue
 
 
@@ -28,35 +24,32 @@ def _mk_rows_basic(n: int = 4, *, include_move: bool = True) -> np.ndarray:
     dt: list[tuple[str, Any]] = [
         ("board", np.uint64),
         ("tile_65536_mask", np.uint16),
-        ("branch_evs", (np.float32, (4,))),  # URDL
-        ("ev_legal", np.uint8),  # URDL bits
+        ("branch_evs", (np.float32, (4,))),
+        ("ev_legal", np.uint8),
     ]
     if include_move:
-        dt.append(("move_dir", np.int64))  # URDL numeric 0..3
+        dt.append(("move_dir", np.int64))
     rows = np.zeros((n,), dtype=np.dtype(dt))
     # Simple boards: pack 16 zero exponents -> 0
     rows["board"] = 0
     rows["tile_65536_mask"] = 0
-    # Construct EVs and legality in URDL order
-    # Example: Up better than others to test reordering robustness
-    urdl = np.array([0.9, 0.2, 0.3, 0.4], dtype=np.float32)
-    rows["branch_evs"] = urdl
-    # Legal bits URDL: all legal (0b1111 = 15)
+    # Construct EVs and legality in UDLR order
+    udlr = np.array([0.9, 0.2, 0.3, 0.4], dtype=np.float32)
+    rows["branch_evs"] = udlr
+    # Legal bits UDLR: all legal (0b1111 = 15)
     rows["ev_legal"] = np.uint8(0xF)
     if include_move:
-        # move_dir URDL e.g. Right=1
-        rows["move_dir"] = 1
+        # move_dir UDLR e.g. Right=3
+        rows["move_dir"] = 3
     return rows
 
 
 def test_reorder_helpers() -> None:
-    labels = np.array([0, 1, 2, 3], dtype=np.int64)  # URDL
-    mapped = remap_labels_urdl_to_udlr(labels)
-    assert mapped.tolist() == [0, 3, 1, 2], "URDL→UDLR class remap incorrect"
-
-    cols = np.arange(8, dtype=np.int64).reshape(2, 4)  # URDL columns
-    reordered = reorder_cols_urdl_to_udlr(cols)
-    assert reordered.tolist() == [[0, 2, 3, 1], [4, 6, 7, 5]], "URDL→UDLR column reorder incorrect"
+    # UDLR is canonical; no reordering helper remains
+    labels = np.array([0, 1, 2, 3], dtype=np.int64)
+    assert labels.tolist() == [0, 1, 2, 3]
+    cols = np.arange(8, dtype=np.int64).reshape(2, 4)
+    assert cols.tolist() == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
 def test_board_codec() -> None:
@@ -77,16 +70,73 @@ def test_make_collate_steps_udlr_canonicalization() -> None:
     out = collate(np.array([0, 1, 2], dtype=np.int64))
     # tokens
     assert out["tokens"].shape == (3, 16)
-    # branch_values/mask are UDLR; original URDL [0.9,0.2,0.3,0.4] becomes [0.9,0.3,0.4,0.2]
+    # branch_values/mask are UDLR and unchanged
     evs = out["branch_values"].numpy()[0].tolist()
     mask = out["branch_mask"].numpy()[0].tolist()
-    assert evs == [0.9, 0.3, 0.4, 0.2], f"Expected UDLR values, got {evs}"
+    assert evs == [0.9, 0.2, 0.3, 0.4], f"Expected UDLR values, got {evs}"
     assert mask == [True, True, True, True], "Legal mask should be all True"
 
-    # Hard-move remap: move_dir=Right(1 URDL) -> class 3 in UDLR
+    # Hard-move labels are already UDLR
     collate_h = make_collate_steps("hard_move", ds, binner=None, ev_tokenizer=None)
     out_h = collate_h(np.array([0], dtype=np.int64))
     assert int(out_h["move_targets"][0].item()) == 3, "Expected Right→class 3 under UDLR"
+
+
+def test_legacy_steps_fields_equivalence() -> None:
+    """Legacy steps used 'ev_values' and 'move' fields; ensure equivalence.
+
+    Constructs two datasets for the same underlying rows:
+    - New style: branch_evs + move_dir (UDLR)
+    - Legacy style: ev_values + move (UDLR)
+    Collate outputs (branch_values, move_targets) must match.
+    """
+    # Common board/mask
+    N = 2
+    board = np.zeros((N,), dtype=np.uint64)
+    mask = np.zeros((N,), dtype=np.uint16)
+
+    # New style rows
+    dt_new = np.dtype([
+        ("board", np.uint64),
+        ("tile_65536_mask", np.uint16),
+        ("branch_evs", (np.float32, (4,))),
+        ("ev_legal", np.uint8),
+        ("move_dir", np.int64),
+    ])
+    rows_new = np.zeros((N,), dtype=dt_new)
+    rows_new["board"] = board
+    rows_new["tile_65536_mask"] = mask
+    rows_new["branch_evs"][0] = np.array([0.8, 0.7, 0.1, 0.2], dtype=np.float32)
+    rows_new["branch_evs"][1] = np.array([0.6, 0.3, 0.9, 0.1], dtype=np.float32)
+    rows_new["ev_legal"] = np.uint8(0xF)
+    rows_new["move_dir"] = np.array([0, 2], dtype=np.int64)  # Up, Left (UDLR)
+
+    # Legacy style rows (ev_values + move)
+    dt_legacy = np.dtype([
+        ("board", np.uint64),
+        ("tile_65536_mask", np.uint16),
+        ("ev_values", (np.float32, (4,))),
+        ("ev_legal", np.uint8),
+        ("move", np.int64),
+    ])
+    rows_legacy = np.zeros((N,), dtype=dt_legacy)
+    rows_legacy["board"] = board
+    rows_legacy["tile_65536_mask"] = mask
+    rows_legacy["ev_values"] = rows_new["branch_evs"]
+    rows_legacy["ev_legal"] = rows_new["ev_legal"]
+    rows_legacy["move"] = rows_new["move_dir"]
+
+    ds_new = _DummyDS(rows_new)
+    ds_legacy = _DummyDS(rows_legacy)
+
+    collate = make_collate_steps("hard_move", ds_new, binner=None, ev_tokenizer=None)
+    out_new = collate(np.array([0, 1], dtype=np.int64))
+    collate2 = make_collate_steps("hard_move", ds_legacy, binner=None, ev_tokenizer=None)
+    out_legacy = collate2(np.array([0, 1], dtype=np.int64))
+
+    assert torch.equal(out_new["move_targets"], out_legacy["move_targets"])  # exact match
+
+    # Argmax rail only: do not compare binned paths here
 
 
 def test_macroxue_collate_targets(tmp_path: Path) -> None:
@@ -114,12 +164,12 @@ def test_macroxue_collate_targets(tmp_path: Path) -> None:
     rows["board"] = 0
     rows["tile_65536_mask"] = 0
     rows["valuation_type"] = 0  # top_score
-    # URDL EVs -> Up best, others smaller
-    rows["branch_evs"][0] = np.array([1.0, 0.0, 0.5, 0.25], dtype=np.float32)
+    # UDLR EVs -> Up best, others smaller
+    rows["branch_evs"][0] = np.array([1.0, 0.5, 0.25, 0.0], dtype=np.float32)
     rows["ev_legal"][0] = np.uint8(0xF)
-    # One illegal branch: Right -> bit 1<<1 zeroed
+    # One illegal branch: Right -> bit 1<<3 zeroed
     rows["branch_evs"][1] = np.array([0.6, 0.4, 0.3, 0.2], dtype=np.float32)
-    rows["ev_legal"][1] = np.uint8(0xD)  # 1101b = U,D,L legal; Right illegal
+    rows["ev_legal"][1] = np.uint8(0x7)  # 0111b = U,D,L legal; Right illegal
 
     ds = _DummyDS(rows, dataset_dir=str(tmp_path))
     collate = make_collate_macroxue(ds, str(spec_path))
@@ -159,4 +209,3 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as td:
         test_macroxue_collate_targets(Path(td))
     print("All invariant tests passed.")
-

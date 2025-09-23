@@ -198,11 +198,10 @@ pub struct Orchestrator {
     /// If true, request argmax-only responses from the inference server.
     #[serde(default)]
     pub argmax_only: bool,
-    /// Order of heads in model output. Defaults to legacy [Up, Down, Left, Right].
+    /// Order of heads in model output (UDLR only; legacy options removed).
     #[serde(default)]
     pub head_order: Option<HeadOrder>,
-    /// Mapping from packed board nibbles to tokens. Defaults to LSB (modern packer & loaders).
-    /// Set to MSB for legacy checkpoints trained with the previous client mapping.
+    /// Mapping from packed board nibbles to tokens. Canonical is MSB-first.
     #[serde(default)]
     pub board_mapping: Option<BoardMapping>,
 }
@@ -280,17 +279,13 @@ impl Config {
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub enum HeadOrder {
-    /// Legacy engine order: [Up, Down, Left, Right]
+    /// Canonical engine order: [Up, Down, Left, Right]
     UDLR,
-    /// Macroxue dataset/training order: [Up, Right, Down, Left]
-    URDL,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 pub enum BoardMapping {
-    /// LSB-first nibble packing (nibble i -> cell i in row-major). Default.
-    LSB,
-    /// Legacy MSB-first nibble mapping used by some older clients/checkpoints.
+    /// Canonical MSB-first nibble packing (cell 0 -> bits 63..60).
     MSB,
 }
 
@@ -299,7 +294,7 @@ impl Orchestrator {
         self.head_order.clone().unwrap_or(HeadOrder::UDLR)
     }
     pub fn board_mapping_or_default(&self) -> BoardMapping {
-        self.board_mapping.clone().unwrap_or(BoardMapping::LSB)
+        self.board_mapping.clone().unwrap_or(BoardMapping::MSB)
     }
 }
 

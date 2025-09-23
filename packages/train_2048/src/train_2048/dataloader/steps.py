@@ -15,11 +15,7 @@ from .collate import (
 
 from ..binning import Binner
 from ..tokenization.macroxue import MacroxueTokenizerSpec
-from ..tokenization.base import (
-    BoardCodec,
-    remap_labels_urdl_to_udlr,
-    reorder_cols_urdl_to_udlr,
-)
+from ..tokenization.base import BoardCodec
 
 
 class StepsDataset(Dataset):

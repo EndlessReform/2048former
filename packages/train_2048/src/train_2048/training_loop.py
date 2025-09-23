@@ -187,8 +187,12 @@ def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: flo
         hl = metrics["head_losses"]
         payload.update({"train/loss_u": float(hl[0]), "train/loss_d": float(hl[1]), "train/loss_l": float(hl[2]), "train/loss_r": float(hl[3])})
     else:
+        # Hard target path (e.g., hard_move): log policy accuracy under both
+        # historical and explicit names for dashboards.
         if metrics.get("policy_acc") is not None:
-            payload["train/policy_acc"] = float(metrics["policy_acc"])
+            acc = float(metrics["policy_acc"])
+            payload["train/policy_acc"] = acc
+            payload["train/policy_accuracy"] = acc
         if metrics.get("policy_agree") is not None:
             payload["train/policy_agree"] = float(metrics["policy_agree"])  # type: ignore[arg-type]
     return payload
@@ -202,8 +206,12 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
         hl = metrics["head_losses"]
         payload.update({"val/loss_u": float(hl[0]), "val/loss_d": float(hl[1]), "val/loss_l": float(hl[2]), "val/loss_r": float(hl[3])})
     else:
+        # Hard target path (e.g., hard_move): log policy accuracy under both
+        # historical and explicit names for dashboards.
         if metrics.get("policy_acc") is not None:
-            payload["val/policy_acc"] = float(metrics["policy_acc"])
+            acc = float(metrics["policy_acc"])
+            payload["val/policy_acc"] = acc
+            payload["val/policy_accuracy"] = acc
         if metrics.get("policy_agree") is not None:
             payload["val/policy_agree"] = float(metrics["policy_agree"])  # type: ignore[arg-type]
     return payload

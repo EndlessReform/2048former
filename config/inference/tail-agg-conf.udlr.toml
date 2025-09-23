@@ -1,0 +1,44 @@
+num_seeds = 256
+max_retries = 1
+max_concurrent_games = 256
+
+[sampling]
+# Confidence-weighted tail aggregation over binned heads.
+# p1 is always the last bin; p2/p3 are next lower bins.
+strategy = "TailAggConf"
+conf_alpha = 0.30  # max p2 weight when margin ~ 0
+conf_beta = 12.0   # slope: larger -> faster decay as margin grows
+conf_gamma = 1.0   # curvature (1.0=rational)
+
+# Optional gates to restrict non-argmax to a move-window (disabled by default)
+# start_gate = 0
+# stop_gate = 64
+
+[orchestrator.connection]
+# One of uds_path or tcp_addr must be set for the Python server.
+uds_path = "/tmp/2048_infer.sock"
+# tcp_addr = "http://127.0.0.1:50051"
+
+[orchestrator]
+# Canonical head order is UDLR across data/train/infer.
+head_order = "UDLR"
+# Request full per-head distributions so the client can aggregate.
+argmax_only = false
+
+[orchestrator.batch]
+# Time-based flush interval for micro-batches (microseconds)
+flush_us = 500
+target_batch = 128
+max_batch = 256
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+
+# Optional: client-side batching metrics (JSONL)
+# metrics_file = "profiles/client-metrics.jsonl"
+# metrics_interval_s = 5.0
+
+# Optional: per-game results (JSONL)
+# [orchestrator.report]
+# results_file = "runs/results.jsonl"
+

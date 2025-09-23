@@ -8,23 +8,23 @@ project = "train-2048-hard-move"
 entity = ""
 run_name = ""
 tags = []
-mode = "online"                       # online | offline | disabled
-report_every = 50                      # log to W&B every N steps (>=1)
+mode = "online"                  # online | offline | disabled
+report_every = 50                # log to W&B every N steps (>=1)
 
 [target]
-mode = "hard_move"                     # single 4-way policy head
+mode = "hard_move" # single 4-way policy head
 
 [hyperparameters]
 learning_rate = 6e-4
 
 [hyperparameters.lr_schedule]
-name = "warmup-stable-decay"           # constant | warmup-stable-decay
+name = "warmup-stable-decay" # constant | warmup-stable-decay
 warmup_steps = 1500
 cooldown_pct = 0.1
 min_lr_ratio = 0.1
 
 [hyperparameters.optimizer]
-name = "adamw"                         # adamw | muon
+name = "adamw"      # adamw | muon
 weight_decay = 0.01
 beta1 = 0.9
 beta2 = 0.98
@@ -38,12 +38,12 @@ dropout_prob = 0.03
 attention_dropout_prob = 0.0
 
 [dataset]
-dataset_dir = "datasets/macroxue/d6_1b"
+dataset_dir = "datasets/macroxue/d6_1b_v2"
 mmap_mode = true
 num_steps = 50_000
 # Limit step range to reduce endgame oversampling
-step_index_min = 0
-step_index_max = 5000
+# step_index_min = 0
+# step_index_max = 5000
 
 # Keep validation small and frequent for sanity
 val_run_pct = 0.005

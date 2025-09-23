@@ -23,7 +23,7 @@ from core_2048.infer import forward_distributions
 
 
 def _pack_board_from_exponents(exps: np.ndarray) -> tuple[np.uint64, np.uint16]:
-    """Pack 16 4-bit exponents (uint8 0..15) into a u64, matching dataset packer."""
+    """Pack 16 4-bit exponents (uint8 0..15) into a u64 (MSB-first)."""
     assert exps.shape == (16,)
     acc = np.uint64(0)
     mask = np.uint16(0)
@@ -32,7 +32,8 @@ def _pack_board_from_exponents(exps: np.ndarray) -> tuple[np.uint64, np.uint16]:
         if vi >= 16:
             mask |= np.uint16(1 << i)
             vi = 15
-        acc |= (np.uint64(vi & 0xF) << np.uint64(4 * i))
+        shift = np.uint64((15 - i) * 4)
+        acc |= (np.uint64(vi & 0xF) << shift)
     return acc, mask
 
 
@@ -45,9 +46,9 @@ def test_e2e_macroxue(tmpdir: Path) -> None:
     exps = np.arange(16, dtype=np.uint8)
     board_u64, mask_u16 = _pack_board_from_exponents(exps)
 
-    # URDL legality bits: enable Up and Right only (bits 1<<0, 1<<1)
+    # UDLR legality bits: enable Up and Down only (bits 1<<0, 1<<1)
     ev_legal = np.uint8(1 | 2)
-    # Branch EVs aligned to URDL (floats in [0,1] to match our knots)
+    # Branch EVs aligned to UDLR (floats in [0,1] to match our knots)
     branch = np.array([0.9, 0.7, 0.3, 0.2], dtype=np.float32)
 
     # NumPy dtype matching crates/dataset-packer StepRow::dtype
@@ -108,7 +109,7 @@ def test_e2e_macroxue(tmpdir: Path) -> None:
     assert targets.shape == (1, 4)
     assert n_classes == len(spec.delta_edges) - 1 + 2
 
-    # Winner should be Up (index 0) with URDL and our EVs; Down/Left illegal
+    # Winner should be Up (index 0) with UDLR and our EVs; Down illegal only
     n_bins = len(spec.delta_edges) - 1
     ILLEGAL = n_bins
     WINNER = n_bins + 1

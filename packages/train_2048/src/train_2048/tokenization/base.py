@@ -6,34 +6,8 @@ import numpy as np
 import torch
 
 
-# Branch order for macroxue tokens: URDL (Up, Right, Down, Left)
-BRANCH_ORDER_URDL = (0, 1, 2, 3)
-# Canonical project order (requested): UDLR
-BRANCH_ORDER_UDLR = (0, 2, 3, 1)
-
-
-def remap_labels_urdl_to_udlr(labels: np.ndarray) -> np.ndarray:
-    """Map class labels in URDL order to UDLR order for hard_move.
-
-    Mapping: 0->0 (U), 1->3 (R), 2->1 (D), 3->2 (L)
-    """
-    perm = np.array([0, 3, 1, 2], dtype=np.int64)
-    if labels.size:
-        return perm[labels]
-    return labels
-
-
-def reorder_cols_urdl_to_udlr(arr: np.ndarray) -> np.ndarray:
-    """Reorder last-dimension columns from URDL to UDLR order.
-
-    Expects shape (..., 4). Returns a view when possible.
-    """
-    return arr[..., [0, 2, 3, 1]]
-
-
-def reorder_cols_urdl_to_udlr_t(arr: torch.Tensor) -> torch.Tensor:
-    """Torch variant of URDL→UDLR column reorder for (...,4) tensors."""
-    return arr.index_select(-1, torch.tensor([0, 2, 3, 1], device=arr.device))
+# Canonical branch order everywhere: UDLR (Up, Down, Left, Right)
+BRANCH_ORDER_UDLR = (0, 1, 2, 3)
 
 
 class BoardCodec:
@@ -41,11 +15,13 @@ class BoardCodec:
 
     @staticmethod
     def decode_packed_board_to_exps_u8(packed: np.ndarray, *, mask65536: Optional[np.ndarray] = None) -> np.ndarray:
+        # MSB-first nibble order: cell i = bits [63-4i .. 60-4i]
         arr = packed.astype(np.uint64, copy=False)
         n = int(arr.shape[0])
         out = np.empty((n, 16), dtype=np.uint8)
         for i in range(16):
-            out[:, i] = ((arr >> (4 * i)) & np.uint64(0xF)).astype(np.uint8, copy=False)
+            shift = (15 - i) * 4
+            out[:, i] = ((arr >> np.uint64(shift)) & np.uint64(0xF)).astype(np.uint8, copy=False)
         if mask65536 is not None:
             m = mask65536.astype(np.uint16, copy=False)
             for i in range(16):
@@ -55,7 +31,8 @@ class BoardCodec:
         return out
 
     @staticmethod
-    def legal_mask_from_bits_urdl(bits: np.ndarray) -> np.ndarray:
+    def legal_mask_from_bits_udlr(bits: np.ndarray) -> np.ndarray:
+        # UDLR bit order: Up=1, Down=2, Left=4, Right=8
         b = bits.astype(np.uint8, copy=False)
         return np.stack([(b & 1) != 0, (b & 2) != 0, (b & 4) != 0, (b & 8) != 0], axis=1)
 
@@ -68,11 +45,7 @@ class EVTokenizer(Protocol):
 
 
 __all__ = [
-    "BRANCH_ORDER_URDL",
     "BRANCH_ORDER_UDLR",
-    "remap_labels_urdl_to_udlr",
-    "reorder_cols_urdl_to_udlr",
-    "reorder_cols_urdl_to_udlr_t",
     "BoardCodec",
     "EVTokenizer",
 ]

@@ -10,8 +10,6 @@ from ..binning import Binner
 from ..tokenization.macroxue import MacroxueTokenizerSpec
 from ..tokenization.base import (
     BoardCodec,
-    remap_labels_urdl_to_udlr,
-    reorder_cols_urdl_to_udlr,
 )
 
 
@@ -23,8 +21,13 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
     spec = MacroxueTokenizerSpec.from_json(Path(tokenizer_path))
     knots = {vt: np.array(k) for vt, k in spec.ecdf_knots.items()}
     delta_edges = np.array(spec.delta_edges)
+    # Number of margin bins inferred from edges
     n_bins = len(delta_edges) - 1
-    illegal_token = n_bins
+    # Class layout (keep semantics consistent with v1 bins: worst -> best):
+    #   0                 : ILLEGAL
+    #   1 .. n_bins      : margin bins (worst .. best)
+    #   n_bins + 1       : WINNER (p1)
+    illegal_token = 0
     winner_token = n_bins + 1
 
     # Precompute valuation type mapping (dataset id -> spec index).
@@ -109,9 +112,8 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
             p[evs >= vt_knots[-1]] = 1.0
             percentiles[mask] = np.clip(p, 0.0, 1.0)
 
-        legal_mask = BoardCodec.legal_mask_from_bits_urdl(ev_legal)
-        branch_evs = reorder_cols_urdl_to_udlr(branch_evs)
-        legal_mask = reorder_cols_urdl_to_udlr(legal_mask)
+        # Dataset now stores UDLR, no reordering needed
+        legal_mask = BoardCodec.legal_mask_from_bits_udlr(ev_legal)
 
         percentiles = percentiles.astype(np.float32, copy=False)
         percentiles[~legal_mask] = -np.inf
@@ -121,15 +123,27 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
         deltas = np.clip(winner_percentiles - percentiles, 0, 1)
         margin_bins = np.searchsorted(delta_edges, deltas, side="right") - 1
         margin_bins = np.clip(margin_bins, 0, n_bins - 1)
+        # Reorder margin bins so that indices increase from worst->best.
+        # Original macroxue bins are 0=best .. n_bins-1=worst.
+        # Map to 1..n_bins with 1=worst .. n_bins=best to align with v1 semantics.
+        margin_bins_inv = (n_bins - 1) - margin_bins  # 0..n_bins-1 (worst..best)
+        class_bins = 1 + margin_bins_inv               # 1..n_bins
 
-        targets = margin_bins.astype(np.int64, copy=False)
+        targets = class_bins.astype(np.int64, copy=False)
+        # Mark illegal moves explicitly
         targets[~legal_mask] = illegal_token
+        # Assign winner token only for rows with at least one legal move
         rows = np.arange(len(idxs), dtype=np.int64)
-        targets[rows, winner_indices] = winner_token
+        any_legal = legal_mask.any(axis=1)
+        if np.any(any_legal):
+            r_sel = rows[any_legal]
+            w_sel = winner_indices[any_legal]
+            targets[r_sel, w_sel] = winner_token
 
         return {
             "tokens": tokens,
             "targets": torch.from_numpy(targets.copy()).long(),
+            # n_classes = margin bins + ILLEGAL + WINNER
             "n_classes": n_bins + 2,
         }
 
@@ -147,15 +161,16 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
         idxs = _np.asarray(batch_indices, dtype=_np.int64)
         batch = dataset.get_rows(idxs)
 
-        # Decode board exponents (macroxue packs as uint64 board + optional 65536 mask)
+        # Decode board exponents (dataset packs MSB-first into uint64 + optional 65536 mask)
         if 'board' not in batch.dtype.names:
             raise KeyError("'board' field is required in steps.npy")
         mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
+        # Always decode MSB-first packed boards, then apply 65536 mask
         from ..tokenization.base import BoardCodec as _BC
         exps_np = _BC.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
         tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
 
-        # Branch EVs and legal moves; dataset stores URDL, standardize to UDLR
+        # Branch EVs and legal moves are UDLR in the dataset
         # Support both new ('branch_evs') and old ('ev_values') field names
         if 'branch_evs' in batch.dtype.names:
             evs = batch['branch_evs'].astype(_np.float32, copy=False)
@@ -163,10 +178,7 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
             evs = batch['ev_values'].astype(_np.float32, copy=False)
         else:
             raise KeyError("'branch_evs' or 'ev_values' missing from steps.npy")
-        legal = BoardCodec.legal_mask_from_bits_urdl(batch['ev_legal']) if 'ev_legal' in batch.dtype.names else _np.isfinite(evs)
-        from ..tokenization.base import reorder_cols_urdl_to_udlr as _reorder
-        evs = _reorder(evs)
-        legal = _reorder(legal)
+        legal = BoardCodec.legal_mask_from_bits_udlr(batch['ev_legal']) if 'ev_legal' in batch.dtype.names else _np.isfinite(evs)
         branch_values = torch.from_numpy(evs.copy()).to(dtype=torch.float32)
         branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))
 
@@ -195,8 +207,6 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
                 dirs_arr = batch['move'].astype(_np.int64, copy=False)
             else:
                 raise KeyError("move_dir/move missing from steps.npy for hard_move target")
-            if dirs_arr.size:
-                dirs_arr = remap_labels_urdl_to_udlr(dirs_arr)
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
         return out
 

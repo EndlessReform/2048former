@@ -125,14 +125,13 @@ def _detect_head_type(init_dir: str) -> str:
 def _adjust_client_cfg_for_model(cfg: dict, head_type: str) -> dict:
     """Return a copy of cfg adjusted for the model's head_type.
 
-    - For action_policy: force orchestrator.argmax_only=True and head_order=UDLR.
+    - For action_policy: prefer head_order=UDLR; allow non-argmax sampling (server returns per-move probs as 4 single-bin heads).
     - For binned_ev: prefer head_order=UDLR if missing (matches training pipeline).
     """
     c = json.loads(json.dumps(cfg))  # deep copy
     orch = c.setdefault("orchestrator", {})
     if head_type == "action_policy":
-        orch["argmax_only"] = True
-        # Our policy head is trained in UDLR order
+        # Our policy head is trained in UDLR order; do not force argmax_only
         orch.setdefault("head_order", "UDLR")
     else:
         # Training dataloader standardizes to UDLR order
@@ -353,14 +352,13 @@ def probe_grpc_ready(target: str, timeout_s: float) -> None:
     fut.result(timeout=timeout_s)
 
 
-def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cudagraphs: bool, *, model_head_order: Optional[str] = None) -> subprocess.Popen:
+def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cudagraphs: bool) -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("INFER_2048_LOG", "0")
     if no_cudagraphs:
         env["INFER_2048_NO_CUDAGRAPHS"] = "1"
-    if model_head_order:
-        env["INFER_2048_MODEL_HEAD_ORDER"] = str(model_head_order).upper()
+    # UDLR canonical; no head-order env needed
     cmd = [
         "uv",
         "run",
@@ -538,14 +536,14 @@ def main() -> None:
 
     # Start server (once for all variants)
     # Propagate client's intended head order to server so outputs are normalized consistently.
-    head_order = str(base_cfg.get("orchestrator", {}).get("head_order", "UDLR")).upper()
+    head_order = "UDLR"
     srv = start_server(
         args.init,
         uds_norm or tcp_norm,
         args.device,
         args.compile_mode,
         args.no_cudagraphs,
-        model_head_order=head_order,
+        
     )
     try:
         # Wait for bind and readiness

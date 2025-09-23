@@ -1,13 +1,10 @@
-init_dir = "inits/v2/50m"
+init_dir = "inits/v2/50m_hard_target"
 checkpoint_dir = "checkpoints"
 seed = 42
 
-# TODO remove this
-# compile_enabled = false
-
 [wandb]
 enabled = true
-project = "train-2048-macroxue-32bin"
+project = "train-2048-macroxue-hardtarget"
 entity = ""
 run_name = ""
 tags = []
@@ -15,7 +12,9 @@ mode = "online"                       # online | offline | disabled
 report_every = 50                     # log to W&B every N steps (>=1)
 
 [target]
-mode = "macroxue_tokens"
+# TODO validate
+# mode = "macroxue_tokens"
+mode = "hard_move"
 
 [hyperparameters]
 learning_rate = 3e-4
@@ -43,8 +42,8 @@ dropout_prob = 0.05
 attention_dropout_prob = 0.0
 
 [dataset]
-dataset_dir = "datasets/macroxue/d6_1b"
-tokenizer_path = "out/tokenizer.json"
+dataset_dir = "datasets/macroxue/d6_1b_v2"
+# tokenizer_path = "out/tokenizer.json"
 mmap_mode = true
 num_steps = 500_000
 # num_epochs = 1
@@ -52,7 +51,7 @@ num_steps = 500_000
 val_split_seed = 42
 val_num_steps = 500
 
-val_every = 10_000
+val_every = 5_000
 
 [checkpoint]
 # Save every epoch (keep all). Epoch count is small.

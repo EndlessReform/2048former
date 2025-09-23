@@ -49,7 +49,8 @@ def _unpack_board_to_exps_u8(packed: np.ndarray, *, mask65536: Optional[np.ndarr
     n = int(arr.shape[0])
     out = np.empty((n, 16), dtype=np.uint8)
     for i in range(16):
-        out[:, i] = ((arr >> (4 * i)) & np.uint64(0xF)).astype(np.uint8, copy=False)
+        shift = (15 - i) * 4
+        out[:, i] = ((arr >> np.uint64(shift)) & np.uint64(0xF)).astype(np.uint8, copy=False)
     if mask65536 is not None:
         m = mask65536.astype(np.uint16, copy=False)
         for i in range(16):
