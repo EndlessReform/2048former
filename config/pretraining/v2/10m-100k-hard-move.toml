@@ -1,5 +1,5 @@
 # init_dir = "inits/v2/10m_hard_target"
-init_dir = "inits/v2/10m_ablations/narrow_n3_75"
+init_dir = "inits/v2/10m_ablations/narrow_n3_5"
 checkpoint_dir = "checkpoints"
 seed = 42
 
@@ -16,7 +16,9 @@ report_every = 50                # log to W&B every N steps (>=1)
 mode = "hard_move" # single 4-way policy head
 
 [hyperparameters]
+# learning_rate = 5e-4
 learning_rate = 6e-4
+grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay
@@ -32,6 +34,7 @@ beta2 = 0.98
 eps = 1e-8
 
 [batch]
+# batch_size = 768
 batch_size = 1024
 
 [dropout]
@@ -41,6 +44,7 @@ attention_dropout_prob = 0.0
 [dataset]
 dataset_dir = "datasets/macroxue/d6_1b_v2"
 mmap_mode = true
+# num_steps = 34_000
 num_steps = 50_000
 # Limit step range to reduce endgame oversampling
 # step_index_min = 0

@@ -54,7 +54,7 @@ class BinnedEV(Objective):
         optimizer.step()
 
         head_losses = [float(l.detach().item()) for l in per_head_losses]
-        return {"loss": float(loss.detach().item()), "head_losses": head_losses, "policy_acc": None, "policy_agree": None}
+        return {"loss": float(loss.detach().item()), "head_losses": head_losses, "policy_accuracy": None, "policy_agreement": None}
 
     @torch.no_grad()
     def evaluate(self, model: torch.nn.Module, dl_val: DataLoader, device: torch.device) -> Dict[str, float | list[float] | None]:
@@ -100,12 +100,11 @@ class BinnedEV(Objective):
             model.train()
 
         if n_batches == 0:
-            return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None, "policy_agree": None}
+            return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_accuracy": None, "policy_agreement": None}
 
         avg_loss = float(total_loss / n_batches)
         avg_heads = (total_heads / n_batches).tolist()
-        return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": None, "policy_agree": None}
+        return {"loss": avg_loss, "head_losses": avg_heads, "policy_accuracy": None, "policy_agreement": None}
 
 
 __all__ = ["BinnedEV"]
-

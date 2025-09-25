@@ -109,8 +109,8 @@ class MacroxueTokens(Objective):
         optimizer.step()
 
         head_losses = [float(l.detach().item()) for l in per_head_losses]
-        policy_agree = float((agree_sum / max(1, agree_cnt)).detach().item()) if agree_cnt > 0 else None
-        return {"loss": float(loss.detach().item()), "head_losses": head_losses, "policy_acc": None, "policy_agree": policy_agree}
+        policy_agreement = float((agree_sum / max(1, agree_cnt)).detach().item()) if agree_cnt > 0 else None
+        return {"loss": float(loss.detach().item()), "head_losses": head_losses, "policy_accuracy": None, "policy_agreement": policy_agreement}
 
     @torch.no_grad()
     def evaluate(
@@ -170,13 +170,12 @@ class MacroxueTokens(Objective):
             model.train()
 
         if n_batches == 0:
-            return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None, "policy_agree": None}
+            return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_accuracy": None, "policy_agreement": None}
 
         avg_loss = float(total_loss / n_batches)
         avg_heads = (total_heads / n_batches).tolist()
-        policy_agree = (agree_sum / agree_cnt) if (agree_cnt > 0) else None
-        return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": None, "policy_agree": policy_agree}
+        policy_agreement = (agree_sum / agree_cnt) if (agree_cnt > 0) else None
+        return {"loss": avg_loss, "head_losses": avg_heads, "policy_accuracy": None, "policy_agreement": policy_agreement}
 
 
 __all__ = ["MacroxueTokens"]
-

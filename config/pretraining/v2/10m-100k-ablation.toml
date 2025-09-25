@@ -19,6 +19,7 @@ mode = "macroxue_tokens"
 
 [hyperparameters]
 learning_rate = 6e-4
+grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay

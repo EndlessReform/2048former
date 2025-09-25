@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .config import TrainingConfig, load_encoder_from_init
+from .config import DropoutConfig, TrainingConfig, load_encoder_from_init
 from .dataloader import build_steps_dataloaders
 from .tokenization.ev_binning import EVBinnerTokenizer
 from .binning import BinningConfig
@@ -33,11 +33,15 @@ def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, t
         u, d, l, r = [float(x) for x in head_losses]
         base += f"  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}"
         if target_mode == "macroxue_tokens":
-            pa = metrics.get("policy_agree")
+            pa = metrics.get("policy_agreement")
+            if pa is None:
+                pa = metrics.get("policy_agree")
             if pa is not None:
                 base += f"  agree={float(pa) * 100:.1f}%"
     else:
-        acc = metrics.get("policy_acc")
+        acc = metrics.get("policy_accuracy")
+        if acc is None:
+            acc = metrics.get("policy_acc")
         if acc is not None:
             base += f"  policy_acc={float(acc):.3f}"
     base += f"  lr={lr:.2e}"
@@ -74,11 +78,39 @@ def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Op
     )
 
 
+def _apply_dropout_from_config(model: torch.nn.Module, dropout_cfg: DropoutConfig) -> None:
+    """Overwrite model dropout settings using the training config as source of truth."""
+
+    dropout_p = float(dropout_cfg.dropout_prob)
+    attn_dropout_p = float(dropout_cfg.attention_dropout_prob)
+
+    enc_cfg = getattr(model, "config", None)
+    if enc_cfg is not None:
+        enc_cfg.dropout_prob = dropout_p
+        enc_cfg.attention_dropout_prob = attn_dropout_p
+
+    for block in getattr(model, "blocks", []):
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            attn.attn_dropout_p = attn_dropout_p
+            resid_dropout = getattr(attn, "resid_dropout", None)
+            if resid_dropout is not None:
+                resid_dropout.p = dropout_p
+
+        mlp = getattr(block, "mlp", None)
+        if mlp is not None:
+            mlp_dropout = getattr(mlp, "dropout", None)
+            if mlp_dropout is not None:
+                mlp_dropout.p = dropout_p
+
+
 def init_model(cfg: TrainingConfig, device: torch.device, *, target_mode: str, dl_train: Optional[DataLoader]):
     model = load_encoder_from_init(cfg.init_dir)
+    _apply_dropout_from_config(model, cfg.dropout)
     model = model.to(device=(device if device.type != "cuda" else device), dtype=(torch.bfloat16 if device.type == "cuda" else None))
     objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
+    _apply_dropout_from_config(model, cfg.dropout)
     if getattr(cfg, "compile_enabled", True):
         model = torch.compile(model, mode="reduce-overhead")
     return model, objective
@@ -188,14 +220,12 @@ def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: flo
         hl = metrics["head_losses"]
         payload.update({"train/loss_u": float(hl[0]), "train/loss_d": float(hl[1]), "train/loss_l": float(hl[2]), "train/loss_r": float(hl[3])})
     else:
-        # Hard target path (e.g., hard_move): log policy accuracy under both
-        # historical and explicit names for dashboards.
-        if metrics.get("policy_acc") is not None:
-            acc = float(metrics["policy_acc"])
-            payload["train/policy_acc"] = acc
-            payload["train/policy_accuracy"] = acc
-        if metrics.get("policy_agree") is not None:
-            payload["train/policy_agree"] = float(metrics["policy_agree"])  # type: ignore[arg-type]
+        # Hard target path (e.g., hard_move): log canonical policy accuracy only.
+        acc = metrics.get("policy_accuracy")
+        if acc is None:
+            acc = metrics.get("policy_acc")
+        if acc is not None:
+            payload["train/policy_accuracy"] = float(acc)
     return payload
 
 
@@ -207,14 +237,12 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
         hl = metrics["head_losses"]
         payload.update({"val/loss_u": float(hl[0]), "val/loss_d": float(hl[1]), "val/loss_l": float(hl[2]), "val/loss_r": float(hl[3])})
     else:
-        # Hard target path (e.g., hard_move): log policy accuracy under both
-        # historical and explicit names for dashboards.
-        if metrics.get("policy_acc") is not None:
-            acc = float(metrics["policy_acc"])
-            payload["val/policy_acc"] = acc
-            payload["val/policy_accuracy"] = acc
-        if metrics.get("policy_agree") is not None:
-            payload["val/policy_agree"] = float(metrics["policy_agree"])  # type: ignore[arg-type]
+        # Hard target path (e.g., hard_move): log canonical policy accuracy only.
+        acc = metrics.get("policy_accuracy")
+        if acc is None:
+            acc = metrics.get("policy_acc")
+        if acc is not None:
+            payload["val/policy_accuracy"] = float(acc)
     return payload
 
 
@@ -285,12 +313,15 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                 batch = next(it)
             t1 = time.perf_counter()
             metrics = objective.train_step(model, batch, optimizer, device)
-            if metrics.get("policy_agree") is not None:
+            agreement = metrics.get("policy_agreement")
+            if agreement is None:
+                agreement = metrics.get("policy_agree")
+            if agreement is not None:
                 if not hasattr(run_training, "_pa_ema"):
-                    run_training._pa_ema = float(metrics["policy_agree"])  # type: ignore[attr-defined]
+                    run_training._pa_ema = float(agreement)  # type: ignore[attr-defined]
                 decay = 0.95
-                run_training._pa_ema = float(decay * run_training._pa_ema + (1 - decay) * float(metrics["policy_agree"]))  # type: ignore[attr-defined]
-                metrics["policy_agree"] = run_training._pa_ema  # type: ignore[attr-defined]
+                run_training._pa_ema = float(decay * run_training._pa_ema + (1 - decay) * float(agreement))  # type: ignore[attr-defined]
+                metrics["policy_agreement"] = run_training._pa_ema  # type: ignore[attr-defined]
             t2 = time.perf_counter()
             pbar.set_postfix_str(_format_postfix(metrics, lr_now, target_mode, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
             if wandb_run is not None and (global_step % wandb_report_every == 0):

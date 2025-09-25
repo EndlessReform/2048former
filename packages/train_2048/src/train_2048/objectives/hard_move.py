@@ -64,21 +64,21 @@ class HardMove(Objective):
         if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
             acc_mask = branch_mask[torch.arange(move_targets.size(0), device=device), move_targets]
             if bool(acc_mask.any()):
-                policy_acc = ((preds == move_targets) & acc_mask).float()[acc_mask].mean()
+                policy_accuracy = ((preds == move_targets) & acc_mask).float()[acc_mask].mean()
             else:
-                policy_acc = torch.zeros((), device=logits.device, dtype=torch.float32)
+                policy_accuracy = torch.zeros((), device=logits.device, dtype=torch.float32)
         else:
-            policy_acc = (preds == move_targets).float().mean()
+            policy_accuracy = (preds == move_targets).float().mean()
 
         probs = F.softmax(logits, dim=-1)
         p_t = probs[torch.arange(move_targets.size(0), device=device), move_targets]
         if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:
             if 'acc_mask' in locals() and bool(acc_mask.any()):
-                policy_agree = float(p_t[acc_mask].mean().detach().item())
+                policy_agreement = float(p_t[acc_mask].mean().detach().item())
             else:
-                policy_agree = None
+                policy_agreement = None
         else:
-            policy_agree = float(p_t.mean().detach().item())
+            policy_agreement = float(p_t.mean().detach().item())
 
         # Per-head decomposition of loss for logging
         head_losses: list[torch.Tensor] = []
@@ -92,8 +92,8 @@ class HardMove(Objective):
         return {
             "loss": float(loss.detach().item()),
             "head_losses": [float(x.detach().item()) for x in head_losses],
-            "policy_acc": float(policy_acc.detach().item()),
-            "policy_agree": policy_agree,
+            "policy_accuracy": float(policy_accuracy.detach().item()),
+            "policy_agreement": policy_agreement,
         }
 
     @torch.no_grad()
@@ -177,13 +177,13 @@ class HardMove(Objective):
             model.train()
 
         if n_batches == 0:
-            return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_acc": None, "policy_agree": None}
+            return {"loss": 0.0, "head_losses": [0.0, 0.0, 0.0, 0.0], "policy_accuracy": None, "policy_agreement": None}
 
         avg_loss = float(total_loss / n_batches)
         avg_heads = (total_heads / n_batches).tolist()
-        policy_acc = float(total_correct / total_examples) if total_examples > 0 else None
-        policy_agree = (agree_sum / agree_cnt) if (agree_cnt > 0) else None
-        return {"loss": avg_loss, "head_losses": avg_heads, "policy_acc": policy_acc, "policy_agree": policy_agree}
+        policy_accuracy = float(total_correct / total_examples) if total_examples > 0 else None
+        policy_agreement = (agree_sum / agree_cnt) if (agree_cnt > 0) else None
+        return {"loss": avg_loss, "head_losses": avg_heads, "policy_accuracy": policy_accuracy, "policy_agreement": policy_agreement}
 
 
 __all__ = ["HardMove"]

@@ -14,6 +14,8 @@ report_every = 10       # log to W&B every N steps (>=1)
 [hyperparameters]
 learning_rate = 4e-4
 muon_lr = 2e-2
+# Clip global gradient norm each step (None to disable)
+grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay

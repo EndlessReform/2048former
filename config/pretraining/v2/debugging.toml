@@ -16,6 +16,7 @@ mode = "hard_move" # single 4-way policy head
 
 [hyperparameters]
 learning_rate = 6e-4
+grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
 name = "warmup-stable-decay" # constant | warmup-stable-decay
