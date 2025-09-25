@@ -69,6 +69,23 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         self._dump_done = False
         # Canonical branch/head order is UDLR everywhere. No per-model reordering.
 
+    def _ensure_pinned_tokens(self, batch: int) -> torch.Tensor:
+        cap = 0 if self._tokens_cpu is None else int(self._tokens_cpu.shape[0])
+        if self._tokens_cpu is None or cap < batch:
+            new_cap = max(1, cap)
+            while new_cap < batch:
+                new_cap *= 2
+            self._tokens_cpu = torch.empty((new_cap, 16), dtype=torch.uint8, pin_memory=True)
+        assert self._tokens_cpu is not None
+        return self._tokens_cpu[:batch]
+
+    @staticmethod
+    def _tokens_from_bytes_mps(boards_bytes: bytes, batch: int, device: torch.device) -> torch.Tensor:
+        # Create a tensor view directly over the request bytes to avoid redundant host copies.
+        raw = torch.frombuffer(memoryview(boards_bytes), dtype=torch.uint8)
+        boards = raw.as_strided((batch, 16), (16, 1))
+        return boards.to(device=device, dtype=torch.long)
+
     async def Infer(self, request, context):  # type: ignore[override]
         t0 = time.perf_counter()
         items = request.items
@@ -105,23 +122,26 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                     grpc.StatusCode.INVALID_ARGUMENT,
                     f"Invalid boards buffer length {np_view.size}, expected {B*16}",
                 )
+            try:
+                model_device = next(self.model.parameters()).device
+            except StopIteration:
+                model_device = torch.device("cpu")
+            model_device = torch.device(model_device)
 
-            # Ensure reusable pinned host buffer has sufficient capacity
-            cap = 0 if self._tokens_cpu is None else int(self._tokens_cpu.shape[0])
-            if self._tokens_cpu is None or cap < B:
-                new_cap = max(1, cap)
-                while new_cap < B:
-                    new_cap *= 2
-                self._tokens_cpu = torch.empty((new_cap, 16), dtype=torch.uint8, pin_memory=True)
+            if model_device.type == "mps":
+                tokens = self._tokens_from_bytes_mps(boards_bytes, B, model_device)
+                vlog("[server] tokens staged (mps direct) and moved to device")
+            else:
+                # Ensure reusable pinned host buffer has sufficient capacity
+                tokens_cpu = self._ensure_pinned_tokens(B)
 
-            # Copy NumPy view into pinned buffer (NumPy -> pinned Tensor via ndarray view),
-            # then async H2D to device with cast to long. Avoid torch.from_numpy on a
-            # non-writable view to prevent warnings and undefined behavior.
-            dst_np = self._tokens_cpu[:B].numpy()  # writable ndarray sharing pinned memory
-            dst_np[...] = np_view  # memcpy from read-only view into pinned buffer
-            model_device = next(self.model.parameters()).device
-            tokens = self._tokens_cpu[:B].to(device=model_device, dtype=torch.long, non_blocking=True)
-            vlog("[server] tokens staged (pinned) and moved to device")
+                # Copy NumPy view into pinned buffer (NumPy -> pinned Tensor via ndarray view),
+                # then async H2D to device with cast to long. Avoid torch.from_numpy on a
+                # non-writable view to prevent warnings and undefined behavior.
+                dst_np = tokens_cpu.numpy()  # writable ndarray sharing pinned memory
+                dst_np[...] = np_view  # memcpy from read-only view into pinned buffer
+                tokens = tokens_cpu.to(device=model_device, dtype=torch.long, non_blocking=True)
+                vlog("[server] tokens staged (pinned) and moved to device")
 
             # Optional: dump the first batch's input tokens (exponents) exactly once
             if (self._dump_tokens_path or self._dump_logits_path) and not self._dump_done:

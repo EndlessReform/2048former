@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from threading import Thread
 
 try:
     import tomllib  # py3.11+
@@ -27,6 +28,14 @@ class RunPaths:
     results_file: Path
     metrics_file: Path
     meta_file: Path
+    server_stderr: Path
+
+
+@dataclass
+class ServerHandle:
+    proc: subprocess.Popen
+    stderr_log: Optional[Path] = None
+    stderr_thread: Optional[Thread] = None
 
 
 def now_ts() -> str:
@@ -42,6 +51,7 @@ def ensure_outdir(outdir: Optional[str]) -> RunPaths:
         results_file=base / "results.jsonl",
         metrics_file=base / "client-metrics.jsonl",
         meta_file=base / "run_meta.json",
+        server_stderr=base / "server-stderr.log",
     )
 
 
@@ -352,7 +362,30 @@ def probe_grpc_ready(target: str, timeout_s: float) -> None:
     fut.result(timeout=timeout_s)
 
 
-def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cudagraphs: bool) -> subprocess.Popen:
+def _start_stderr_tee(proc: subprocess.Popen, log_path: Path) -> Thread:
+    def _pump() -> None:
+        assert proc.stderr is not None
+        with log_path.open("w", encoding="utf-8") as fp:
+            for chunk in proc.stderr:
+                fp.write(chunk)
+                fp.flush()
+                sys.stderr.write(chunk)
+                sys.stderr.flush()
+
+    thread = Thread(target=_pump, daemon=True)
+    thread.start()
+    return thread
+
+
+def start_server(
+    init_dir: str,
+    bind: str,
+    device: str,
+    compile_mode: str,
+    no_cudagraphs: bool,
+    *,
+    stderr_log: Optional[Path] = None,
+) -> ServerHandle:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("INFER_2048_LOG", "0")
@@ -378,16 +411,25 @@ def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cu
         cmd += ["--uds", "unix:" + bind]
     # Only surface stderr to the console; discard stdout to avoid clutter.
     devnull = subprocess.DEVNULL
-    popen_kwargs: dict = {"stdout": devnull, "stderr": None, "env": env}
+    popen_kwargs: dict = {"stdout": devnull, "env": env}
+    if stderr_log:
+        popen_kwargs.update({"stderr": subprocess.PIPE, "text": True, "bufsize": 1})
+    else:
+        popen_kwargs.update({"stderr": None})
     # Start server in its own process group so we can reliably terminate the whole tree.
     if os.name == "posix":  # Linux/macOS
         popen_kwargs["preexec_fn"] = os.setsid  # type: ignore[assignment]
     elif os.name == "nt":  # Windows
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    return subprocess.Popen(cmd, **popen_kwargs)
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    thread: Optional[Thread] = None
+    if stderr_log:
+        thread = _start_stderr_tee(proc, stderr_log)
+    return ServerHandle(proc=proc, stderr_log=stderr_log, stderr_thread=thread)
 
 
-def terminate_server(proc: subprocess.Popen, uds_norm: Optional[str], timeout: float = 5.0) -> None:
+def terminate_server(handle: ServerHandle, uds_norm: Optional[str], timeout: float = 5.0) -> None:
+    proc = handle.proc
     try:
         if proc.poll() is not None:
             return
@@ -421,6 +463,8 @@ def terminate_server(proc: subprocess.Popen, uds_norm: Optional[str], timeout: f
                     proc.kill()
                 _ = proc.wait(timeout=timeout)
     finally:
+        if handle.stderr_thread is not None:
+            handle.stderr_thread.join(timeout=1.0)
         # Cleanup UDS path if provided
         if uds_norm:
             sock_path = uds_norm[5:] if uds_norm.startswith("unix:") else uds_norm
@@ -503,23 +547,25 @@ def main() -> None:
     base_cfg = read_toml(Path(args.config))
     variants = _sampling_grid_variants(base_cfg)
 
+    server_device = args.device.strip()
+
     # If no grid present, behave like before with a single config.
     single_cfg = None
     if len(variants) == 1 and variants[0][0] == "base":
         client_cfg = make_client_cfg(Path(args.config), rp, uds=uds_norm[5:] if uds_norm else None, tcp=tcp_norm, init_dir=args.init)
         single_cfg = client_cfg
         print(f"[bench] output dir: {rp.outdir}")
-        print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
+        print(f"[bench] server: device={server_device} compile={args.compile_mode} bind={bind}")
         print(f"[bench] client config: {client_cfg}")
     else:
         print(f"[bench] output dir: {rp.outdir}  (grid {len(variants)} variants)")
-        print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
+        print(f"[bench] server: device={server_device} compile={args.compile_mode} bind={bind}")
 
     # Persist run metadata for provenance
     meta = {
         "ts": now_ts(),
         "init_dir": str(Path(args.init).resolve()),
-        "device": args.device,
+        "device": server_device,
         "compile_mode": args.compile_mode,
         "bind": str(bind),
         "uds": uds_norm,
@@ -530,6 +576,7 @@ def main() -> None:
         "results_file": str(rp.results_file),
         "metrics_file": str(rp.metrics_file),
         "client_cfg": str(rp.client_cfg),
+        "server_stderr": str(rp.server_stderr),
     }
     with rp.meta_file.open("w", encoding="utf-8") as fp:
         json.dump(meta, fp, indent=2)
@@ -540,14 +587,14 @@ def main() -> None:
     srv = start_server(
         args.init,
         uds_norm or tcp_norm,
-        args.device,
+        server_device,
         args.compile_mode,
         args.no_cudagraphs,
-        
+        stderr_log=rp.server_stderr,
     )
     try:
         # Wait for bind and readiness
-        wait_for_socket(uds_norm, srv.pid, args.timeout)
+        wait_for_socket(uds_norm, srv.proc.pid, args.timeout)
         probe_grpc_ready(uds_norm or tcp_norm, args.timeout)
         if single_cfg is not None:
             # Single run
@@ -580,6 +627,15 @@ def main() -> None:
             _write_grid_csv_summary(rp.outdir, grid_rows)
     finally:
         terminate_server(srv, uds_norm, timeout=5.0)
+
+    server_rc = srv.proc.returncode
+    if server_rc not in (0, None):
+        print(
+            f"[bench] server exited with code {server_rc}; see {rp.server_stderr} for details",
+            file=sys.stderr,
+        )
+    elif rp.server_stderr.exists() and rp.server_stderr.stat().st_size > 0:
+        print(f"[bench] server stderr captured at {rp.server_stderr}")
 
     if not args.no_summary:
         if single_cfg is not None:
