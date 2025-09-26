@@ -22,6 +22,7 @@ from .checkpointing import (
     maybe_save_best,
     dangerous_dump_pt,
     maybe_resume_optimizer_from_init,
+    maybe_save_pt_interval,
 )
 
 
@@ -167,25 +168,41 @@ def make_scheduler(cfg: TrainingConfig, optimizer: torch.optim.Optimizer, total_
     lr_cfg = cfg.hyperparameters.lr_schedule
     base_lrs = [pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups]
 
-    def _compute_decay_steps(total: int) -> int:
-        if lr_cfg.name != "warmup-stable-decay":
-            return 0
-        if getattr(lr_cfg, "cooldown_pct", None):
-            return int(math.ceil(total * float(lr_cfg.cooldown_pct)))
-        return int(lr_cfg.decay_steps or 0)
-
+    total_steps = max(total_steps, 0)
     warmup_steps = int(lr_cfg.warmup_steps or 0)
-    warmup_steps = max(0, min(warmup_steps, max(total_steps, 0)))
-    decay_steps = _compute_decay_steps(total_steps)
-    decay_steps = max(0, min(decay_steps, max(total_steps - warmup_steps, 0)))
-    stable_steps = max(0, total_steps - warmup_steps - decay_steps)
-    decay_start_step = warmup_steps + stable_steps
+    warmup_steps = max(0, min(warmup_steps, total_steps if total_steps > 0 else warmup_steps))
+
+    decay_steps = 0
+    stable_steps = 0
+    decay_start_step = warmup_steps
+
+    if lr_cfg.name == "warmup-stable-decay":
+        if getattr(lr_cfg, "cooldown_pct", None):
+            decay_steps = int(math.ceil(total_steps * float(lr_cfg.cooldown_pct))) if total_steps > 0 else int(lr_cfg.decay_steps or 0)
+        else:
+            decay_steps = int(lr_cfg.decay_steps or 0)
+        decay_steps = max(0, min(decay_steps, max(total_steps - warmup_steps, 0)))
+        stable_steps = max(0, total_steps - warmup_steps - decay_steps)
+        decay_start_step = warmup_steps + stable_steps
+    elif lr_cfg.name == "cosine":
+        decay_steps = max(0, total_steps - warmup_steps)
+        decay_start_step = warmup_steps  # cosine begins immediately after warmup
 
     def scale_for_step(step_idx: int) -> float:
         if lr_cfg.name == "constant" or total_steps <= 0:
             return 1.0
         if warmup_steps > 0 and step_idx < warmup_steps:
             return float(step_idx + 1) / float(warmup_steps)
+        if lr_cfg.name == "cosine":
+            if decay_steps <= 0:
+                return 1.0
+            progress = max(0, min(step_idx - warmup_steps, decay_steps))
+            if decay_steps == 0:
+                return lr_cfg.min_lr_ratio
+            frac = float(progress) / float(decay_steps)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * frac))
+            return lr_cfg.min_lr_ratio + (1.0 - lr_cfg.min_lr_ratio) * cosine
+        # warmup-stable-decay path
         if step_idx < (warmup_steps + stable_steps):
             return 1.0
         if decay_steps <= 0:
@@ -328,7 +345,8 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                 _wandb_log(_build_train_payload(metrics, lr_now, target_mode, epoch=(None if fixed_steps > 0 else epoch), dt_data_ms=(t1 - t0) * 1e3, dt_comp_ms=(t2 - t1) * 1e3), step=global_step)
             _maybe_log_val(objective, model, dl_val, device, cfg=cfg, target_mode=target_mode, step=global_step, wandb_run=wandb_run, epoch=(None if fixed_steps > 0 else epoch))
             global_step += 1
-            maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=(None if fixed_steps > 0 else epoch), best_tracker=best_tracker, wandb_run=wandb_run)
+            maybe_save_pt_interval(model=model, run_dir=run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, step=global_step, interval=getattr(cfg.checkpoint, "save_pt_every_steps", None))
+            maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=(None if fixed_steps > 0 else epoch), best_tracker=best_tracker, optimizer=optimizer, training_cfg=cfg, wandb_run=wandb_run)
             if fixed_steps == 0:
                 dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step)
         if fixed_steps == 0 and getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):

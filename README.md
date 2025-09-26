@@ -175,3 +175,14 @@ Config changes
 - Use `dataset_dir` instead of `packfile`.
 - Validation uses disjoint runs via percentage (`val_run_pct`) or explicit SQL (`val_run_sql`).
 - See `config/config.example.toml` and `config/long-ctxt-sft.toml` for templates.
+
+Training
+--------
+
+- Install deps once via `uv sync`, then train with `uv run python main.py --config config/config.example.toml` (override `--device` as needed).
+- To resume from a previous run, point `init_dir` at either the original init folder or a saved `.pt` bundle (for example `init_dir = "checkpoints/20240901_120000/model-stable.pt"`).
+- When a `.pt` bundle is used, the encoder weights, optimizer state, and `global_step` are restored automatically before training continues.
+- Checkpoints are still written into the `checkpoint_dir` from the active config, so update it if you want the resumed run to land in a new folder.
+- `[checkpoint].save_pt_every_steps` dumps numbered `model-step-XXXXXXXX.pt` bundles that include optimizer state for straight resumes.
+- Validation best checkpoints now write `model-best.pt` bundles; convert to safetensors for inference with `uv run python bin/pt_to_safetensors.py <path/to/model-best.pt> --write-config`.
+- Learning rate schedulers support `constant`, `warmup-stable-decay`, or `cosine` (with optional warmup).

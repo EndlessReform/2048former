@@ -147,7 +147,7 @@ class WandbConfig(BaseModel):
 
 
 class LRScheduleConfig(BaseModel):
-    name: Literal["constant", "warmup-stable-decay"] = "constant"
+    name: Literal["constant", "warmup-stable-decay", "cosine"] = "constant"
     # Only used for warmup-stable-decay
     warmup_steps: int = 0
     decay_steps: int = 0
@@ -240,12 +240,21 @@ class CheckpointConfig(BaseModel):
     save_best_every_steps: Optional[int] = None
     # Minimum improvement required to update the best
     best_min_delta: float = 0.0
+    # Persist a full .pt bundle every N steps (includes optimizer/global_step)
+    save_pt_every_steps: Optional[int] = None
 
     @field_validator("every_epochs", "save_best_every_steps")
     @classmethod
     def _non_negative_or_none(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
             raise ValueError("checkpoint intervals must be > 0 when provided")
+        return v
+
+    @field_validator("save_pt_every_steps")
+    @classmethod
+    def _pt_interval_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("save_pt_every_steps must be > 0 when provided")
         return v
 
     @field_validator("best_min_delta")
@@ -258,7 +267,7 @@ class CheckpointConfig(BaseModel):
 
 class TrainingConfig(BaseModel):
     # IO
-    init_dir: str
+    init_dir: str  # directory with config/weights or path to a .pt bundle
     checkpoint_dir: str
 
     # Sections

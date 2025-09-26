@@ -1,4 +1,4 @@
-init_dir = "inits/v1_10m"
+init_dir = "inits/v1_10m"      # Directory with config & weights or a checkpoint .pt file
 checkpoint_dir = "checkpoints"
 seed = 0
 
@@ -18,7 +18,7 @@ muon_lr = 2e-2
 grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
-name = "warmup-stable-decay" # constant | warmup-stable-decay
+name = "warmup-stable-decay" # constant | warmup-stable-decay | cosine
 warmup_steps = 1000
 # decay_steps = 0
 # Alternatively, specify a percentage of total steps for cooldown/decay
@@ -72,3 +72,9 @@ val_split_seed = 42
 
 # Validate every N training steps (0 disables)
 val_every = 1000
+
+[checkpoint]
+# every_epochs = 1
+# save_best_every_steps = 1000
+# best_min_delta = 0.0
+# save_pt_every_steps = 5000    # Persist model-step-XXXXXXXX.pt bundles for resume

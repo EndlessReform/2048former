@@ -12,16 +12,41 @@ from safetensors.torch import save_file as safe_save_file
 from .config import normalize_state_dict_keys
 
 
+def save_pt_bundle(
+    path: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    training_cfg: Optional[object],
+    global_step: Optional[int],
+) -> Path:
+    """Persist a torch ``.pt`` bundle with weights, optimizer state, and metadata."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "global_step": (int(global_step) if global_step is not None else None),
+        "model": normalize_state_dict_keys(model.state_dict()),
+        "optimizer": (optimizer.state_dict() if optimizer is not None else None),
+        "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
+        "training_config": training_cfg.model_dump() if training_cfg is not None and hasattr(training_cfg, "model_dump") else None,
+    }
+    torch.save(payload, str(path))
+    return path
+
+
 def maybe_resume_optimizer_from_init(init_dir: str, optimizer: torch.optim.Optimizer) -> Optional[int]:
-    """If an init folder contains a PT bundle, load optimizer state.
+    """If an init folder or checkpoint bundle contains a PT payload, load state.
 
     Returns the saved global_step when available, else None. Safe no-op on failure.
     """
     init_path = Path(init_dir)
-    pt_candidates = [
-        init_path / "model-stable.pt",
-        init_path / "model.pt",
-    ]
+    if init_path.is_file():
+        pt_candidates = [init_path]
+    else:
+        pt_candidates = [
+            init_path / "model-stable.pt",
+            init_path / "model.pt",
+        ]
     for pt in pt_candidates:
         if pt.is_file():
             try:
@@ -73,7 +98,14 @@ def save_safetensors(model: torch.nn.Module, path: Path) -> Path:
     return path
 
 
-def _save_stable_bundle(run_dir: Path, *, model: torch.nn.Module, optimizer: Optional[torch.optim.Optimizer], training_cfg: Optional[object], global_step: Optional[int]) -> None:
+def _save_stable_bundle(
+    run_dir: Path,
+    *,
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    training_cfg: Optional[object],
+    global_step: Optional[int],
+) -> None:
     """Write both safetensors and a .pt bundle for stable checkpoint.
 
     The .pt includes optimizer state to support resumption (e.g., WSD/Muon/AdamW).
@@ -82,14 +114,13 @@ def _save_stable_bundle(run_dir: Path, *, model: torch.nn.Module, optimizer: Opt
     save_safetensors(model, run_dir / "model-stable.safetensors")
     # PT bundle with optimizer + configs for easy resume
     try:
-        payload = {
-            "global_step": (int(global_step) if global_step is not None else None),
-            "model": normalize_state_dict_keys(model.state_dict()),
-            "optimizer": (optimizer.state_dict() if optimizer is not None else None),
-            "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
-            "training_config": (training_cfg.model_dump() if training_cfg is not None else None),
-        }
-        torch.save(payload, str(run_dir / "model-stable.pt"))
+        save_pt_bundle(
+            run_dir / "model-stable.pt",
+            model=model,
+            optimizer=optimizer,
+            training_cfg=training_cfg,
+            global_step=global_step,
+        )
     except Exception:
         pass
 
@@ -125,6 +156,8 @@ def maybe_save_best(
     step: int,
     epoch: Optional[int],
     best_tracker: Dict[str, float],
+    optimizer: Optional[torch.optim.Optimizer],
+    training_cfg: Optional[object],
     wandb_run: Optional[object] = None,
 ):
     if cfg_checkpoint is None or cfg_checkpoint.save_best_every_steps is None or dl_val is None:
@@ -138,7 +171,18 @@ def maybe_save_best(
     val_loss = float(val_metrics["loss"])
     if val_loss + float(cfg_checkpoint.best_min_delta) < best_tracker.get("best_val_loss", float("inf")):
         best_tracker["best_val_loss"] = val_loss
-        save_safetensors(model, run_dir / "model-best.safetensors")
+        try:
+            save_pt_bundle(
+                run_dir / "model-best.pt",
+                model=model,
+                optimizer=optimizer,
+                training_cfg=training_cfg,
+                global_step=step,
+            )
+        except Exception as e:
+            print(f"[ckpt] Failed to write best checkpoint at step {step}: {e}")
+        else:
+            print(f"[ckpt] Saved new best checkpoint at step {step}: {run_dir / 'model-best.pt'}")
         if wandb_run is not None:
             try:
                 import wandb  # type: ignore
@@ -169,12 +213,35 @@ def dangerous_dump_pt(*, cfg, run_dir: Path, model: torch.nn.Module, optimizer: 
             print(f"[ckpt] Failed to write dangerous pt checkpoint at step {step}: {e}")
 
 
+def maybe_save_pt_interval(
+    *,
+    model: torch.nn.Module,
+    run_dir: Path,
+    optimizer: Optional[torch.optim.Optimizer],
+    training_cfg: Optional[object],
+    step: int,
+    interval: Optional[int],
+) -> None:
+    if interval is None or interval <= 0:
+        return
+    if step <= 0 or (step % interval) != 0:
+        return
+    path = run_dir / f"model-step-{step:08d}.pt"
+    try:
+        save_pt_bundle(path, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=step)
+        print(f"[ckpt] Saved step checkpoint: {path}")
+    except Exception as e:
+        print(f"[ckpt] Failed to write step checkpoint at step {step}: {e}")
+
+
 __all__ = [
     "create_run_dir",
     "dump_training_and_model_config",
     "save_safetensors",
+    "save_pt_bundle",
     "maybe_save_stable",
     "maybe_save_best",
     "dangerous_dump_pt",
     "maybe_resume_optimizer_from_init",
+    "maybe_save_pt_interval",
 ]
