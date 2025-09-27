@@ -1,0 +1,70 @@
+num_seeds = 32
+max_retries = 1
+max_concurrent_games = 32
+
+[sampling]
+# strategy = "Argmax"
+
+## Alternative strategies:
+# Softmax over p1 across heads
+# strategy = "Softmax"
+# temperature = 0.25
+
+# Nucleus (top-p) with top-k cap (default k=2) over heads (uses p1 as score)
+# strategy = "TopPTopK"
+# top_p = 0.80
+# top_k = 2
+# temperature = 0.25
+
+# Tail aggregation: score = p1 + alpha_p2 * p2 + beta_p3 * p3
+# p1=exact-1 bin, p2=second-to-last bin, p3=third-to-last bin.
+# strategy = "TailAgg"
+# alpha_p2 = 0.25
+# beta_p3 = 0.025
+
+# Advanced tail aggregation (takes precedence over alpha/beta if set):
+#tail_bins = 4    # number of extra bins to include below p1
+#tail_decay = 0.2 # weight decay per bin: p2 weight=1.0, p3=0.5, p4=0.25, ...
+
+# Optional: gates for when to apply non-argmax sampling
+# Only relevant if strategy != "Argmax". Outside the window, fall back to argmax.
+# start_gate = 9000 # default: 0 (enable from the first move)
+# stop_gate = 64   # default: unset (never stop)
+
+## Alternative: Tail aggregation with confidence-based p2 weighting (margin-based)
+strategy = "TailAggConf"
+conf_alpha = 0.34        # max p2 weight when margin (p1-p2) is near zero
+conf_beta = 12.0         # slope: larger -> faster decay of p2 weight as margin grows
+conf_gamma = 1.0         # curvature of decay (1.0=rational, >1 steeper, <1 flatter)
+
+[orchestrator.connection]
+# One of uds_path or tcp_addr must be set for the Python server.
+uds_path = "/tmp/2048_infer.sock"
+# tcp_addr = "http://127.0.0.1:50051"
+
+[orchestrator]
+# Head order mapping for model heads → moves.
+# Training/data loaders in this repo standardize to UDLR (Up, Down, Left, Right).
+# Canonical head order is UDLR; legacy options removed.
+head_order = "UDLR"
+# For binned_ev models, request full per-head distributions so the client can
+# apply legality-aware selection. For action_policy models, the bench launcher
+# will force argmax_only=true automatically.
+argmax_only = false
+
+[orchestrator.batch]
+# Time-based flush interval for micro-batches (microseconds)
+flush_us = 500
+target_batch = 32
+max_batch = 128
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+
+# Optional: client-side batching metrics (JSONL)
+# metrics_file = "profiles/client-metrics.jsonl"
+# metrics_interval_s = 5.0
+
+# Optional: per-game results (JSONL)
+# [orchestrator.report]
+# results_file = "runs/results.jsonl"

@@ -42,6 +42,16 @@ strategy = "Argmax"
 uds_path = "/tmp/2048_infer.sock"
 # tcp_addr = "http://127.0.0.1:50051"
 
+[orchestrator]
+# Head order mapping for model heads → moves.
+# Training/data loaders in this repo standardize to UDLR (Up, Down, Left, Right).
+# Canonical head order is UDLR; legacy options removed.
+head_order = "UDLR"
+# For binned_ev models, request full per-head distributions so the client can
+# apply legality-aware selection. For action_policy models, the bench launcher
+# will force argmax_only=true automatically.
+argmax_only = false
+
 [orchestrator.batch]
 # Time-based flush interval for micro-batches (microseconds)
 flush_us = 500

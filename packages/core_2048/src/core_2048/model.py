@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 class EncoderConfig(BaseModel):
     input_vocab_size: int = 16
-    output_n_bins: int
+    output_n_bins: int | None = None
     hidden_size: int
     num_hidden_layers: int
     num_attention_heads: int
@@ -19,6 +19,20 @@ class EncoderConfig(BaseModel):
     attention_dropout_prob: float = 0.0
     # Absolute positional embeddings length
     max_position_embeddings: int = 16
+    # Output head type: default binned EV per direction; alternative single policy head over 4 moves
+    head_type: str = "binned_ev"  # accepted: "binned_ev", "action_policy"
+
+    @classmethod
+    def model_validate(cls, obj):
+        cfg = super().model_validate(obj)
+        # Validate head/output compatibility
+        if cfg.head_type == "binned_ev":
+            if cfg.output_n_bins is None or int(cfg.output_n_bins) <= 0:
+                raise ValueError("output_n_bins must be set (>0) when head_type='binned_ev'")
+        else:
+            # action_policy: output_n_bins is unused; allow None
+            pass
+        return cfg
 
 
 class EncoderAttention(nn.Module):
@@ -245,9 +259,21 @@ class Encoder(nn.Module):
         )
         # Final RMSNorm
         self.final_ln = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.ev_heads = nn.ModuleList(
-            [nn.Linear(config.hidden_size, config.output_n_bins) for _ in range(4)]
-        )
+        # Output heads are modular; default remains binned EV per direction
+        self.head_type = getattr(config, "head_type", "binned_ev")
+        if self.head_type == "binned_ev":
+            if self.config.output_n_bins is None or int(self.config.output_n_bins) <= 0:
+                raise ValueError("EncoderConfig.output_n_bins must be > 0 for binned_ev head")
+            self.ev_heads = nn.ModuleList(
+                [nn.Linear(config.hidden_size, int(config.output_n_bins)) for _ in range(4)]
+            )
+            self.policy_head = None
+        elif self.head_type == "action_policy":
+            # Single 4-way policy head (Up, Down, Left, Right)
+            self.policy_head = nn.Linear(config.hidden_size, 4)
+            self.ev_heads = None
+        else:
+            raise ValueError(f"Unknown head_type: {self.head_type}")
 
     def forward(
         self,
@@ -282,6 +308,9 @@ class Encoder(nn.Module):
 
         # Final mean pooling
         board_repr = x.mean(dim=1)  # (B, H)
-        ev_logits = [head(board_repr) for head in self.ev_heads]  # List of (B, n_bins)
-        return x, ev_logits
-
+        if self.head_type == "binned_ev":
+            ev_logits = [head(board_repr) for head in self.ev_heads]  # List of (B, n_bins)
+            return x, ev_logits
+        else:  # action_policy
+            policy_logits = self.policy_head(board_repr)  # (B, 4)
+            return x, policy_logits

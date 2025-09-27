@@ -1283,13 +1283,17 @@ name = "train-2048-workspace"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "grpcio" },
     { name = "infer-2048" },
+    { name = "numpy" },
     { name = "train-2048" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "grpcio", specifier = ">=1.74.0" },
     { name = "infer-2048", editable = "packages/infer_2048" },
+    { name = "numpy", specifier = ">=2.3.2" },
     { name = "train-2048", editable = "packages/train_2048" },
 ]
 

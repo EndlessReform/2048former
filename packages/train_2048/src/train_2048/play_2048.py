@@ -34,6 +34,7 @@ def _legal_mask_from_board(board) -> torch.Tensor:  # (1,4) bool
     base_vals = list(board.to_values())
     mask: list[bool] = []
     dummy_rng = Rng(0)
+    # Standardized project order: UDLR (Up, Down, Left, Right)
     order = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]
     for mv in order:
         nb = board.make_move(mv, rng=dummy_rng)
@@ -44,8 +45,8 @@ def _legal_mask_from_board(board) -> torch.Tensor:  # (1,4) bool
 def _select_move_from_probs(head_probs: list[torch.Tensor], legal_mask: torch.Tensor) -> int:
     # head_probs: list of 4 (B, n_bins); B==1 here
     n_bins = head_probs[0].size(1)
-    one_idx = n_bins - 1
-    p1 = torch.stack([hp[:, one_idx] for hp in head_probs], dim=1)  # (1,4)
+    one_idx = n_bins - 1  # winner or p1 bin at end
+    p1 = torch.stack([hp[:, one_idx] for hp in head_probs], dim=1)  # (1,4) in [Up,Right,Down,Left]
     masked = p1.masked_fill(~legal_mask.to(dtype=torch.bool, device=p1.device), float("-inf"))
     if not torch.isfinite(masked).any():
         # fallback if no legal (shouldn't happen if caller checks game_over)
@@ -115,6 +116,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             break
         head_probs = forward_distributions(model, tokens, set_eval=True)
         idx = _select_move_from_probs(head_probs, legal_mask)
+        # Map selected head index (UDLR) to engine Move
         mv = [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT][idx]
         board = board.make_move(mv, rng=rng)
         moves += 1

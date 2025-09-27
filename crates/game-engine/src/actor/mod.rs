@@ -1,12 +1,15 @@
 use crate::config;
-use crate::feeder::FeederHandle;
 use crate::ds_writer::StepRow as DsStepRow;
-use tokio::sync::mpsc as tokio_mpsc;
-use tokio_util::sync::CancellationToken;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use crate::feeder::{FeederHandle, InferenceOutput};
 use ai_2048::engine as GameEngine;
 use ai_2048::engine::{Board, Move};
 use rand::SeedableRng;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio_util::sync::CancellationToken;
 
 pub mod strategies;
 
@@ -18,6 +21,8 @@ pub struct GameActor {
     pub board: Board,
     pub seed: u64,
     pub sampling: config::SamplingStrategy,
+    pub head_order: config::HeadOrder,
+    pub board_map: config::BoardMapping,
     pub step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
     pub cancel: CancellationToken,
     pub step_budget: Option<StepBudget>,
@@ -30,13 +35,25 @@ pub struct StepBudget {
 }
 
 impl StepBudget {
-    pub fn new(max: u64) -> Self { Self { max, used: Arc::new(AtomicU64::new(0)) } }
+    pub fn new(max: u64) -> Self {
+        Self {
+            max,
+            used: Arc::new(AtomicU64::new(0)),
+        }
+    }
     /// Try to consume exactly 1 step budget. Returns false if exhausted.
     pub fn try_take(&self) -> bool {
         let mut cur = self.used.load(Ordering::Relaxed);
         loop {
-            if cur >= self.max { return false; }
-            match self.used.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            if cur >= self.max {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return true,
                 Err(next) => cur = next,
             }
@@ -44,7 +61,9 @@ impl StepBudget {
     }
     /// Read the number of steps consumed so far.
     #[allow(dead_code)]
-    pub fn used(&self) -> u64 { self.used.load(Ordering::Relaxed) }
+    pub fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
 }
 
 pub struct GameResult {
@@ -61,6 +80,8 @@ impl GameActor {
         handle: FeederHandle,
         seed: u64,
         sampling: config::SamplingStrategy,
+        head_order: config::HeadOrder,
+        board_map: config::BoardMapping,
         step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
         cancel: CancellationToken,
         step_budget: Option<StepBudget>,
@@ -70,7 +91,18 @@ impl GameActor {
         let mut board: Board = Board::EMPTY;
         board = board.with_random_tile(&mut rng);
         board = board.with_random_tile(&mut rng);
-        Self { game_id, handle, board, seed, sampling, step_tx, cancel, step_budget }
+        Self {
+            game_id,
+            handle,
+            board,
+            seed,
+            sampling,
+            head_order,
+            board_map,
+            step_tx,
+            cancel,
+            step_budget,
+        }
     }
 
     /// Run the actor loop to completion and return the result.
@@ -80,41 +112,71 @@ impl GameActor {
         let mut rng = rand::rngs::StdRng::from_entropy();
 
         while !self.board.is_game_over() {
-            if self.cancel.is_cancelled() { break; }
-            if let Some(b) = &self.step_budget { if !b.try_take() { break; } }
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            if let Some(b) = &self.step_budget {
+                if !b.try_take() {
+                    break;
+                }
+            }
             let id = ((self.game_id as u64) << 32) | seq;
-            let board_bytes = board_to_exponents(self.board);
+            let board_bytes = board_to_exponents(self.board, self.board_map.clone());
             // Record step row (pre-move state) for dataset
             if let Some(tx) = &self.step_tx {
-                let _ = tx.try_send(DsStepRow { run_id: self.game_id as u64, step_idx: steps as u32, exps: board_bytes });
+                let _ = tx.try_send(DsStepRow {
+                    run_id: self.game_id as u64,
+                    step_idx: steps as u32,
+                    exps: board_bytes,
+                });
             }
             let rx = self.handle.submit(id, self.game_id, board_bytes).await;
-            let bins = tokio::select! {
+            let inference = tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => { break; }
                 res = rx => {
                     match res {
-                        Ok(Ok(b)) => b,
+                        Ok(Ok(out)) => out,
                         Ok(Err(_status)) => { break; },
                         Err(_canceled) => { break; },
                     }
                 }
             };
-            // Compute legal mask and select move according to configured sampling strategy
-            let legal = legal_mask(self.board);
-            // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
-            let start_gate = self.sampling.start_gate_or_default();
-            let stop_gate = self.sampling.stop_gate();
-            let outside_window = (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
-            let mv = if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
-                // Strategy is argmax; no gating effect
-                strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
-            } else if outside_window {
-                // Force argmax outside the sampling window
-                strategies::select_move_max_p1(&bins, &legal)
-            } else {
-                // Within window: apply configured non-argmax strategy
-                strategies::select_move(&bins, &legal, &self.sampling, &mut rng)
+            // Compute legal mask in the configured head order and select move
+            let order = self.head_order.clone();
+            let legal = legal_mask(self.board, order.clone());
+            let mv = match inference {
+                InferenceOutput::Bins(bins) => {
+                    // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
+                    let start_gate = self.sampling.start_gate_or_default();
+                    let stop_gate = self.sampling.stop_gate();
+                    let outside_window =
+                        (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
+                    if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
+                    } else if outside_window {
+                        strategies::select_move_max_p1(&bins, &legal, order)
+                    } else {
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
+                    }
+                }
+                InferenceOutput::Argmax { head, .. } => {
+                    // Map head index according to configured order
+                    let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
+                    let idx = head as usize;
+                    if let Some(&choice) = dirs.get(idx) {
+                        if legal.get(idx).copied().unwrap_or(false) {
+                            Some(choice)
+                        } else {
+                            dirs.iter()
+                                .enumerate()
+                                .find(|(i, _)| legal.get(*i).copied().unwrap_or(false))
+                                .map(|(_, &m)| m)
+                        }
+                    } else {
+                        None
+                    }
+                }
             };
 
             if let Some(m) = mv {
@@ -127,24 +189,29 @@ impl GameActor {
             seq += 1;
         }
 
-        GameResult { game_id: self.game_id, seed: self.seed, steps, score: self.board.score(), highest_tile: self.board.highest_tile() as u32 }
+        GameResult {
+            game_id: self.game_id,
+            seed: self.seed,
+            steps,
+            score: self.board.score(),
+            highest_tile: self.board.highest_tile() as u32,
+        }
     }
 }
 
-fn board_to_exponents(b: Board) -> [u8; 16] {
-    // ai_2048 packs 16 nibbles in a u64. To match the Python `to_exponents()`
-    // row-major ordering expected by the model, map MSB-first to (row, col).
-    // That is, nibble 15 -> index 0 (top-left), ..., nibble 0 -> index 15 (bottom-right).
+fn board_to_exponents(b: Board, _map: config::BoardMapping) -> [u8; 16] {
+    // Canonical MSB-first mapping: cell i reads nibble (15 - i)
     let raw = b.raw();
     let mut out = [0u8; 16];
     for idx in 0..16 {
-        let nib = 15 - idx; // MSB-first
+        let nib = 15 - idx;
         out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
     }
     out
 }
 
-fn legal_mask(board: Board) -> [bool; 4] {
+fn legal_mask(board: Board, _order: config::HeadOrder) -> [bool; 4] {
+    // Produce mask in UDLR order
     let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
     let mut mask = [false; 4];
     for (i, &m) in dirs.iter().enumerate() {

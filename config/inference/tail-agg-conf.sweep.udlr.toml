@@ -1,0 +1,33 @@
+num_seeds = 256
+max_retries = 1
+max_concurrent_games = 256
+
+[sampling]
+strategy = "TailAggConf"
+
+# Grid over confidence-weighted tail aggregation.
+# These arrays will be expanded by benchmarks/bench_client_server.py into
+# Cartesian variants, each written under bench_runs/<ts>/<label>/.
+conf_alpha = [0.24, 0.28, 0.30, 0.34]
+conf_beta  = [8.0, 12.0, 16.0]
+conf_gamma = [1.0]
+
+# Optional gating to restrict non-argmax to a window (per-variant options)
+# start_gate = [0, 7000, 9000]
+# stop_gate  = [64]  # leave unset to allow full-game by default
+
+[orchestrator.connection]
+uds_path = "/tmp/2048_infer.sock"
+
+[orchestrator]
+head_order = "UDLR"
+argmax_only = false
+
+[orchestrator.batch]
+flush_us = 500
+target_batch = 128
+max_batch = 256
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+

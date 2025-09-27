@@ -10,13 +10,13 @@ use log::{debug, error, info};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use std::time::Duration;
 
 use actor::GameActor;
 use feeder::Feeder;
@@ -39,6 +39,8 @@ struct ShardedWriter {
     pending_steps: HashMap<u64, ds_writer::StepRow>,
     pending_embs: HashMap<u64, Vec<f32>>,
     total_steps: u64,
+    buffer_gauge: Option<Arc<AtomicUsize>>,
+    data_mode: bool,
 }
 
 impl ShardedWriter {
@@ -47,7 +49,12 @@ impl ShardedWriter {
         shard_max_steps: usize,
         max_gb: Option<f64>,
         inline_embeddings: bool,
+        buffer_gauge: Option<Arc<AtomicUsize>>,
+        data_mode: bool,
     ) -> Self {
+        if let Some(g) = &buffer_gauge {
+            g.store(0, Ordering::Relaxed);
+        }
         Self {
             session_dir,
             shard_max_steps,
@@ -60,6 +67,14 @@ impl ShardedWriter {
             pending_steps: HashMap::new(),
             pending_embs: HashMap::new(),
             total_steps: 0,
+            buffer_gauge,
+            data_mode,
+        }
+    }
+
+    fn update_buffer_gauge(&self) {
+        if let Some(g) = &self.buffer_gauge {
+            g.store(self.steps_buf.len(), Ordering::Relaxed);
         }
     }
 
@@ -89,8 +104,13 @@ impl ShardedWriter {
             self.steps_buf.push(row);
         }
         self.total_steps += 1;
+        self.update_buffer_gauge();
         if self.total_steps % 10_000 == 0 {
-            debug!("total steps: {}, paired buffered: {}", self.total_steps, self.steps_buf.len());
+            debug!(
+                "total steps: {}, paired buffered: {}",
+                self.total_steps,
+                self.steps_buf.len()
+            );
         }
         if self.steps_buf.len() >= self.shard_max_steps {
             self.write_shard("shard_full");
@@ -98,9 +118,15 @@ impl ShardedWriter {
     }
 
     fn push_embedding(&mut self, er: feeder::EmbeddingRow) {
-        if !self.inline_embeddings { return; }
-        if self.emb_dim.is_none() { self.emb_dim = Some(er.dim); }
-        if self.emb_dim != Some(er.dim) { return; }
+        if !self.inline_embeddings {
+            return;
+        }
+        if self.emb_dim.is_none() {
+            self.emb_dim = Some(er.dim);
+        }
+        if self.emb_dim != Some(er.dim) {
+            return;
+        }
         let id = er.id;
         if let Some(step) = self.pending_steps.remove(&id) {
             self.steps_buf.push(step);
@@ -108,6 +134,7 @@ impl ShardedWriter {
         } else {
             self.pending_embs.insert(id, er.values);
         }
+        self.update_buffer_gauge();
         if self.steps_buf.len() >= self.shard_max_steps {
             self.write_shard("emb_full");
         }
@@ -122,12 +149,21 @@ impl ShardedWriter {
 
         // Write steps shard
         let steps_path = self.session_dir.join(format!("steps-{shard_id}.npy"));
-        info!(
-            "flushing {} steps to {} (reason: {})",
-            self.steps_buf.len(),
-            steps_path.display(),
-            reason
-        );
+        if self.data_mode {
+            info!(
+                "dataset flush reason={} steps={} shard={}",
+                reason,
+                self.steps_buf.len(),
+                steps_path.display()
+            );
+        } else {
+            info!(
+                "flushing {} steps to {} (reason: {})",
+                self.steps_buf.len(),
+                steps_path.display(),
+                reason
+            );
+        }
         let steps_bytes_est = self.steps_buf.len() * (8 + 4 + 16);
         if self
             .max_gb
@@ -149,9 +185,12 @@ impl ShardedWriter {
                         .map_or(false, |gb| (emb_bytes_est as f64) / 1e9 > gb)
                     {
                         eprintln!("Skipping embeddings shard write: est. size > cap");
-                    } else if let Err(e) =
-                        ds_writer::write_embeddings_npy(&self.emb_buf, self.steps_buf.len(), dim, &emb_path)
-                    {
+                    } else if let Err(e) = ds_writer::write_embeddings_npy(
+                        &self.emb_buf,
+                        self.steps_buf.len(),
+                        dim,
+                        &emb_path,
+                    ) {
                         eprintln!("Failed to write embeddings shard {}: {}", shard_id, e);
                     }
                 }
@@ -159,6 +198,7 @@ impl ShardedWriter {
         }
         self.steps_buf.clear();
         self.emb_buf.clear();
+        self.update_buffer_gauge();
     }
 
     fn flush(&mut self) {
@@ -177,7 +217,6 @@ struct Args {
 async fn main() {
     env_logger::init();
     let args = Args::parse();
-    println!("Using configuration file: {}", args.config.display());
     let config = match Config::from_toml(&args.config) {
         Ok(c) => c,
         Err(e) => {
@@ -185,6 +224,10 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    let data_collection_mode = config.max_steps.is_some();
+    if !data_collection_mode {
+        println!("Using configuration file: {}", args.config.display());
+    }
     debug!("Loaded config: {:#?}", config);
 
     // Initialize game engine tables if needed
@@ -215,13 +258,18 @@ async fn main() {
         eprintln!("Either uds_path or tcp_addr must be set under [orchestrator.connection]");
         std::process::exit(2);
     };
-    println!("Connected to inference server");
+    if !data_collection_mode {
+        println!("Connected to inference server");
+    }
 
     // Shared cancellation to coordinate graceful shutdown
     let cancel = CancellationToken::new();
 
     // Start feeder
-    let (mut feeder, handle) = Feeder::new(config.orchestrator.batch.clone());
+    let (mut feeder, handle) = Feeder::new(
+        config.orchestrator.batch.clone(),
+        config.orchestrator.argmax_only,
+    );
     feeder.set_cancel_token(cancel.clone());
     // Optional embeddings pipeline
     let (emb_tx, mut emb_rx) = mpsc::channel::<feeder::EmbeddingRow>(65_536);
@@ -229,6 +277,13 @@ async fn main() {
         feeder.set_embeddings_channel(emb_tx.clone());
     }
     let feeder_task = feeder.spawn(client);
+
+    let log_regular = !data_collection_mode;
+    let buffer_gauge: Option<Arc<AtomicUsize>> = if data_collection_mode {
+        Some(Arc::new(AtomicUsize::new(0)))
+    } else {
+        None
+    };
 
     // Optional results writer and session recorder (metadata.db)
     let (res_tx, mut res_rx) = mpsc::channel::<actor::GameResult>(1024);
@@ -239,10 +294,12 @@ async fn main() {
         let session_dir = config.orchestrator.report.session_dir.clone();
         let max_ram_mb = config.orchestrator.report.max_ram_mb;
         let max_gb = config.orchestrator.report.max_gb;
-        // Surface where results will be written (or disabled)
-        match results_path.as_ref() {
-            Some(p) => eprintln!("[client] results file: {}", p.display()),
-            None => eprintln!("[client] results file: disabled"),
+        if log_regular {
+            // Surface where results will be written (or disabled)
+            match results_path.as_ref() {
+                Some(p) => eprintln!("[client] results file: {}", p.display()),
+                None => eprintln!("[client] results file: disabled"),
+            }
         }
         Some(tokio::spawn(async move {
             // Results JSONL sink (optional)
@@ -332,6 +389,8 @@ async fn main() {
     let step_writer_handle = {
         let report_conf = config.orchestrator.report.clone();
         let inline_emb = config.orchestrator.inline_embeddings;
+        let buffer_gauge = buffer_gauge.clone();
+        let data_mode = data_collection_mode;
         Some(tokio::spawn(async move {
             if let Some(dir) = report_conf.session_dir.as_ref() {
                 let mut writer = ShardedWriter::new(
@@ -339,6 +398,8 @@ async fn main() {
                     report_conf.shard_max_steps_or_default(),
                     report_conf.max_gb,
                     inline_emb,
+                    buffer_gauge,
+                    data_mode,
                 );
 
                 let mut step_done = false;
@@ -350,7 +411,9 @@ async fn main() {
                             match maybe_row {
                                 Some(row) => writer.push_step(row),
                                 None => {
-                                    info!("step_rx closed");
+                                    if !data_mode {
+                                        info!("step_rx closed");
+                                    }
                                     step_done = true;
                                 }
                             }
@@ -359,7 +422,9 @@ async fn main() {
                             match maybe_emb {
                                 Some(er) => writer.push_embedding(er),
                                 None => {
-                                    info!("emb_rx closed");
+                                    if !data_mode {
+                                        info!("emb_rx closed");
+                                    }
                                     emb_done = true;
                                 }
                             }
@@ -406,18 +471,65 @@ async fn main() {
         }
     };
 
-    // Bug fix: bound spawning by `started` (not `finished`) to avoid overshooting `num_seeds`.
-    let can_spawn_more = |started_games: usize, total_steps_done: u64| -> bool {
-        let games_ok = match target_games { Some(g) => started_games < g, None => true };
-        let steps_ok = match target_steps { Some(s) => total_steps_done < s, None => true };
+    // Spawn policy: use live step budget and a tail guard so we don't start
+    // new games when very close to the budget (they would exit immediately).
+    let tail_guard: u64 = 200_000; // steps margin before budget to stop spawning
+    let can_spawn_more = |started_games: usize, steps_done_live: u64| -> bool {
+        let games_ok = match target_games {
+            Some(g) => started_games < g,
+            None => true,
+        };
+        let steps_ok = match target_steps {
+            Some(s) => steps_done_live.saturating_add(tail_guard) < s,
+            None => true,
+        };
         games_ok && steps_ok
     };
 
-    // Spawn a lightweight progress reporter (prints every 2s)
-    let progress_task = {
+    // Spawn a progress reporter appropriate for the current mode
+    let progress_task: Option<tokio::task::JoinHandle<()>> = if data_collection_mode {
+        if let Some(budget) = step_budget.clone() {
+            let buffer_gauge = buffer_gauge.clone();
+            let target_steps_val = target_steps;
+            Some(tokio::spawn(async move {
+                let mut next_bucket: u64 = 100_000;
+                let mut prev_steps: u64 = 0;
+                let mut prev_time = Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let steps = budget.used();
+                    let now = Instant::now();
+                    let dt = now.duration_since(prev_time).as_secs_f64();
+                    let delta = steps.saturating_sub(prev_steps);
+                    let rate = if dt > 0.0 { delta as f64 / dt } else { 0.0 };
+                    let buffered = buffer_gauge
+                        .as_ref()
+                        .map(|g| g.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    while steps >= next_bucket {
+                        let milestone = next_bucket;
+                        info!(
+                            "dataset progress total_steps={} buffered={} steps_per_s={:.2}",
+                            milestone, buffered, rate
+                        );
+                        next_bucket = next_bucket.saturating_add(100_000);
+                    }
+                    prev_steps = steps;
+                    prev_time = now;
+                    if let Some(target) = target_steps_val {
+                        if steps >= target {
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
         let started_c = started_counter.clone();
         let finished_c = finished_counter.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let s = started_c.load(Ordering::Relaxed);
@@ -427,21 +539,30 @@ async fn main() {
                     "[client] progress: started={} running={} finished={}",
                     s, running, f
                 );
-                if running == 0 { break; }
+                if running == 0 {
+                    break;
+                }
             }
-        })
+        }))
     };
 
     // Main game loop
     loop {
         // Spawn new actors if there is capacity and we should continue
-        while set.len() < max_conc && can_spawn_more(started, total_steps) {
+        let steps_done_live: u64 = if let Some(b) = &step_budget {
+            b.used()
+        } else {
+            total_steps
+        };
+        while set.len() < max_conc && can_spawn_more(started, steps_done_live) {
             let game_id = next_game_id;
             let actor = GameActor::new(
                 game_id,
                 handle.clone(),
                 make_seed(started),
                 config.sampling.clone(),
+                config.orchestrator.head_order_or_default(),
+                config.orchestrator.board_mapping_or_default(),
                 Some(step_tx.clone()),
                 cancel.clone(),
                 step_budget.clone(),
@@ -484,38 +605,65 @@ async fn main() {
         //   we cancel to respect the exact budget for dataset collection.
         // - Otherwise (typical benchmark/results mode), do NOT cancel; stop
         //   spawning new games and let existing ones finish naturally.
-        if !can_spawn_more(started, total_steps) {
-            if step_budget.is_some() && config.orchestrator.inline_embeddings {
-                cancel.cancel();
+        let steps_done_live: u64 = if let Some(b) = &step_budget {
+            b.used()
+        } else {
+            total_steps
+        };
+        if let Some(s) = target_steps {
+            if steps_done_live >= s {
+                if step_budget.is_some() && config.orchestrator.inline_embeddings {
+                    cancel.cancel();
+                }
             }
         }
     }
-    info!("Draining pipeline...");
+    if log_regular {
+        info!("Draining pipeline...");
+    }
     drop(set);
 
     // All actors done; drop the handle so feeder can exit, then wait for it
-    info!("Draining pipeline...");
+    if log_regular {
+        info!("Draining pipeline...");
+    }
     // Signal end of submissions and step collection
     drop(handle);
     drop(step_tx);
     // Ensure embeddings channel closes for step writer termination
     drop(emb_tx);
 
-    info!("Waiting for feeder task...");
+    if log_regular {
+        info!("Waiting for feeder task...");
+    }
     let _ = feeder_task.await;
-    info!("Feeder task finished.");
+    if log_regular {
+        info!("Feeder task finished.");
+    }
 
     drop(res_tx);
     if let Some(h) = writer_handle {
-        info!("Waiting for writer task...");
+        if log_regular {
+            info!("Waiting for writer task...");
+        }
         let _ = h.await;
-        info!("Writer task finished.");
+        if log_regular {
+            info!("Writer task finished.");
+        }
     }
     if let Some(h) = step_writer_handle {
-        info!("Waiting for step writer task...");
+        if log_regular {
+            info!("Waiting for step writer task...");
+        }
         let _ = h.await;
-        info!("Step writer task finished.");
+        if log_regular {
+            info!("Step writer task finished.");
+        }
     }
-    let _ = progress_task.await;
-    info!("All tasks finished.");
+    if let Some(task) = progress_task {
+        let _ = task.await;
+    }
+    if log_regular {
+        info!("All tasks finished.");
+    }
 }

@@ -28,6 +28,7 @@ module-name = ["train_2048"]
 [project.scripts]
 play = "train_2048.play_2048:main"
 train = "train_2048.main:main"
+tokenizer-macroxue = "train_2048.tokenization.cli:main"
 
 
 [tool.uv.sources]

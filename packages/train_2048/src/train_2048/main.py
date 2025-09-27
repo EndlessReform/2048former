@@ -3,7 +3,7 @@ import torch
 from typing import Optional
 
 from train_2048.config import load_config
-from train_2048.train import train as run_training
+from train_2048.training_loop import run_training
 
 
 def main(argv: Optional[list[str]] = None):
@@ -62,6 +62,7 @@ def main(argv: Optional[list[str]] = None):
                     "lr_schedule": cfg.hyperparameters.lr_schedule.model_dump(),
                     "batch": cfg.batch.model_dump(),
                     "dropout": cfg.dropout.model_dump(),
+                    "target": cfg.target.model_dump(),
                     "binning": cfg.binning.model_dump(),
                     "dataset": cfg.dataset.model_dump(),
                 },

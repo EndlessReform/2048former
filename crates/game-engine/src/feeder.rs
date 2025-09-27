@@ -1,14 +1,14 @@
 use crate::config;
 use crate::grpc::{self, pb};
-use tokio::sync::mpsc as tokio_mpsc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tonic::Status;
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
 
 /// Single inference item sent to the micro-batcher.
 /// - `id` is a stable, caller-supplied identifier used for routing
@@ -26,6 +26,13 @@ pub struct InferenceItem {
 /// The outer dimension is heads in the fixed order [Up, Down, Left, Right].
 pub type Bins = Vec<Vec<f32>>; // heads x n_bins
 
+/// Inference response payload returned to actors.
+#[derive(Debug, Clone)]
+pub enum InferenceOutput {
+    Bins(Bins),
+    Argmax { head: u32, _p1: f32 },
+}
+
 /// Micro-batching feeder. Builds batches from a bounded queue, submits RPCs,
 /// and routes responses to per-item oneshots. Backpressure is enforced via a
 /// sliding window of in-flight items.
@@ -35,10 +42,11 @@ pub struct Feeder {
     completion_rx: mpsc::Receiver<usize>,
     completion_tx: mpsc::Sender<usize>,
     inflight_items: usize,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Bins, Status>>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<InferenceOutput, Status>>>>>,
     metrics: Option<Arc<Metrics>>, // client-side batch metrics
     emb_tx: Option<tokio_mpsc::Sender<EmbeddingRow>>, // optional inline embeddings
     cancel: Option<CancellationToken>,
+    argmax_only: bool,
 }
 
 impl Feeder {
@@ -46,7 +54,7 @@ impl Feeder {
     ///
     /// Usage: let (feeder, handle) = Feeder::new(cfg.orchestrator.batch.clone());
     ///        let _task = feeder.spawn(client);
-    pub fn new(batch_cfg: config::Batch) -> (Self, FeederHandle) {
+    pub fn new(batch_cfg: config::Batch, argmax_only: bool) -> (Self, FeederHandle) {
         let (req_tx, req_rx) = mpsc::channel(batch_cfg.queue_cap);
         let (completion_tx, completion_rx) = mpsc::channel::<usize>(batch_cfg.inflight_batches * 2);
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -64,8 +72,15 @@ impl Feeder {
             metrics: metrics.clone(),
             emb_tx: None,
             cancel: None,
+            argmax_only,
         };
-        (feeder, FeederHandle { tx: req_tx, pending })
+        (
+            feeder,
+            FeederHandle {
+                tx: req_tx,
+                pending,
+            },
+        )
     }
 
     /// Sender used internally to return credits when a batch completes.
@@ -106,7 +121,10 @@ impl Feeder {
                         }
                     }
                 } else {
-                    match self.req_rx.recv().await { Some(item) => buf.push(item), None => return }
+                    match self.req_rx.recv().await {
+                        Some(item) => buf.push(item),
+                        None => return,
+                    }
                 }
 
                 let deadline = Instant::now() + flush;
@@ -155,7 +173,8 @@ impl Feeder {
                     model_id: String::new(),
                     items: items_pb,
                     batch_id: 0,
-                    return_embedding: self.emb_tx.is_some(),
+                    return_embedding: self.emb_tx.is_some() && !self.argmax_only,
+                    argmax_only: self.argmax_only,
                 };
                 let mut client_clone = client.clone();
                 let completion = self.completion_tx.clone();
@@ -173,18 +192,29 @@ impl Feeder {
                             let mut map = pending.lock().await;
                             // If embeddings are requested, prefer concatenated buffer when present
                             let mut emitted_from_concat = false;
-                            if let (Some(ch), true) = (emb_tx.as_ref(), !resp.embeddings_concat.is_empty()) {
-                                if embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                            if !self.argmax_only
+                                && let (Some(ch), true) =
+                                    (emb_tx.as_ref(), !resp.embeddings_concat.is_empty())
+                            {
+                                if embed_dim > 0
+                                    && resp.embed_dtype
+                                        == pb::infer_response::EmbedDType::Fp32 as i32
+                                {
                                     // Safe cast: u8 bytes to f32 words
-                                    let floats: &[f32] = bytemuck::try_cast_slice(&resp.embeddings_concat)
-                                        .unwrap_or(&[]);
+                                    let floats: &[f32] =
+                                        bytemuck::try_cast_slice(&resp.embeddings_concat)
+                                            .unwrap_or(&[]);
                                     let n_items = resp.item_ids.len();
                                     if floats.len() == n_items * embed_dim {
                                         for (i, item_id) in resp.item_ids.iter().enumerate() {
                                             let start = i * embed_dim;
                                             let end = start + embed_dim;
                                             let v: Vec<f32> = floats[start..end].to_vec();
-                                            let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                            let _ = ch.try_send(EmbeddingRow {
+                                                id: *item_id,
+                                                dim: embed_dim,
+                                                values: v,
+                                            });
                                         }
                                         emitted_from_concat = true;
                                     }
@@ -193,20 +223,52 @@ impl Feeder {
 
                             for (i, item_id) in resp.item_ids.iter().enumerate() {
                                 if let Some(tx) = map.remove(item_id) {
-                                    let bins: Result<Bins, Status> = resp
-                                        .outputs
-                                        .get(i)
-                                        .map(|o| o.heads.iter().map(|h| h.probs.clone()).collect())
-                                        .ok_or_else(|| Status::internal("missing output for item"));
-                                    let _ = tx.send(bins);
+                                    let payload: Result<InferenceOutput, Status> = if self
+                                        .argmax_only
+                                    {
+                                        match (resp.argmax_heads.get(i), resp.argmax_p1.get(i)) {
+                                            (Some(head), Some(p1)) => Ok(InferenceOutput::Argmax {
+                                                head: *head,
+                                                _p1: *p1,
+                                            }),
+                                            _ => Err(Status::internal(
+                                                "missing argmax output for item",
+                                            )),
+                                        }
+                                    } else {
+                                        resp.outputs
+                                            .get(i)
+                                            .map(|o| {
+                                                InferenceOutput::Bins(
+                                                    o.heads
+                                                        .iter()
+                                                        .map(|h| h.probs.clone())
+                                                        .collect(),
+                                                )
+                                            })
+                                            .ok_or_else(|| {
+                                                Status::internal("missing output for item")
+                                            })
+                                    };
+                                    let _ = tx.send(payload);
                                 }
-                                // If not emitted via concatenated buffer, fall back to per-item field
-                                if !emitted_from_concat {
-                                    if let (Some(ch), Some(out)) = (emb_tx.as_ref(), resp.outputs.get(i)) {
-                                        if !out.embedding.is_empty() && embed_dim > 0 && resp.embed_dtype == pb::infer_response::EmbedDType::Fp32 as i32 {
+                                if !self.argmax_only && !emitted_from_concat {
+                                    if let (Some(ch), Some(out)) =
+                                        (emb_tx.as_ref(), resp.outputs.get(i))
+                                    {
+                                        if !out.embedding.is_empty()
+                                            && embed_dim > 0
+                                            && resp.embed_dtype
+                                                == pb::infer_response::EmbedDType::Fp32 as i32
+                                        {
                                             if out.embedding.len() == embed_dim * 4 {
-                                                let v: Vec<f32> = bytemuck::cast_slice(&out.embedding).to_vec();
-                                                let _ = ch.try_send(EmbeddingRow { id: *item_id, dim: embed_dim, values: v });
+                                                let v: Vec<f32> =
+                                                    bytemuck::cast_slice(&out.embedding).to_vec();
+                                                let _ = ch.try_send(EmbeddingRow {
+                                                    id: *item_id,
+                                                    dim: embed_dim,
+                                                    values: v,
+                                                });
                                             }
                                         }
                                     }
@@ -236,18 +298,18 @@ impl Feeder {
 #[derive(Clone)]
 pub struct FeederHandle {
     tx: mpsc::Sender<InferenceItem>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Bins, Status>>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<InferenceOutput, Status>>>>>,
 }
 
 impl FeederHandle {
-    /// Submit an inference item and receive a oneshot for its per-head probabilities.
-    /// The returned Receiver yields `Bins` on success or a gRPC `Status` on failure.
+    /// Submit an inference item and receive a oneshot for its per-item result.
+    /// The returned Receiver yields `InferenceOutput` on success or a gRPC `Status`.
     pub async fn submit(
         &self,
         id: u64,
         game_id: u32,
         board: [u8; 16],
-    ) -> oneshot::Receiver<Result<Bins, Status>> {
+    ) -> oneshot::Receiver<Result<InferenceOutput, Status>> {
         let (tx_once, rx) = oneshot::channel();
         {
             let mut map = self.pending.lock().await;
@@ -261,6 +323,9 @@ impl FeederHandle {
 impl Feeder {
     /// Enable inline embeddings emission by providing a channel to receive them.
     pub fn set_embeddings_channel(&mut self, ch: tokio_mpsc::Sender<EmbeddingRow>) {
+        if self.argmax_only {
+            return;
+        }
         self.emb_tx = Some(ch);
     }
 
@@ -293,7 +358,11 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new() -> Self { Self { inner: Arc::new(Mutex::new(MetricsInner::default())) } }
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MetricsInner::default())),
+        }
+    }
 
     async fn record_complete(&self, batch_len: usize) {
         let mut g = self.inner.lock().await;
@@ -304,11 +373,20 @@ impl Metrics {
 
     async fn snapshot(&self) -> MetricsInner {
         let g = self.inner.lock().await;
-        MetricsInner { counts: g.counts.clone(), total_items: g.total_items, total_batches: g.total_batches }
+        MetricsInner {
+            counts: g.counts.clone(),
+            total_items: g.total_items,
+            total_batches: g.total_batches,
+        }
     }
 
     async fn run_reporter(&self, path: std::path::PathBuf, interval_s: f64) {
-        let mut file = match tokio::fs::OpenOptions::new().create(true).append(true).open(&path).await {
+        let mut file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
             Ok(f) => f,
             Err(_) => return,
         };
@@ -328,7 +406,9 @@ impl Metrics {
             // top 10 by batch frequency
             let mut top: Vec<(usize, u64)> = snap.counts.iter().map(|(k, v)| (*k, *v)).collect();
             top.sort_by(|a, b| b.1.cmp(&a.1));
-            if top.len() > 10 { top.truncate(10); }
+            if top.len() > 10 {
+                top.truncate(10);
+            }
             let covered_batches: u64 = top.iter().map(|(_, c)| *c).sum();
             let missed_batches = snap.total_batches.saturating_sub(covered_batches);
 
@@ -339,7 +419,9 @@ impl Metrics {
                 .map(|(bs, c)| (*bs, (*bs as u64) * (*c)))
                 .collect();
             top_items.sort_by(|a, b| b.1.cmp(&a.1));
-            if top_items.len() > 10 { top_items.truncate(10); }
+            if top_items.len() > 10 {
+                top_items.truncate(10);
+            }
             let covered_items: u64 = top_items.iter().map(|(_, c)| *c).sum();
             let missed_items = snap.total_items.saturating_sub(covered_items);
 

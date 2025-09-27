@@ -1,0 +1,47 @@
+num_seeds = 256
+max_retries = 1
+max_concurrent_games = 256
+
+[sampling]
+# Softmax over p1 across heads with temperature.
+# Note: Only supported for binned-ev models. For single policy head
+# (hard targets), the server requires argmax_only=true; use
+# config/inference/hard-move-argmax.udlr.toml instead.
+strategy = "Softmax"
+temperature = 0.30
+
+# Optional: gates for when to apply non-argmax sampling.
+# Outside the window, fall back to argmax.
+# start_gate = 0   # default: 0 (enable from the first move)
+# stop_gate = 64   # default: unset (never stop)
+
+[orchestrator.connection]
+# One of uds_path or tcp_addr must be set for the Python server.
+uds_path = "/tmp/2048_infer.sock"
+# tcp_addr = "http://127.0.0.1:50051"
+
+[orchestrator]
+# Head order mapping for model heads → moves. Canonical is UDLR.
+head_order = "UDLR"
+# Request full per-head distributions so the client can apply legality-aware
+# selection. For action_policy models, argmax_only must be true and non-argmax
+# sampling is not supported.
+argmax_only = false
+
+[orchestrator.batch]
+# Time-based flush interval for micro-batches (microseconds)
+flush_us = 500
+target_batch = 128
+max_batch = 256
+inflight_batches = 2
+per_game_inflight = 8
+queue_cap = 8192
+
+# Optional: client-side batching metrics (JSONL)
+# metrics_file = "profiles/client-metrics.jsonl"
+# metrics_interval_s = 5.0
+
+# Optional: per-game results (JSONL)
+# [orchestrator.report]
+# results_file = "runs/results.jsonl"
+

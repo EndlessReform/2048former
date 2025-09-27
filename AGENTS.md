@@ -28,6 +28,12 @@
 - Keep dataclasses/Pydantic models in `config.py`; avoid circular imports.
 - Prefer explicit `from train_2048 import …` over relative wildcards.
 
+### Rust self-play data writers
+- Use `crates/dataset-packer` for dataset plumbing and share dtype builders with `game-engine` (`StepRow::dtype`, `ds_writer::step_row_dtype`). Keep NumPy and Rust definitions aligned (`align=True`, explicit field order).
+- Write metadata through `rusqlite` (`bundled` feature). Enable WAL + `synchronous = NORMAL`, and use `INSERT … ON CONFLICT DO UPDATE` so reruns are idempotent.
+- Prefer `rayon` for IO-heavy loops and keep `indicatif` progress bars + `env_logger` output consistent with the packer.
+- When adding fields to steps or metadata, update the docs and dtype/schema definitions before merging; mismatched layouts have broken previous runs.
+
 ## Testing Guidelines
 - No formal test suite yet. Validate via:
   - Quick sim: `bin/play_2048.py` (prints moves/sec, score, highest tile).

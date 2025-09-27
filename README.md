@@ -116,12 +116,12 @@ idxs = np.flatnonzero(mask)
 exps_buf, dirs, evs = a2.batch_from_steps(steps, idxs, parallel=True)
 exps = np.frombuffer(exps_buf, dtype=np.uint8).reshape(-1, 16)
 
-# EV encoding (branches)
-# - Order: Up=0, Down=1, Left=2, Right=3
+# EV encoding (branches, UDLR canonical)
+# - Order: Up=0, Down=1, Left=2, Right=3 (UDLR)
 # - ev_values are normalized to [0,1]; chosen branch is exactly 1.0
-# - ev_legal is a u8 bitmask (Up=1, Down=2, Left=4, Right=8)
+# - ev_legal is a u8 bitmask (UDLR: Up=1, Down=2, Left=4, Right=8)
 #   Illegal branches also store 0.0 in ev_values, so use the mask
-# Tip: expand mask to (N,4) and zero-out illegal entries
+# Tip: expand mask to (N,4) and zero-out illegal entries (UDLR)
 mask_bits = steps['ev_legal'][idxs]
 legal = np.stack([
     (mask_bits & 1) != 0,   # Up
@@ -175,3 +175,14 @@ Config changes
 - Use `dataset_dir` instead of `packfile`.
 - Validation uses disjoint runs via percentage (`val_run_pct`) or explicit SQL (`val_run_sql`).
 - See `config/config.example.toml` and `config/long-ctxt-sft.toml` for templates.
+
+Training
+--------
+
+- Install deps once via `uv sync`, then train with `uv run python main.py --config config/config.example.toml` (override `--device` as needed).
+- To resume from a previous run, point `init_dir` at either the original init folder or a saved `.pt` bundle (for example `init_dir = "checkpoints/20240901_120000/model-stable.pt"`).
+- When a `.pt` bundle is used, the encoder weights, optimizer state, and `global_step` are restored automatically before training continues.
+- Checkpoints are still written into the `checkpoint_dir` from the active config, so update it if you want the resumed run to land in a new folder.
+- `[checkpoint].save_pt_every_steps` dumps numbered `model-step-XXXXXXXX.pt` bundles that include optimizer state for straight resumes.
+- Validation best checkpoints now write `model-best.pt` bundles; convert to safetensors for inference with `uv run python bin/pt_to_safetensors.py <path/to/model-best.pt> --write-config`.
+- Learning rate schedulers support `constant`, `warmup-stable-decay`, or `cosine` (with optional warmup).

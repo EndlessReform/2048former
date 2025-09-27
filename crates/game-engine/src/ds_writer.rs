@@ -6,7 +6,9 @@ use npyz::{DType, Field, TypeStr, WriterBuilder};
 
 /// Minimal v1 step row: matches docs/self-play-v1.md
 /// Fields: run_id: u64, step_idx: u32, exps: [u8; 16]
-#[derive(Clone, Copy, Debug, PartialEq, npyz::Serialize, npyz::Deserialize, npyz::AutoSerialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, npyz::Serialize, npyz::Deserialize, npyz::AutoSerialize,
+)]
 pub struct StepRow {
     pub run_id: u64,
     pub step_idx: u32,
@@ -20,15 +22,29 @@ fn step_row_dtype() -> DType {
     let u4_le: TypeStr = "<u4".parse().unwrap();
     let u1: TypeStr = "|u1".parse().unwrap();
     DType::Record(vec![
-        Field { name: "run_id".into(), dtype: DType::Plain(u8_le) },
-        Field { name: "step_idx".into(), dtype: DType::Plain(u4_le) },
-        Field { name: "exps".into(), dtype: DType::Array(16, Box::new(DType::Plain(u1))) },
+        Field {
+            name: "run_id".into(),
+            dtype: DType::Plain(u8_le),
+        },
+        Field {
+            name: "step_idx".into(),
+            dtype: DType::Plain(u4_le),
+        },
+        Field {
+            name: "exps".into(),
+            dtype: DType::Array(16, Box::new(DType::Plain(u1))),
+        },
     ])
 }
 
 /// Write steps.npy with a structured dtype, atomically via a temp path.
-pub fn write_steps_npy(rows: &[StepRow], out_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = out_path.parent() { std::fs::create_dir_all(parent)?; }
+pub fn write_steps_npy(
+    rows: &[StepRow],
+    out_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let tmp = out_path.with_extension("npy.tmp");
     let file = BufWriter::new(File::create(&tmp)?);
     let mut w = npyz::WriteOptions::new()
@@ -51,7 +67,9 @@ pub fn write_embeddings_npy(
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(floats.len(), n_rows * dim, "embeddings length must be N*D");
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let file = BufWriter::new(File::create(path)?);
     let f4_le: TypeStr = "<f4".parse().unwrap();
     let mut w = npyz::WriteOptions::new()
@@ -77,9 +95,21 @@ mod tests {
         let td = tempdir().unwrap();
         let path = td.path().join("steps.npy");
         let rows = vec![
-            StepRow { run_id: 1, step_idx: 0, exps: [0u8; 16] },
-            StepRow { run_id: 1, step_idx: 1, exps: [1u8; 16] },
-            StepRow { run_id: 2, step_idx: 0, exps: [2u8; 16] },
+            StepRow {
+                run_id: 1,
+                step_idx: 0,
+                exps: [0u8; 16],
+            },
+            StepRow {
+                run_id: 1,
+                step_idx: 1,
+                exps: [1u8; 16],
+            },
+            StepRow {
+                run_id: 2,
+                step_idx: 0,
+                exps: [2u8; 16],
+            },
         ];
         write_steps_npy(&rows, &path).unwrap();
 

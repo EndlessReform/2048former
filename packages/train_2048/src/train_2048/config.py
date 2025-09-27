@@ -11,6 +11,12 @@ from core_2048 import Encoder, EncoderConfig, load_encoder_from_init, normalize_
 from .binning import BinningConfig
 
 
+class TargetConfig(BaseModel):
+    """Configure which supervision target to use during training."""
+
+    mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
+
+
 def _find_repo_root() -> Path:
     """Return the repository root by walking upwards.
 
@@ -30,9 +36,14 @@ def _find_repo_root() -> Path:
 class DatasetConfig(BaseModel):
     # Root directory containing steps.npy and metadata.db
     dataset_dir: str = "./dataset"
+    # Path to the tokenizer spec file (only for macroxue_tokens mode)
+    tokenizer_path: Optional[str] = None
     # Optional: SQL to define the universe of runs (training+validation)
     run_sql: Optional[str] = None
     sql_params: list[object] = Field(default_factory=list)
+    # Optional: restrict steps by index window (inclusive bounds)
+    step_index_min: Optional[int] = None
+    step_index_max: Optional[int] = None
 
     # Validation split options (by run to avoid leakage)
     # Option A: explicit SQL for validation runs
@@ -41,6 +52,22 @@ class DatasetConfig(BaseModel):
     # Option B: random run split when >0; ignored if val_run_sql provided
     val_run_pct: float = 0.0
     val_split_seed: int = 42
+    # Optional flag to load ``steps.npy`` via ``np.load(mmap_mode='r')``.
+    # When ``True`` the dataset will map the file into memory and only read
+    # slices as needed. This is useful for very large datasets that would
+    # otherwise exhaust RAM.
+    mmap_mode: bool = False
+    # Shuffling strategy for full-dataset epochs (when num_steps is None):
+    # - If False, iterate sequentially (fast, minimal memory)
+    # - If True, use buffered shuffle to avoid materializing a full permutation
+    shuffle: bool = False
+    shuffle_buffer_size: int = 1_000_000
+    # Validation limits
+    # Cap validation to a fixed number of steps (batches). When >0, overrides val_steps_pct.
+    val_num_steps: Optional[int] = None
+    # Alternatively, derive validation steps as a fraction of training steps per epoch
+    # (e.g., 0.1 = 10% as many validation steps as training). Ignored if val_num_steps is set.
+    val_steps_pct: float = 0.0
 
     # Choose either fixed steps or epochs. If both provided, steps takes priority.
     num_steps: Optional[int] = None
@@ -69,9 +96,24 @@ class DatasetConfig(BaseModel):
         if v < 0:
             raise ValueError("dataset.val_every must be >= 0 (0 disables)")
         return v
+    @field_validator("val_steps_pct")
+    @classmethod
+    def _val_steps_pct_range(cls, v: float) -> float:
+        if v < 0.0 or v > 1.0:
+            if v != 0.0:
+                raise ValueError("dataset.val_steps_pct must be in [0,1] (0 disables)")
+        return v
 
     def resolved_dataset_dir(self) -> str:
         p = Path(self.dataset_dir)
+        if not p.is_absolute():
+            p = _find_repo_root() / p
+        return str(p)
+
+    def resolved_tokenizer_path(self) -> Optional[str]:
+        if self.tokenizer_path is None:
+            return None
+        p = Path(self.tokenizer_path)
         if not p.is_absolute():
             p = _find_repo_root() / p
         return str(p)
@@ -105,7 +147,7 @@ class WandbConfig(BaseModel):
 
 
 class LRScheduleConfig(BaseModel):
-    name: Literal["constant", "warmup-stable-decay"] = "constant"
+    name: Literal["constant", "warmup-stable-decay", "cosine"] = "constant"
     # Only used for warmup-stable-decay
     warmup_steps: int = 0
     decay_steps: int = 0
@@ -198,12 +240,21 @@ class CheckpointConfig(BaseModel):
     save_best_every_steps: Optional[int] = None
     # Minimum improvement required to update the best
     best_min_delta: float = 0.0
+    # Persist a full .pt bundle every N steps (includes optimizer/global_step)
+    save_pt_every_steps: Optional[int] = None
 
     @field_validator("every_epochs", "save_best_every_steps")
     @classmethod
     def _non_negative_or_none(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
             raise ValueError("checkpoint intervals must be > 0 when provided")
+        return v
+
+    @field_validator("save_pt_every_steps")
+    @classmethod
+    def _pt_interval_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("save_pt_every_steps must be > 0 when provided")
         return v
 
     @field_validator("best_min_delta")
@@ -216,7 +267,7 @@ class CheckpointConfig(BaseModel):
 
 class TrainingConfig(BaseModel):
     # IO
-    init_dir: str
+    init_dir: str  # directory with config/weights or path to a .pt bundle
     checkpoint_dir: str
 
     # Sections
@@ -224,6 +275,7 @@ class TrainingConfig(BaseModel):
     hyperparameters: HyperParams = Field(default_factory=HyperParams)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     dropout: DropoutConfig = Field(default_factory=DropoutConfig)
+    target: TargetConfig = Field(default_factory=TargetConfig)
     # Discretization for EV heads
     binning: BinningConfig = Field(default_factory=BinningConfig)
     # Dataset input
@@ -233,6 +285,10 @@ class TrainingConfig(BaseModel):
 
     # Misc
     seed: int = 0
+    # Debug/toggles
+    compile_enabled: bool = True
+    # If true, also dump .pt checkpoints with optimizer state early and every 100k steps.
+    dangerous_just_checkpoint: bool = False
 
     @classmethod
     def from_toml(cls, path: str) -> "TrainingConfig":
@@ -253,6 +309,7 @@ __all__ = [
     "HyperParams",
     "BatchConfig",
     "DropoutConfig",
+    "TargetConfig",
     "CheckpointConfig",
     "TrainingConfig",
     "load_config",

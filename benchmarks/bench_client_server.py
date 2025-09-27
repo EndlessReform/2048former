@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from threading import Thread
 
 try:
     import tomllib  # py3.11+
@@ -27,6 +28,14 @@ class RunPaths:
     results_file: Path
     metrics_file: Path
     meta_file: Path
+    server_stderr: Path
+
+
+@dataclass
+class ServerHandle:
+    proc: subprocess.Popen
+    stderr_log: Optional[Path] = None
+    stderr_thread: Optional[Thread] = None
 
 
 def now_ts() -> str:
@@ -42,6 +51,7 @@ def ensure_outdir(outdir: Optional[str]) -> RunPaths:
         results_file=base / "results.jsonl",
         metrics_file=base / "client-metrics.jsonl",
         meta_file=base / "run_meta.json",
+        server_stderr=base / "server-stderr.log",
     )
 
 
@@ -55,12 +65,13 @@ def write_toml(d: dict, path: Path) -> None:
     def emit_table(fp, key, table):
         fp.write(f"[{key}]\n")
         for k, v in table.items():
-            if isinstance(v, (int, float)):
+            # IMPORTANT: check bool before int — bool is a subclass of int in Python
+            if isinstance(v, bool):
+                fp.write(f"{k} = {'true' if v else 'false'}\n")
+            elif isinstance(v, (int, float)):
                 fp.write(f"{k} = {v}\n")
             elif isinstance(v, str):
                 fp.write(f"{k} = \"{v}\"\n")
-            elif isinstance(v, bool):
-                fp.write(f"{k} = {'true' if v else 'false'}\n")
         fp.write("\n")
 
     with path.open("w", encoding="utf-8") as fp:
@@ -73,12 +84,69 @@ def write_toml(d: dict, path: Path) -> None:
             emit_table(fp, "sampling", d["sampling"])  # expects {strategy: "Argmax"}
         if "orchestrator" in d:
             orch = d["orchestrator"].copy()
+            # Emit simple orchestrator keys (e.g., head_order, argmax_only, inline_embeddings, fixed_seed, random_seeds)
+            simple = {
+                k: v
+                for k, v in orch.items()
+                if k not in {"connection", "batch", "report"}
+                and isinstance(v, (int, float, str, bool))
+            }
+            if simple:
+                emit_table(fp, "orchestrator", simple)
             if "connection" in orch:
                 emit_table(fp, "orchestrator.connection", orch["connection"])  # uds_path/tcp_addr
             if "batch" in orch:
                 emit_table(fp, "orchestrator.batch", orch["batch"])  # flush_us, target_batch, ...
             if "report" in orch:
                 emit_table(fp, "orchestrator.report", orch["report"])  # results_file
+
+
+def _detect_head_type(init_dir: str) -> str:
+    """Detect model head type by inspecting weights first, then config.json.
+
+    Returns one of: 'action_policy' or 'binned_ev'. Defaults to 'binned_ev'.
+    """
+    # Prefer inspecting weights to avoid stale config.json
+    try:
+        w = Path(init_dir) / "model.safetensors"
+        if w.exists():
+            from safetensors.torch import load_file as safe_load_file  # type: ignore
+
+            state = safe_load_file(str(w))
+            keys = list(state.keys())
+            if any(k.startswith("policy_head.") for k in keys):
+                return "action_policy"
+            if any(k.startswith("ev_heads.0.") for k in keys):
+                return "binned_ev"
+    except Exception:
+        pass
+    # Fallback: config.json
+    try:
+        p = Path(init_dir) / "config.json"
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            return str(cfg.get("head_type", "binned_ev"))
+    except Exception:
+        pass
+    return "binned_ev"
+
+
+def _adjust_client_cfg_for_model(cfg: dict, head_type: str) -> dict:
+    """Return a copy of cfg adjusted for the model's head_type.
+
+    - For action_policy: prefer head_order=UDLR; allow non-argmax sampling (server returns per-move probs as 4 single-bin heads).
+    - For binned_ev: prefer head_order=UDLR if missing (matches training pipeline).
+    """
+    c = json.loads(json.dumps(cfg))  # deep copy
+    orch = c.setdefault("orchestrator", {})
+    if head_type == "action_policy":
+        # Our policy head is trained in UDLR order; do not force argmax_only
+        orch.setdefault("head_order", "UDLR")
+    else:
+        # Training dataloader standardizes to UDLR order
+        orch.setdefault("head_order", "UDLR")
+    return c
 
 
 def _sampling_grid_variants(base_cfg: dict) -> list[tuple[str, dict]]:
@@ -208,8 +276,11 @@ def _write_grid_csv_summary(outdir: Path, rows: list[dict]) -> None:
             fp.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
 
 
-def make_client_cfg(base_cfg_path: Path, rp: RunPaths, uds: Optional[str], tcp: Optional[str]) -> Path:
+def make_client_cfg(base_cfg_path: Path, rp: RunPaths, uds: Optional[str], tcp: Optional[str], *, init_dir: Optional[str] = None) -> Path:
     cfg = read_toml(base_cfg_path)
+    if init_dir:
+        head_type = _detect_head_type(init_dir)
+        cfg = _adjust_client_cfg_for_model(cfg, head_type)
     # Ensure nested tables exist
     orch = cfg.setdefault("orchestrator", {})
     conn = orch.setdefault("connection", {})
@@ -291,12 +362,36 @@ def probe_grpc_ready(target: str, timeout_s: float) -> None:
     fut.result(timeout=timeout_s)
 
 
-def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cudagraphs: bool) -> subprocess.Popen:
+def _start_stderr_tee(proc: subprocess.Popen, log_path: Path) -> Thread:
+    def _pump() -> None:
+        assert proc.stderr is not None
+        with log_path.open("w", encoding="utf-8") as fp:
+            for chunk in proc.stderr:
+                fp.write(chunk)
+                fp.flush()
+                sys.stderr.write(chunk)
+                sys.stderr.flush()
+
+    thread = Thread(target=_pump, daemon=True)
+    thread.start()
+    return thread
+
+
+def start_server(
+    init_dir: str,
+    bind: str,
+    device: str,
+    compile_mode: str,
+    no_cudagraphs: bool,
+    *,
+    stderr_log: Optional[Path] = None,
+) -> ServerHandle:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("INFER_2048_LOG", "0")
     if no_cudagraphs:
         env["INFER_2048_NO_CUDAGRAPHS"] = "1"
+    # UDLR canonical; no head-order env needed
     cmd = [
         "uv",
         "run",
@@ -316,16 +411,25 @@ def start_server(init_dir: str, bind: str, device: str, compile_mode: str, no_cu
         cmd += ["--uds", "unix:" + bind]
     # Only surface stderr to the console; discard stdout to avoid clutter.
     devnull = subprocess.DEVNULL
-    popen_kwargs: dict = {"stdout": devnull, "stderr": None, "env": env}
+    popen_kwargs: dict = {"stdout": devnull, "env": env}
+    if stderr_log:
+        popen_kwargs.update({"stderr": subprocess.PIPE, "text": True, "bufsize": 1})
+    else:
+        popen_kwargs.update({"stderr": None})
     # Start server in its own process group so we can reliably terminate the whole tree.
     if os.name == "posix":  # Linux/macOS
         popen_kwargs["preexec_fn"] = os.setsid  # type: ignore[assignment]
     elif os.name == "nt":  # Windows
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-    return subprocess.Popen(cmd, **popen_kwargs)
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    thread: Optional[Thread] = None
+    if stderr_log:
+        thread = _start_stderr_tee(proc, stderr_log)
+    return ServerHandle(proc=proc, stderr_log=stderr_log, stderr_thread=thread)
 
 
-def terminate_server(proc: subprocess.Popen, uds_norm: Optional[str], timeout: float = 5.0) -> None:
+def terminate_server(handle: ServerHandle, uds_norm: Optional[str], timeout: float = 5.0) -> None:
+    proc = handle.proc
     try:
         if proc.poll() is not None:
             return
@@ -359,6 +463,8 @@ def terminate_server(proc: subprocess.Popen, uds_norm: Optional[str], timeout: f
                     proc.kill()
                 _ = proc.wait(timeout=timeout)
     finally:
+        if handle.stderr_thread is not None:
+            handle.stderr_thread.join(timeout=1.0)
         # Cleanup UDS path if provided
         if uds_norm:
             sock_path = uds_norm[5:] if uds_norm.startswith("unix:") else uds_norm
@@ -441,23 +547,25 @@ def main() -> None:
     base_cfg = read_toml(Path(args.config))
     variants = _sampling_grid_variants(base_cfg)
 
+    server_device = args.device.strip()
+
     # If no grid present, behave like before with a single config.
     single_cfg = None
     if len(variants) == 1 and variants[0][0] == "base":
-        client_cfg = make_client_cfg(Path(args.config), rp, uds=uds_norm[5:] if uds_norm else None, tcp=tcp_norm)
+        client_cfg = make_client_cfg(Path(args.config), rp, uds=uds_norm[5:] if uds_norm else None, tcp=tcp_norm, init_dir=args.init)
         single_cfg = client_cfg
         print(f"[bench] output dir: {rp.outdir}")
-        print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
+        print(f"[bench] server: device={server_device} compile={args.compile_mode} bind={bind}")
         print(f"[bench] client config: {client_cfg}")
     else:
         print(f"[bench] output dir: {rp.outdir}  (grid {len(variants)} variants)")
-        print(f"[bench] server: device={args.device} compile={args.compile_mode} bind={bind}")
+        print(f"[bench] server: device={server_device} compile={args.compile_mode} bind={bind}")
 
     # Persist run metadata for provenance
     meta = {
         "ts": now_ts(),
         "init_dir": str(Path(args.init).resolve()),
-        "device": args.device,
+        "device": server_device,
         "compile_mode": args.compile_mode,
         "bind": str(bind),
         "uds": uds_norm,
@@ -468,15 +576,25 @@ def main() -> None:
         "results_file": str(rp.results_file),
         "metrics_file": str(rp.metrics_file),
         "client_cfg": str(rp.client_cfg),
+        "server_stderr": str(rp.server_stderr),
     }
     with rp.meta_file.open("w", encoding="utf-8") as fp:
         json.dump(meta, fp, indent=2)
 
     # Start server (once for all variants)
-    srv = start_server(args.init, uds_norm or tcp_norm, args.device, args.compile_mode, args.no_cudagraphs)
+    # Propagate client's intended head order to server so outputs are normalized consistently.
+    head_order = "UDLR"
+    srv = start_server(
+        args.init,
+        uds_norm or tcp_norm,
+        server_device,
+        args.compile_mode,
+        args.no_cudagraphs,
+        stderr_log=rp.server_stderr,
+    )
     try:
         # Wait for bind and readiness
-        wait_for_socket(uds_norm, srv.pid, args.timeout)
+        wait_for_socket(uds_norm, srv.proc.pid, args.timeout)
         probe_grpc_ready(uds_norm or tcp_norm, args.timeout)
         if single_cfg is not None:
             # Single run
@@ -509,6 +627,15 @@ def main() -> None:
             _write_grid_csv_summary(rp.outdir, grid_rows)
     finally:
         terminate_server(srv, uds_norm, timeout=5.0)
+
+    server_rc = srv.proc.returncode
+    if server_rc not in (0, None):
+        print(
+            f"[bench] server exited with code {server_rc}; see {rp.server_stderr} for details",
+            file=sys.stderr,
+        )
+    elif rp.server_stderr.exists() and rp.server_stderr.stat().st_size > 0:
+        print(f"[bench] server stderr captured at {rp.server_stderr}")
 
     if not args.no_summary:
         if single_cfg is not None:

@@ -1,0 +1,57 @@
+init_dir = "checkpoints/20250924_082335/model-stable.pt"
+checkpoint_dir = "checkpoints"
+seed = 43
+
+[wandb]
+enabled = true
+project = "train-2048-macroxue-hardtarget"
+entity = ""
+run_name = ""
+tags = ["v2", "hard-move", "continue"]
+mode = "online"                            # online | offline | disabled
+report_every = 50                          # log to W&B every N steps (>=1)
+
+[target]
+mode = "hard_move"
+
+[hyperparameters]
+learning_rate = 5e-4
+# Continue from the stable plateau LR and cosine decay to the configured minimum ratio.
+grad_clip_norm = 1.0
+
+[hyperparameters.lr_schedule]
+name = "cosine"
+warmup_steps = 0
+min_lr_ratio = 0.1
+
+[hyperparameters.optimizer]
+name = "adamw"      # adamw | muon
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.98
+eps = 1e-8
+
+[batch]
+batch_size = 1024
+
+[dropout]
+dropout_prob = 0.03
+attention_dropout_prob = 0.0
+
+[dataset]
+dataset_dir = "datasets/macroxue/d6_1b_v2"
+mmap_mode = true
+num_steps = 800_000
+
+val_run_pct = 0.0025
+val_split_seed = 42
+val_num_steps = 500
+val_every = 10_000
+
+[checkpoint]
+# Continue writing validation-best bundles.
+save_best_every_steps = 10_000
+best_min_delta = 0.002
+save_pt_every_steps = 100_000
+# Retain any epoch checkpoints when iterating over the dataset multiple times.
+every_epochs = 1
