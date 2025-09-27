@@ -3,7 +3,7 @@ checkpoint_dir = "checkpoints"
 seed = 43
 
 [wandb]
-enabled = false
+enabled = true
 project = "train-2048-macroxue-hardtarget"
 entity = ""
 run_name = ""
