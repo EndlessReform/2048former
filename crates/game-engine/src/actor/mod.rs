@@ -26,6 +26,7 @@ pub struct GameActor {
     pub step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
     pub cancel: CancellationToken,
     pub step_budget: Option<StepBudget>,
+    pub record_logprobs: bool,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,7 @@ impl GameActor {
         step_tx: Option<tokio_mpsc::Sender<DsStepRow>>,
         cancel: CancellationToken,
         step_budget: Option<StepBudget>,
+        record_logprobs: bool,
     ) -> Self {
         // Initialize a fresh board with two random tiles
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -102,6 +104,7 @@ impl GameActor {
             step_tx,
             cancel,
             step_budget,
+            record_logprobs,
         }
     }
 
@@ -121,15 +124,8 @@ impl GameActor {
                 }
             }
             let id = ((self.game_id as u64) << 32) | seq;
+            let step_idx = steps as u32;
             let board_bytes = board_to_exponents(self.board, self.board_map.clone());
-            // Record step row (pre-move state) for dataset
-            if let Some(tx) = &self.step_tx {
-                let _ = tx.try_send(DsStepRow {
-                    run_id: self.game_id as u64,
-                    step_idx: steps as u32,
-                    exps: board_bytes,
-                });
-            }
             let rx = self.handle.submit(id, self.game_id, board_bytes).await;
             let inference = tokio::select! {
                 biased;
@@ -145,26 +141,36 @@ impl GameActor {
             // Compute legal mask in the configured head order and select move
             let order = self.head_order.clone();
             let legal = legal_mask(self.board, order.clone());
-            let mv = match inference {
+            let selection = match inference {
                 InferenceOutput::Bins(bins) => {
                     // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
                     let start_gate = self.sampling.start_gate_or_default();
                     let stop_gate = self.sampling.stop_gate();
                     let outside_window =
                         (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
-                    if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
-                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
-                    } else if outside_window {
-                        strategies::select_move_max_p1(&bins, &legal, order)
+                    if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) || outside_window {
+                        strategies::select_move_max_p1(
+                            &bins,
+                            &legal,
+                            order.clone(),
+                            self.record_logprobs,
+                        )
                     } else {
-                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
+                        strategies::select_move_with_details(
+                            &bins,
+                            &legal,
+                            &self.sampling,
+                            &mut rng,
+                            order.clone(),
+                            self.record_logprobs,
+                        )
                     }
                 }
                 InferenceOutput::Argmax { head, .. } => {
                     // Map head index according to configured order
                     let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
                     let idx = head as usize;
-                    if let Some(&choice) = dirs.get(idx) {
+                    let mv = if let Some(&choice) = dirs.get(idx) {
                         if legal.get(idx).copied().unwrap_or(false) {
                             Some(choice)
                         } else {
@@ -175,17 +181,53 @@ impl GameActor {
                         }
                     } else {
                         None
-                    }
+                    };
+                    let log_probs = if self.record_logprobs {
+                        let mut arr = [f32::NEG_INFINITY; 4];
+                        if let Some(choice) = mv {
+                            let idx = move_to_idx(choice);
+                            if idx < 4 {
+                                arr[idx] = 0.0;
+                            }
+                        }
+                        Some(arr)
+                    } else {
+                        None
+                    };
+                    strategies::Selection { mv, log_probs }
                 }
             };
 
-            if let Some(m) = mv {
-                // Apply move and spawn new tile using the Board API
-                self.board = self.board.make_move(m, &mut rng);
-                steps += 1;
-            } else {
+            let Some(m) = selection.mv else {
                 break;
+            };
+
+            let move_idx = move_to_idx(m);
+            let logp = if self.record_logprobs {
+                selection.log_probs.unwrap_or_else(|| {
+                    let mut arr = [f32::NEG_INFINITY; 4];
+                    if move_idx < 4 {
+                        arr[move_idx] = 0.0;
+                    }
+                    arr
+                })
+            } else {
+                [f32::NAN; 4]
+            };
+
+            if let Some(tx) = &self.step_tx {
+                let _ = tx.try_send(DsStepRow {
+                    run_id: self.game_id as u64,
+                    step_idx,
+                    exps: board_bytes,
+                    move_dir: move_idx as u8,
+                    logp,
+                });
             }
+
+            // Apply move and spawn new tile using the Board API
+            self.board = self.board.make_move(m, &mut rng);
+            steps += 1;
             seq += 1;
         }
 
@@ -219,4 +261,13 @@ fn legal_mask(board: Board, _order: config::HeadOrder) -> [bool; 4] {
         mask[i] = after.raw() != board.raw();
     }
     mask
+}
+
+fn move_to_idx(m: Move) -> usize {
+    match m {
+        Move::Up => 0,
+        Move::Down => 1,
+        Move::Left => 2,
+        Move::Right => 3,
+    }
 }

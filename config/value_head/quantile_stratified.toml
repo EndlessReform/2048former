@@ -1,0 +1,71 @@
+# Value-head training scaffold focused on stratified per-game sampling.
+# This config leans on the self-play 50M v2 dump and caps each run to 512 states
+# spread across early/mid/late quantiles to avoid oversampling long episodes.
+
+init_dir = "inits/v1_50m"
+checkpoint_dir = "checkpoints/value-head"
+seed = 7
+
+[wandb]
+enabled = false
+project = "train-2048-value-head"
+entity = ""
+run_name = "value-head-quantile"
+tags = ["value-head", "quantile-sampler"]
+mode = "disabled"
+report_every = 100
+
+[target]
+# Placeholder target while the value-head objective is under development.
+# Swap to "value_ordinal" or "value_categorical" once the objective lands.
+mode = "binned_ev"
+
+[hyperparameters]
+learning_rate = 2e-4
+muon_lr = 1.5e-2
+
+[hyperparameters.lr_schedule]
+name = "cosine"
+warmup_steps = 4_000
+min_lr_ratio = 0.1
+
+[hyperparameters.optimizer]
+name = "adamw"
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.98
+eps = 1e-8
+
+[batch]
+batch_size = 512
+
+[dropout]
+dropout_prob = 0.05
+attention_dropout_prob = 0.0
+
+[binning]
+strategy = "edges"
+special_zero_one = true
+edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
+
+[dataset]
+dataset_dir = "selfplay/50m_v2_hard_target"
+mmap_mode = true
+shuffle = true
+shuffle_buffer_size = 2_000_000
+num_steps = 100_000
+val_run_pct = 0.01
+val_split_seed = 42
+val_num_steps = 1_000
+val_every = 5_000
+
+[dataset.value_sampler]
+enabled = true
+max_states_per_game = 512
+stage_boundaries = [0.0, 0.25, 0.75, 1.0]
+stage_weights = [0.25, 0.45, 0.30]  # emphasize mid-game exposure
+
+[checkpoint]
+save_best_every_steps = 5_000
+best_min_delta = 0.001
+save_pt_every_steps = 50_000

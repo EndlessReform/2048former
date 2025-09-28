@@ -1,0 +1,37 @@
+max_steps = 50_000_000
+max_concurrent_games = 256
+max_retries = 3
+
+[sampling]
+strategy = "Argmax"
+
+[orchestrator.connection]
+uds_path = "/tmp/2048_infer.sock"
+
+[orchestrator.batch]
+flush_us = 250
+target_batch = 512
+max_batch = 1024
+inflight_batches = 2
+per_game_inflight = 16
+queue_cap = 65536
+metrics_interval_s = 5
+
+[orchestrator]
+# V2 hard-target models require these settings.
+head_order = "UDLR"
+board_mapping = "MSB"
+argmax_only = true
+inline_embeddings = true
+# Requires the inference server to return embeddings. When unavailable, the
+# collector writes steps-only shards after hitting shard_max_steps.
+random_seeds = true
+# Optional: set to true to record per-move log-probabilities for KD experiments.
+record_logprobs = false
+
+[orchestrator.report]
+session_dir = "selfplay/50m_v2_hard_target"
+# Optional sanity caps (approximate):
+shard_max_steps = 10_000_000
+max_ram_mb = 16384
+max_gb = 120

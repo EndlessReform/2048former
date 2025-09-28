@@ -198,6 +198,9 @@ pub struct Orchestrator {
     /// If true, request argmax-only responses from the inference server.
     #[serde(default)]
     pub argmax_only: bool,
+    /// When true, record per-move log-probabilities alongside steps.
+    #[serde(default)]
+    pub record_logprobs: bool,
     /// Order of heads in model output (UDLR only; legacy options removed).
     #[serde(default)]
     pub head_order: Option<HeadOrder>,
@@ -244,6 +247,7 @@ impl Default for Orchestrator {
             fixed_seed: None,
             random_seeds: false,
             argmax_only: false,
+            record_logprobs: false,
             head_order: None,
             board_mapping: None,
         }

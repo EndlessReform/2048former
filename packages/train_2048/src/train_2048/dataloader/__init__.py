@@ -47,6 +47,7 @@ def build_dataloaders(
         train_num_steps=getattr(ds_cfg, "num_steps", None),
         val_num_steps=getattr(ds_cfg, "val_num_steps", None),
         val_steps_pct=float(getattr(ds_cfg, "val_steps_pct", 0.0) or 0.0),
+        value_sampler=getattr(ds_cfg, "value_sampler", None),
     )
 
 

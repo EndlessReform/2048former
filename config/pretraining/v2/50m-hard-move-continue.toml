@@ -41,7 +41,7 @@ attention_dropout_prob = 0.0
 [dataset]
 dataset_dir = "datasets/macroxue/d6_1b_v2"
 mmap_mode = true
-num_steps = 800_000
+num_steps = 400_000
 
 val_run_pct = 0.0025
 val_split_seed = 42

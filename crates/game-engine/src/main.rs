@@ -6,8 +6,9 @@ mod grpc;
 mod recorder;
 
 use clap::Parser;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -99,6 +100,9 @@ impl ShardedWriter {
                 }
             } else {
                 self.pending_steps.insert(id, row);
+                if self.pending_steps.len() >= self.shard_max_steps {
+                    self.flush_pending_steps("pending_full");
+                }
             }
         } else {
             self.steps_buf.push(row);
@@ -164,7 +168,7 @@ impl ShardedWriter {
                 reason
             );
         }
-        let steps_bytes_est = self.steps_buf.len() * (8 + 4 + 16);
+        let steps_bytes_est = self.steps_buf.len() * mem::size_of::<ds_writer::StepRow>();
         if self
             .max_gb
             .map_or(false, |gb| (steps_bytes_est as f64) / 1e9 > gb)
@@ -203,6 +207,33 @@ impl ShardedWriter {
 
     fn flush(&mut self) {
         self.write_shard("flush");
+        self.flush_pending_steps("flush_pending");
+    }
+
+    fn flush_pending_steps(&mut self, reason: &str) {
+        if self.pending_steps.is_empty() {
+            return;
+        }
+        let mut pending: Vec<_> = self.pending_steps.drain().collect();
+        let pending_count = pending.len();
+        pending.sort_by_key(|(id, _)| *id);
+        for (_, row) in pending {
+            self.steps_buf.push(row);
+        }
+        if self.inline_embeddings {
+            if self.pending_embs.is_empty() {
+                warn!(
+                    "inline embeddings requested but missing; flushing {pending_count} pending steps without embeddings"
+                );
+            } else {
+                warn!(
+                    "dropping {} unmatched embeddings while flushing {pending_count} pending steps",
+                    self.pending_embs.len()
+                );
+            }
+            self.pending_embs.clear();
+        }
+        self.write_shard(reason);
     }
 }
 
@@ -566,6 +597,7 @@ async fn main() {
                 Some(step_tx.clone()),
                 cancel.clone(),
                 step_budget.clone(),
+                config.orchestrator.record_logprobs,
             );
             set.spawn(actor.run());
             started += 1;

@@ -19,6 +19,7 @@ def save_pt_bundle(
     optimizer: Optional[torch.optim.Optimizer],
     training_cfg: Optional[object],
     global_step: Optional[int],
+    scheduler_state: Optional[dict],
 ) -> Path:
     """Persist a torch ``.pt`` bundle with weights, optimizer state, and metadata."""
 
@@ -29,15 +30,18 @@ def save_pt_bundle(
         "optimizer": (optimizer.state_dict() if optimizer is not None else None),
         "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
         "training_config": training_cfg.model_dump() if training_cfg is not None and hasattr(training_cfg, "model_dump") else None,
+        "lr_scheduler": scheduler_state,
     }
     torch.save(payload, str(path))
     return path
 
 
-def maybe_resume_optimizer_from_init(init_dir: str, optimizer: torch.optim.Optimizer) -> Optional[int]:
+def maybe_resume_optimizer_from_init(init_dir: str, optimizer: torch.optim.Optimizer) -> tuple[Optional[int], Optional[dict]]:
     """If an init folder or checkpoint bundle contains a PT payload, load state.
 
-    Returns the saved global_step when available, else None. Safe no-op on failure.
+    Returns a tuple ``(global_step, scheduler_state)`` when available; both entries
+    are ``None`` on failure. ``scheduler_state`` mirrors the payload stored by
+    ``save_pt_bundle`` and may be used to resume LR schedules.
     """
     init_path = Path(init_dir)
     if init_path.is_file():
@@ -58,12 +62,15 @@ def maybe_resume_optimizer_from_init(init_dir: str, optimizer: torch.optim.Optim
                         gs_int = int(gs) if gs is not None else None
                     except Exception:
                         gs_int = None
+                    sched_state = bundle.get("lr_scheduler") if isinstance(bundle, dict) else None
+                    if sched_state is not None and not isinstance(sched_state, dict):
+                        sched_state = None
                     print(f"[resume] Loaded optimizer state from {pt}")
-                    return gs_int
+                    return gs_int, sched_state
             except Exception as e:
                 print(f"[resume] Failed to load optimizer from {pt}: {e}")
-                return None
-    return None
+                return None, None
+    return None, None
 
 
 def create_run_dir(base_dir: str) -> Path:
@@ -105,6 +112,7 @@ def _save_stable_bundle(
     optimizer: Optional[torch.optim.Optimizer],
     training_cfg: Optional[object],
     global_step: Optional[int],
+    scheduler_state: Optional[dict],
 ) -> None:
     """Write both safetensors and a .pt bundle for stable checkpoint.
 
@@ -120,6 +128,7 @@ def _save_stable_bundle(
             optimizer=optimizer,
             training_cfg=training_cfg,
             global_step=global_step,
+            scheduler_state=scheduler_state,
         )
     except Exception:
         pass
@@ -135,13 +144,14 @@ def maybe_save_stable(
     decay_steps: int,
     decay_start: int,
     preflag: dict,
+    scheduler_state: Optional[dict],
 ) -> None:
     if preflag.get("saved", False):
         return
     if decay_steps <= 0:
         return
     if global_step == decay_start:
-        _save_stable_bundle(run_dir, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=global_step)
+        _save_stable_bundle(run_dir, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=global_step, scheduler_state=scheduler_state)
         preflag["saved"] = True
 
 
@@ -158,6 +168,7 @@ def maybe_save_best(
     best_tracker: Dict[str, float],
     optimizer: Optional[torch.optim.Optimizer],
     training_cfg: Optional[object],
+    scheduler_state: Optional[dict],
     wandb_run: Optional[object] = None,
 ):
     if cfg_checkpoint is None or cfg_checkpoint.save_best_every_steps is None or dl_val is None:
@@ -178,6 +189,7 @@ def maybe_save_best(
                 optimizer=optimizer,
                 training_cfg=training_cfg,
                 global_step=step,
+                scheduler_state=scheduler_state,
             )
         except Exception as e:
             print(f"[ckpt] Failed to write best checkpoint at step {step}: {e}")
@@ -192,7 +204,7 @@ def maybe_save_best(
                 pass
 
 
-def dangerous_dump_pt(*, cfg, run_dir: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, step: int) -> None:
+def dangerous_dump_pt(*, cfg, run_dir: Path, model: torch.nn.Module, optimizer: torch.optim.Optimizer, step: int, scheduler_state: Optional[dict]) -> None:
     if not getattr(cfg, "dangerous_just_checkpoint", False):
         return
     if step <= 0:
@@ -204,6 +216,7 @@ def dangerous_dump_pt(*, cfg, run_dir: Path, model: torch.nn.Module, optimizer: 
             "optimizer": optimizer.state_dict(),
             "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
             "training_config": cfg.model_dump(),
+            "lr_scheduler": scheduler_state,
         }
         path = run_dir / f"dangerous-step-{step:08d}.pt"
         try:
@@ -221,6 +234,7 @@ def maybe_save_pt_interval(
     training_cfg: Optional[object],
     step: int,
     interval: Optional[int],
+    scheduler_state: Optional[dict],
 ) -> None:
     if interval is None or interval <= 0:
         return
@@ -228,7 +242,7 @@ def maybe_save_pt_interval(
         return
     path = run_dir / f"model-step-{step:08d}.pt"
     try:
-        save_pt_bundle(path, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=step)
+        save_pt_bundle(path, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=step, scheduler_state=scheduler_state)
         print(f"[ckpt] Saved step checkpoint: {path}")
     except Exception as e:
         print(f"[ckpt] Failed to write step checkpoint at step {step}: {e}")

@@ -76,6 +76,7 @@ def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Op
         val_split_seed=cfg.dataset.val_split_seed,
         num_workers_train=12,
         mmap_mode=cfg.dataset.mmap_mode,
+        value_sampler=cfg.dataset.value_sampler,
     )
 
 
@@ -164,7 +165,13 @@ def init_optimizer(model: torch.nn.Module, cfg: TrainingConfig) -> torch.optim.O
     raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
 
-def make_scheduler(cfg: TrainingConfig, optimizer: torch.optim.Optimizer, total_steps: int) -> tuple[Callable[[int], float], Callable[[float], float], dict]:
+def make_scheduler(
+    cfg: TrainingConfig,
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    *,
+    scheduler_offset: int = 0,
+) -> tuple[Callable[[int], float], Callable[[float], float], dict]:
     lr_cfg = cfg.hyperparameters.lr_schedule
     base_lrs = [pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups]
 
@@ -189,25 +196,26 @@ def make_scheduler(cfg: TrainingConfig, optimizer: torch.optim.Optimizer, total_
         decay_start_step = warmup_steps  # cosine begins immediately after warmup
 
     def scale_for_step(step_idx: int) -> float:
+        rel_step = max(0, step_idx - scheduler_offset)
         if lr_cfg.name == "constant" or total_steps <= 0:
             return 1.0
-        if warmup_steps > 0 and step_idx < warmup_steps:
-            return float(step_idx + 1) / float(warmup_steps)
+        if warmup_steps > 0 and rel_step < warmup_steps:
+            return float(rel_step + 1) / float(warmup_steps)
         if lr_cfg.name == "cosine":
             if decay_steps <= 0:
                 return 1.0
-            progress = max(0, min(step_idx - warmup_steps, decay_steps))
+            progress = max(0, min(rel_step - warmup_steps, decay_steps))
             if decay_steps == 0:
                 return lr_cfg.min_lr_ratio
             frac = float(progress) / float(decay_steps)
             cosine = 0.5 * (1.0 + math.cos(math.pi * frac))
             return lr_cfg.min_lr_ratio + (1.0 - lr_cfg.min_lr_ratio) * cosine
         # warmup-stable-decay path
-        if step_idx < (warmup_steps + stable_steps):
+        if rel_step < (warmup_steps + stable_steps):
             return 1.0
         if decay_steps <= 0:
             return 1.0
-        pos = step_idx - decay_start_step + 1
+        pos = rel_step - decay_start_step + 1
         pos = max(1, min(pos, decay_steps))
         frac = float(pos) / float(decay_steps)
         return 1.0 - (1.0 - lr_cfg.min_lr_ratio) * frac
@@ -291,8 +299,9 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     optimizer = init_optimizer(model, cfg)
     # Try to resume optimizer state from init_dir (.pt bundle), if present
     resumed_step: Optional[int] = None
+    saved_scheduler_state: Optional[dict] = None
     try:
-        resumed_step = maybe_resume_optimizer_from_init(cfg.init_dir, optimizer)
+        resumed_step, saved_scheduler_state = maybe_resume_optimizer_from_init(cfg.init_dir, optimizer)
         if resumed_step is not None:
             print(f"[resume] Optimizer resumed; starting from global_step={resumed_step}")
     except Exception:
@@ -305,22 +314,119 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     steps_this_epoch = fixed_steps if fixed_steps > 0 else per_epoch_steps
     total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
 
-    scale_for_step, apply_lr, sched_meta = make_scheduler(cfg, optimizer, total_steps)
+    lr_cfg = cfg.hyperparameters.lr_schedule
+
+    scheduler_offset = 0
+    scheduler_resume_mode = "fresh"
+    scheduler_relative_start = 0
+    effective_total_steps = total_steps
+
+    if lr_cfg.name == "cosine":
+        if saved_scheduler_state and saved_scheduler_state.get("name") == "cosine":
+            scheduler_offset = int(saved_scheduler_state.get("offset", 0))
+            saved_total = int(saved_scheduler_state.get("total_steps", 0))
+            if saved_total > 0:
+                if effective_total_steps <= 0:
+                    effective_total_steps = saved_total
+                else:
+                    effective_total_steps = max(saved_total, effective_total_steps)
+            scheduler_relative_start = int(saved_scheduler_state.get("relative_step", max(0, (resumed_step or 0) - scheduler_offset)))
+            if scheduler_offset == 0 and resumed_step is not None:
+                scheduler_offset = int(resumed_step) - scheduler_relative_start
+            scheduler_resume_mode = "resume" if resumed_step is not None else "resume-noopt"
+        else:
+            if saved_scheduler_state is None and resumed_step is not None:
+                print("[lr] No cosine scheduler state found; treating resume as fresh schedule.")
+            if saved_scheduler_state is not None:
+                print(
+                    f"[lr] Ignoring saved scheduler state (name={saved_scheduler_state.get('name')}) for cosine resume; resetting schedule."
+                )
+            scheduler_offset = int(resumed_step or 0)
+            scheduler_relative_start = max(0, (resumed_step or 0) - scheduler_offset)
+            scheduler_resume_mode = "reset"
+    else:
+        scheduler_offset = 0
+        scheduler_relative_start = max(0, (resumed_step or 0) - scheduler_offset)
+        if saved_scheduler_state is not None and saved_scheduler_state.get("name") not in (None, lr_cfg.name):
+            print(
+                f"[lr] Saved scheduler state ({saved_scheduler_state.get('name')}) does not match configured '{lr_cfg.name}', ignoring."
+            )
+
+    scale_for_step, apply_lr, sched_meta = make_scheduler(
+        cfg,
+        optimizer,
+        effective_total_steps,
+        scheduler_offset=scheduler_offset,
+    )
+
+    global_step = int(resumed_step) if (resumed_step is not None) else 0
+
+    sched_meta["scheduler_offset"] = scheduler_offset
+    sched_meta["effective_total_steps"] = effective_total_steps
+
+    print(
+        "[lr] mode={mode} total_steps={total} warmup={warmup} decay={decay} offset={offset} start_relative_step={start} resume_mode={resume}".format(
+            mode=lr_cfg.name,
+            total=effective_total_steps,
+            warmup=sched_meta.get("warmup_steps", 0),
+            decay=sched_meta.get("decay_steps", 0),
+            offset=scheduler_offset,
+            start=scheduler_relative_start,
+            resume=scheduler_resume_mode,
+        )
+    )
+    print(
+        f"[lr] initial_scale={scale_for_step(global_step):.6f} (global_step={global_step})"
+    )
 
     run_ckpt_dir = create_run_dir(cfg.checkpoint_dir)
     print(f"Checkpoint directory: {run_ckpt_dir}")
     dump_training_and_model_config(run_ckpt_dir, cfg, model)
-
-    global_step = int(resumed_step) if (resumed_step is not None) else 0
     pre_decay_flag = {"saved": False}
     best_tracker: Dict[str, float] = {}
     wandb_report_every = max(1, int(getattr(getattr(cfg, "wandb", None), "report_every", 1)))
+
+    def _current_scheduler_state(step: int) -> Optional[dict]:
+        if lr_cfg.name == "constant":
+            return {
+                "version": 1,
+                "name": lr_cfg.name,
+                "global_step": int(step),
+                "offset": int(scheduler_offset),
+                "total_steps": int(effective_total_steps),
+            }
+        rel = max(0, step - scheduler_offset)
+        state = {
+            "version": 1,
+            "name": lr_cfg.name,
+            "global_step": int(step),
+            "relative_step": int(rel),
+            "offset": int(scheduler_offset),
+            "total_steps": int(effective_total_steps),
+            "warmup_steps": int(sched_meta.get("warmup_steps", 0)),
+            "decay_steps": int(sched_meta.get("decay_steps", 0)),
+            "stable_steps": int(sched_meta.get("stable_steps", 0)),
+            "decay_start_step": int(sched_meta.get("decay_start_step", 0)),
+        }
+        if hasattr(lr_cfg, "min_lr_ratio"):
+            state["min_lr_ratio"] = float(getattr(lr_cfg, "min_lr_ratio", 0.0))
+        return state
 
     for epoch in range(epochs):
         it = iter(dl_train)
         pbar = tqdm(range(steps_this_epoch), desc=("Train" if fixed_steps > 0 else f"Epoch {epoch + 1}/{epochs}"), dynamic_ncols=True, total=steps_this_epoch)
         for _ in pbar:
-            maybe_save_stable(model, run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, global_step=global_step, decay_steps=sched_meta["decay_steps"], decay_start=sched_meta["decay_start_step"], preflag=pre_decay_flag)
+            maybe_save_stable(
+                model,
+                run_ckpt_dir,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                global_step=global_step,
+                decay_steps=sched_meta["decay_steps"],
+                decay_start=sched_meta["decay_start_step"],
+                preflag=pre_decay_flag,
+                scheduler_state=_current_scheduler_state(global_step),
+            )
             lr_now = apply_lr(scale_for_step(global_step))
             t0 = time.perf_counter()
             try:
@@ -345,10 +451,33 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                 _wandb_log(_build_train_payload(metrics, lr_now, target_mode, epoch=(None if fixed_steps > 0 else epoch), dt_data_ms=(t1 - t0) * 1e3, dt_comp_ms=(t2 - t1) * 1e3), step=global_step)
             _maybe_log_val(objective, model, dl_val, device, cfg=cfg, target_mode=target_mode, step=global_step, wandb_run=wandb_run, epoch=(None if fixed_steps > 0 else epoch))
             global_step += 1
-            maybe_save_pt_interval(model=model, run_dir=run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, step=global_step, interval=getattr(cfg.checkpoint, "save_pt_every_steps", None))
-            maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=(None if fixed_steps > 0 else epoch), best_tracker=best_tracker, optimizer=optimizer, training_cfg=cfg, wandb_run=wandb_run)
+            sched_state_now = _current_scheduler_state(global_step)
+            maybe_save_pt_interval(
+                model=model,
+                run_dir=run_ckpt_dir,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                step=global_step,
+                interval=getattr(cfg.checkpoint, "save_pt_every_steps", None),
+                scheduler_state=sched_state_now,
+            )
+            maybe_save_best(
+                model=model,
+                run_dir=run_ckpt_dir,
+                evaluate_fn=objective.evaluate,
+                dl_val=dl_val,
+                device=device,
+                cfg_checkpoint=cfg.checkpoint,
+                step=global_step,
+                epoch=(None if fixed_steps > 0 else epoch),
+                best_tracker=best_tracker,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                scheduler_state=sched_state_now,
+                wandb_run=wandb_run,
+            )
             if fixed_steps == 0:
-                dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step)
+                dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step, scheduler_state=sched_state_now)
         if fixed_steps == 0 and getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):
             save_safetensors(model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors")
 

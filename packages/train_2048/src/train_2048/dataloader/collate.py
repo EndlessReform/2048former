@@ -162,31 +162,52 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
         batch = dataset.get_rows(idxs)
 
         # Decode board exponents (dataset packs MSB-first into uint64 + optional 65536 mask)
-        if 'board' not in batch.dtype.names:
-            raise KeyError("'board' field is required in steps.npy")
-        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
-        # Always decode MSB-first packed boards, then apply 65536 mask
         from ..tokenization.base import BoardCodec as _BC
-        exps_np = _BC.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
+        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
+
+        if 'board' in batch.dtype.names:
+            # Packed 64-bit board as produced by legacy datasets.
+            exps_np = _BC.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
+        elif 'exps' in batch.dtype.names:
+            # Lean self-play writer already stores raw exponents per tile.
+            exps_np = batch['exps'].astype(_np.uint8, copy=False)
+        else:
+            raise KeyError("steps.npy must provide either 'board' or 'exps' field")
+
         tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
 
-        # Branch EVs and legal moves are UDLR in the dataset
-        # Support both new ('branch_evs') and old ('ev_values') field names
+        # Branch EVs and legal moves are UDLR when present. Self-play v1 lean
+        # dumps omit them; tolerate that unless the objective requires them.
+        branch_values = None
+        branch_mask = None
+        evs = None
         if 'branch_evs' in batch.dtype.names:
             evs = batch['branch_evs'].astype(_np.float32, copy=False)
         elif 'ev_values' in batch.dtype.names:
             evs = batch['ev_values'].astype(_np.float32, copy=False)
-        else:
-            raise KeyError("'branch_evs' or 'ev_values' missing from steps.npy")
-        legal = BoardCodec.legal_mask_from_bits_udlr(batch['ev_legal']) if 'ev_legal' in batch.dtype.names else _np.isfinite(evs)
-        branch_values = torch.from_numpy(evs.copy()).to(dtype=torch.float32)
-        branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))
+
+        if evs is not None:
+            legal = (
+                BoardCodec.legal_mask_from_bits_udlr(batch['ev_legal'])
+                if 'ev_legal' in batch.dtype.names
+                else _np.isfinite(evs)
+            )
+            branch_values = torch.from_numpy(evs.copy()).to(dtype=torch.float32)
+            branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))
 
         out = {
             "tokens": tokens,
-            "branch_values": branch_values,
         }
+        if 'logp' in batch.dtype.names:
+            logp_np = batch['logp'].astype(_np.float32, copy=False)
+            out["policy_logp"] = torch.from_numpy(logp_np.copy()).to(dtype=torch.float32)
+        if branch_values is not None:
+            out["branch_values"] = branch_values
+        if branch_mask is not None:
+            out["branch_mask"] = branch_mask
         if target_mode == "binned_ev":
+            if branch_values is None or branch_mask is None:
+                raise KeyError("binned_ev target requires branch_evs/ev_values fields")
             if ev_tokenizer is not None:
                 try:
                     ev_tokenizer.to(branch_values.device)  # type: ignore[attr-defined]
@@ -206,9 +227,11 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
             elif 'move' in batch.dtype.names:
                 dirs_arr = batch['move'].astype(_np.int64, copy=False)
             else:
-                raise KeyError("move_dir/move missing from steps.npy for hard_move target")
+                raise KeyError(
+                    "move_dir/move missing from steps.npy for hard_move target"
+                )
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
-        return out
+            return out
 
     return _collate
 

@@ -17,6 +17,69 @@ class TargetConfig(BaseModel):
     mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
 
 
+class ValueSamplerConfig(BaseModel):
+    """Configure per-game stratified sampling for state selection."""
+
+    enabled: bool = False
+    max_states_per_game: int = 512
+    stage_boundaries: list[float] = Field(default_factory=lambda: [0.0, 0.25, 0.75, 1.0])
+    stage_weights: Optional[list[float]] = None
+
+    @field_validator("max_states_per_game")
+    @classmethod
+    def _max_states_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("max_states_per_game must be > 0")
+        return v
+
+    @field_validator("stage_boundaries")
+    @classmethod
+    def _validate_boundaries(cls, v: list[float]) -> list[float]:
+        if len(v) < 2:
+            raise ValueError("stage_boundaries must contain at least two values")
+        if abs(v[0]) > 1e-8:
+            raise ValueError("stage_boundaries must start at 0.0")
+        if abs(v[-1] - 1.0) > 1e-8:
+            raise ValueError("stage_boundaries must end at 1.0")
+        for lo, hi in zip(v, v[1:]):
+            if hi < lo:
+                raise ValueError("stage_boundaries must be non-decreasing")
+        return v
+
+    @field_validator("stage_weights")
+    @classmethod
+    def _validate_weights(cls, weights: Optional[list[float]], info) -> Optional[list[float]]:
+        if weights is None:
+            return None
+        boundaries = info.data.get("stage_boundaries") or []
+        expected = max(len(boundaries) - 1, 0)
+        if len(weights) != expected:
+            raise ValueError(
+                "stage_weights must match the number of stage intervals"
+            )
+        if any(w < 0.0 for w in weights):
+            raise ValueError("stage_weights must be non-negative")
+        total = float(sum(weights))
+        if total <= 0.0:
+            raise ValueError("stage_weights must sum to a positive value")
+        return weights
+
+    def normalized_weights(self) -> list[float]:
+        """Return stage weights normalized to sum to 1 across intervals."""
+
+        weights = self.stage_weights
+        if weights is None:
+            diffs = [max(0.0, hi - lo) for lo, hi in zip(self.stage_boundaries, self.stage_boundaries[1:])]
+            total = float(sum(diffs))
+            if total <= 0.0:
+                # Fallback to uniform weights per stage when boundaries collapse
+                n = max(len(diffs), 1)
+                return [1.0 / n] * n
+            return [d / total for d in diffs]
+        total = float(sum(weights))
+        return [w / total for w in weights]
+
+
 def _find_repo_root() -> Path:
     """Return the repository root by walking upwards.
 
@@ -62,6 +125,7 @@ class DatasetConfig(BaseModel):
     # - If True, use buffered shuffle to avoid materializing a full permutation
     shuffle: bool = False
     shuffle_buffer_size: int = 1_000_000
+    value_sampler: Optional[ValueSamplerConfig] = None
     # Validation limits
     # Cap validation to a fixed number of steps (batches). When >0, overrides val_steps_pct.
     val_num_steps: Optional[int] = None
@@ -310,6 +374,7 @@ __all__ = [
     "BatchConfig",
     "DropoutConfig",
     "TargetConfig",
+    "ValueSamplerConfig",
     "CheckpointConfig",
     "TrainingConfig",
     "load_config",

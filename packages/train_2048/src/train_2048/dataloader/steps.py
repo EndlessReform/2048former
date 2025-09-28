@@ -14,6 +14,7 @@ from .collate import (
 )
 
 from ..binning import Binner
+from ..config import ValueSamplerConfig
 from ..tokenization.macroxue import MacroxueTokenizerSpec
 from ..tokenization.base import BoardCodec
 
@@ -51,6 +52,21 @@ class StepsDataset(Dataset):
                 raise FileNotFoundError(f"Missing steps.npy or steps-*.npy at {root}")
             self.shards = [_np.load(str(steps_path), mmap_mode="r" if mmap_mode else None)]
             self.cum_counts = np.array([0, self.shards[0].shape[0]])
+
+        # Determine the canonical step index field the dataset exposes. Some
+        # historic collections used "step_index" while the lean self-play
+        # writer emits "step_idx"; support both so downstream samplers can
+        # reference a single attribute.
+        dtype_names = self.shards[0].dtype.names or ()
+        self.step_field = None
+        for candidate in ("step_index", "step_idx"):
+            if candidate in dtype_names:
+                self.step_field = candidate
+                break
+        if self.step_field is None:
+            raise KeyError(
+                "steps.npy is missing required 'step_index' or 'step_idx' column"
+            )
 
         # Resolve the indices to iterate over. Avoid constructing a giant
         # arange by default; None sentinel means "all rows".
@@ -215,7 +231,7 @@ class FilteredBufferedShuffleSampler(Sampler[int]):
             # Iterate in chunks to cap memory bandwidth
             for lo in range(0, N, self.chunk_size):
                 hi = min(N, lo + self.chunk_size)
-                step_idx = shard['step_index'][lo:hi].astype(_np.int64, copy=False)
+                step_idx = shard[ds.step_field][lo:hi].astype(_np.int64, copy=False)
                 keep = _np.ones(step_idx.shape[0], dtype=bool)
                 if self.smin is not None:
                     keep &= step_idx >= int(self.smin)
@@ -259,7 +275,7 @@ class FilteredBufferedShuffleSampler(Sampler[int]):
         # Compute and cache
         total = 0
         for s_idx, shard in enumerate(self.dataset.shards):
-            step_idx = shard['step_index']
+            step_idx = shard[self.dataset.step_field]
             if self.smin is not None and self.smax is not None:
                 mask = (step_idx >= int(self.smin)) & (step_idx <= int(self.smax))
                 total += int(np.count_nonzero(mask))
@@ -309,7 +325,7 @@ class FilteredStreamingSampler(Sampler[int]):
             N = shard.shape[0]
             for lo in range(0, N, self.chunk_size):
                 hi = min(N, lo + self.chunk_size)
-                step_idx = shard['step_index'][lo:hi].astype(_np.int64, copy=False)
+                step_idx = shard[ds.step_field][lo:hi].astype(_np.int64, copy=False)
                 keep = _np.ones(step_idx.shape[0], dtype=bool)
                 if self.smin is not None:
                     keep &= step_idx >= int(self.smin)
@@ -349,6 +365,223 @@ class FilteredStreamingSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self.total_samples
+
+
+def _ensure_run_index_cache(dataset: "StepsDataset") -> dict[str, np.ndarray]:
+    """Materialize and cache arrays for grouping steps by run."""
+
+    cache = getattr(dataset, "_run_index_cache", None)
+    if cache is not None:
+        return cache
+
+    import numpy as _np
+
+    run_chunks = []
+    step_chunks = []
+    global_chunks = []
+    for shard_idx, shard in enumerate(dataset.shards):
+        offset = int(dataset.cum_counts[shard_idx])
+        count = shard.shape[0]
+        run_chunks.append(shard["run_id"].astype(_np.int64, copy=False))
+        step_chunks.append(shard[dataset.step_field].astype(_np.int64, copy=False))
+        global_chunks.append(_np.arange(count, dtype=_np.int64) + offset)
+
+    run_ids = _np.concatenate(run_chunks)
+    step_idx = _np.concatenate(step_chunks)
+    global_idx = _np.concatenate(global_chunks)
+
+    order = _np.lexsort((step_idx, run_ids))
+    sorted_run_ids = run_ids[order]
+    sorted_global_idx = global_idx[order]
+
+    unique_runs, first_idx, counts = _np.unique(
+        sorted_run_ids, return_index=True, return_counts=True
+    )
+    run_offsets = _np.empty(unique_runs.size + 1, dtype=_np.int64)
+    run_offsets[:-1] = first_idx
+    run_offsets[-1] = sorted_run_ids.size
+
+    cache = {
+        "unique_runs": unique_runs,
+        "run_offsets": run_offsets,
+        "sorted_global_idx": sorted_global_idx,
+    }
+    setattr(dataset, "_run_index_cache", cache)
+    return cache
+
+
+def _evenly_spaced_offsets(length: int, count: int) -> np.ndarray:
+    """Return ``count`` offsets within ``[0, length)`` spaced across the range."""
+
+    if count >= length:
+        return np.arange(length, dtype=np.int64)
+    if count <= 0:
+        return np.empty((0,), dtype=np.int64)
+    offsets = np.linspace(0, length - 1, num=count, endpoint=True, dtype=np.float64)
+    offsets = np.rint(offsets).astype(np.int64, copy=False)
+    offsets = np.clip(offsets, 0, length - 1)
+    offsets = np.unique(offsets)
+    if offsets.size < count:
+        pool = np.arange(length, dtype=np.int64)
+        used = np.zeros(length, dtype=bool)
+        used[offsets] = True
+        missing = count - offsets.size
+        extras = pool[~used][:missing]
+        offsets = np.sort(np.concatenate([offsets, extras]))
+    return offsets
+
+
+def _select_positions_for_run(total_steps: int, sampler: ValueSamplerConfig) -> np.ndarray:
+    """Compute relative positions for a run following stratified quantiles."""
+
+    if total_steps <= 0:
+        return np.empty((0,), dtype=np.int64)
+
+    max_samples = min(int(sampler.max_states_per_game), int(total_steps))
+    if max_samples >= total_steps:
+        return np.arange(total_steps, dtype=np.int64)
+
+    boundaries = np.asarray(sampler.stage_boundaries, dtype=np.float64)
+    weights = np.asarray(sampler.normalized_weights(), dtype=np.float64)
+    num_stages = max(0, boundaries.size - 1)
+    if num_stages == 0:
+        return np.arange(max_samples, dtype=np.int64)
+
+    stage_ranges: list[tuple[int, int]] = []
+    prev_end = -1
+    for i in range(num_stages):
+        lo = float(boundaries[i])
+        hi = float(boundaries[i + 1])
+
+        raw_start = 0 if i == 0 else int(np.floor(lo * total_steps))
+        start = max(prev_end + 1, raw_start)
+
+        if i == num_stages - 1 or hi >= 1.0 - 1e-8:
+            end = total_steps - 1
+        else:
+            end = int(np.ceil(hi * total_steps)) - 1
+        end = min(end, total_steps - 1)
+
+        if end < start:
+            stage_ranges.append((start, 0))
+            continue
+        length = end - start + 1
+        stage_ranges.append((start, length))
+        prev_end = end
+
+    available_indices = [idx for idx, (_, length) in enumerate(stage_ranges) if length > 0]
+    if not available_indices:
+        # Degenerate case: fall back to first ``max_samples`` steps
+        return np.arange(max_samples, dtype=np.int64)
+
+    weights = weights[: num_stages]
+    avail_weights = np.asarray([weights[idx] for idx in available_indices], dtype=np.float64)
+    # Renormalize within available stages
+    total_w = float(avail_weights.sum())
+    if total_w <= 0.0:
+        avail_weights = np.full(len(available_indices), 1.0 / len(available_indices), dtype=np.float64)
+    else:
+        avail_weights = avail_weights / total_w
+
+    stage_lengths = np.asarray([stage_ranges[idx][1] for idx in available_indices], dtype=np.int64)
+
+    raw_counts = avail_weights * max_samples
+    base_counts = np.floor(raw_counts).astype(np.int64)
+    base_counts = np.minimum(base_counts, stage_lengths)
+
+    selected_counts = base_counts.copy()
+    residual = int(max_samples - selected_counts.sum())
+
+    if residual > 0:
+        fractional = raw_counts - np.floor(raw_counts)
+        fractional[selected_counts >= stage_lengths] = -1.0
+        order = np.argsort(-fractional)
+        for idx in order:
+            if residual <= 0:
+                break
+            if selected_counts[idx] >= stage_lengths[idx]:
+                continue
+            selected_counts[idx] += 1
+            residual -= 1
+
+    if residual > 0:
+        for idx in range(selected_counts.size):
+            if residual <= 0:
+                break
+            capacity = int(stage_lengths[idx] - selected_counts[idx])
+            if capacity <= 0:
+                continue
+            take = min(capacity, residual)
+            selected_counts[idx] += take
+            residual -= take
+
+    selected_positions = []
+    for local_idx, stage_idx in enumerate(available_indices):
+        count = int(selected_counts[local_idx])
+        if count <= 0:
+            continue
+        start, length = stage_ranges[stage_idx]
+        offsets = _evenly_spaced_offsets(length, count)
+        if offsets.size == 0:
+            continue
+        selected_positions.append(start + offsets)
+
+    if not selected_positions:
+        return np.arange(max_samples, dtype=np.int64)
+
+    positions = np.unique(np.concatenate(selected_positions))
+    if positions.size > max_samples:
+        positions = np.sort(positions)[:max_samples]
+    elif positions.size < max_samples:
+        pool = np.arange(total_steps, dtype=np.int64)
+        mask = np.ones(total_steps, dtype=bool)
+        mask[positions] = False
+        needed = max_samples - positions.size
+        positions = np.sort(np.concatenate([positions, pool[mask][:needed]]))
+    else:
+        positions = np.sort(positions)
+    return positions
+
+
+def _apply_value_sampler(
+    dataset: "StepsDataset",
+    run_ids: Optional[np.ndarray],
+    sampler: Optional[ValueSamplerConfig],
+) -> Optional[np.ndarray]:
+    if sampler is None or not sampler.enabled:
+        return None
+    if run_ids is None or run_ids.size == 0:
+        return np.empty((0,), dtype=np.int64)
+
+    cache = _ensure_run_index_cache(dataset)
+    unique_runs = cache["unique_runs"]
+    run_offsets = cache["run_offsets"]
+    sorted_global_idx = cache["sorted_global_idx"]
+
+    target_runs = np.unique(run_ids.astype(np.int64, copy=False))
+    positions = np.searchsorted(unique_runs, target_runs)
+    valid = (positions < unique_runs.size) & (unique_runs[positions] == target_runs)
+    if not np.any(valid):
+        return np.empty((0,), dtype=np.int64)
+
+    target_runs = target_runs[valid]
+    positions = positions[valid]
+
+    selected = []
+    for pos in positions:
+        start = int(run_offsets[pos])
+        end = int(run_offsets[pos + 1])
+        total = end - start
+        if total <= 0:
+            continue
+        rel = _select_positions_for_run(total, sampler)
+        if rel.size == 0:
+            continue
+        selected.append(sorted_global_idx[start + rel])
+
+    if not selected:
+        return np.empty((0,), dtype=np.int64)
+    return np.concatenate(selected).astype(np.int64)
 
 
 def _select_run_ids(
@@ -514,6 +747,7 @@ def build_steps_dataloaders(
     mmap_mode: bool = False,
     step_index_min: Optional[int] = None,
     step_index_max: Optional[int] = None,
+    value_sampler: Optional[ValueSamplerConfig] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], int]:
     """Create train/val DataLoaders from steps.npy + metadata.db.
 
@@ -545,11 +779,25 @@ def build_steps_dataloaders(
     print(f"[data] Selected runs: train={train_rids.size} val={(0 if val_rids is None else val_rids.size)}")
     # If no explicit validation split and train==all runs, avoid materialising indices
     # and iterate the full dataset directly.
-    if val_rids is None and run_sql is None and (val_run_pct == 0.0) and (val_run_sql is None):
-        train_indices = None
+    if value_sampler is not None and value_sampler.enabled:
+        train_indices = _apply_value_sampler(ds_train, train_rids, value_sampler)
+        val_indices = (
+            _apply_value_sampler(ds_train, val_rids, value_sampler)
+            if val_rids is not None
+            else None
+        )
+        print(
+            "[data] Value sampler: per-game cap={} stages={}".format(
+                value_sampler.max_states_per_game,
+                len(value_sampler.stage_boundaries) - 1,
+            )
+        )
     else:
-        train_indices = _indices_from_run_ids(ds_train, train_rids)
-    val_indices = _indices_from_run_ids(ds_train, val_rids) if val_rids is not None else None
+        if val_rids is None and run_sql is None and (val_run_pct == 0.0) and (val_run_sql is None):
+            train_indices = None
+        else:
+            train_indices = _indices_from_run_ids(ds_train, train_rids)
+        val_indices = _indices_from_run_ids(ds_train, val_rids) if val_rids is not None else None
 
     # Optional: apply step-index window filtering (inclusive) if provided in config
     if (step_index_min is not None) or (step_index_max is not None):
@@ -568,7 +816,7 @@ def build_steps_dataloaders(
                 if not mask.any():
                     continue
                 local = (idx[mask] - offset).astype(_np.int64, copy=False)
-                step_idx = shard['step_index'][local].astype(_np.int64, copy=False)
+                step_idx = shard[ds_train.step_field][local].astype(_np.int64, copy=False)
                 keep = _np.ones_like(local, dtype=bool)
                 if smin_i is not None:
                     keep &= step_idx >= smin_i

@@ -13,6 +13,8 @@ pub struct StepRow {
     pub run_id: u64,
     pub step_idx: u32,
     pub exps: [u8; 16],
+    pub move_dir: u8,
+    pub logp: [f32; 4],
 }
 
 /// Build the exact dtype for StepRow to ensure NumPy parity.
@@ -21,6 +23,7 @@ fn step_row_dtype() -> DType {
     let u8_le: TypeStr = "<u8".parse().unwrap();
     let u4_le: TypeStr = "<u4".parse().unwrap();
     let u1: TypeStr = "|u1".parse().unwrap();
+    let f4_le: TypeStr = "<f4".parse().unwrap();
     DType::Record(vec![
         Field {
             name: "run_id".into(),
@@ -32,7 +35,15 @@ fn step_row_dtype() -> DType {
         },
         Field {
             name: "exps".into(),
-            dtype: DType::Array(16, Box::new(DType::Plain(u1))),
+            dtype: DType::Array(16, Box::new(DType::Plain(u1.clone()))),
+        },
+        Field {
+            name: "move_dir".into(),
+            dtype: DType::Plain(u1),
+        },
+        Field {
+            name: "logp".into(),
+            dtype: DType::Array(4, Box::new(DType::Plain(f4_le))),
         },
     ])
 }
@@ -99,16 +110,22 @@ mod tests {
                 run_id: 1,
                 step_idx: 0,
                 exps: [0u8; 16],
+                move_dir: 0,
+                logp: [0.0, f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
             },
             StepRow {
                 run_id: 1,
                 step_idx: 1,
                 exps: [1u8; 16],
+                move_dir: 2,
+                logp: [f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY],
             },
             StepRow {
                 run_id: 2,
                 step_idx: 0,
                 exps: [2u8; 16],
+                move_dir: 3,
+                logp: [f32::NEG_INFINITY; 4],
             },
         ];
         write_steps_npy(&rows, &path).unwrap();
@@ -126,6 +143,8 @@ mod tests {
         assert_eq!(back[0].run_id, 1);
         assert_eq!(back[1].step_idx, 1);
         assert_eq!(back[2].exps[0], 2);
+        assert_eq!(back[0].move_dir, 0);
+        assert_eq!(back[0].logp[0], 0.0);
     }
 
     #[test]

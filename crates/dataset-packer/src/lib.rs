@@ -376,7 +376,10 @@ mod tests {
         // Prepare a tiny gzipped JSONL with one step
         let dir = tempdir().unwrap();
         let steps_path = dir.path().join("one.jsonl.gz");
-        let mut enc = GzEncoder::new(std::fs::File::create(&steps_path).unwrap(), Compression::default());
+        let mut enc = GzEncoder::new(
+            std::fs::File::create(&steps_path).unwrap(),
+            Compression::default(),
+        );
         // exponents 0..15 with a 16 at position 5 to test mask; move is "right"; branch evs UDLR with Right None (illegal)
         let mut board: Vec<u8> = (0u8..16u8).collect();
         board[5] = 16u8; // force a 65536 tile at index 5
@@ -402,13 +405,18 @@ mod tests {
         };
         let enc_v = ValuationEncoder::new();
         let (rows, any_legal) = parse_steps_file(&steps_path, 1u32, &meta, &enc_v).unwrap();
-        assert!(any_legal, "expected at least one legal branch in test record");
+        assert!(
+            any_legal,
+            "expected at least one legal branch in test record"
+        );
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
 
         // Verify board packing MSB + 65536 mask behavior
         let mut cell_arr = [0u8; 16];
-        for i in 0..16 { cell_arr[i] = i as u8; }
+        for i in 0..16 {
+            cell_arr[i] = i as u8;
+        }
         // Force a 16 at index 5 in our reference as parse path clamps >=16 to 15 and sets mask
         cell_arr[5] = 16u8;
         let (exp_board, exp_mask) = pack_board_msb_ref(&cell_arr);
