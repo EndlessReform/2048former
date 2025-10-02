@@ -52,3 +52,43 @@ Quick usage:
 
 - Train (example): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml`
 - The tokenizer path is configured at `dataset.tokenizer_path` and must point to a `tokenizer.json` generated as above.
+
+## Value Head Fine-Tuning
+
+The value-head flow reuses the frozen encoder and learns either a linear probe or a shallow MLP on top of the mean-pooled board representation. Key pieces live in:
+
+- Collate + dataset plumbing: `packages/train_2048/src/train_2048/dataloader/collate.py` / `steps.py`
+- Objectives: `packages/train_2048/src/train_2048/objectives/value_head.py`
+- Config knobs: `[target]` and `[value_head]` in `packages/train_2048/src/train_2048/config.py`
+
+### Train a Value Head
+
+1. Update `config/value_head/quantile_stratified.toml` with the desired init/checkpoint directories, dataset path, and (optionally) SQL filters for train/val runs.
+2. Kick off training (ordinal/BCE reach-rate by default):
+   ```bash
+   uv run python packages/train_2048/src/train_2048/main.py \
+     --config config/value_head/quantile_stratified.toml
+   ```
+3. Adjust `[value_head]` to switch between a linear probe (`head_type = "probe"`) and the 1-hidden-layer MLP (`head_type = "mlp"`), override dropout/hidden size, or unfreeze the transformer trunk (`freeze_trunk = false`).
+
+### Evaluate on a Holdout Split
+
+Use `benchmarks/value_head_eval.py` to score the trained ordinal head on a disjoint pool of game states. The script streams states directly from `steps.npy` shards, computes per-threshold AUROC/Brier/ECE, and optionally stratifies metrics by step quantiles (early/mid/late by default).
+
+```bash
+uv run python benchmarks/value_head_eval.py \
+  --config config/value_head/quantile_stratified.toml \
+  --init inits/v1_50m \
+  --checkpoint checkpoints/value-head/model-stable.safetensors \
+  --dataset selfplay/holdout_v2 \
+  --run-sql "SELECT id FROM runs WHERE split = 'val'" \
+  --output-csv out/value_head_metrics.csv
+```
+
+Flags of note:
+
+- `--stage-boundaries` (default: `0 0.25 0.75 1.0`) controls the progress slices for early/mid/late reporting.
+- `--threshold` can override the tile milestones evaluated (defaults come from `[value_head].tile_thresholds`).
+- `--ece-bins` sets the calibration bin count (default 20).
+
+The script prints a table of metrics and can emit JSON/CSV for downstream tracking.

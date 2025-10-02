@@ -39,6 +39,15 @@ def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, t
                 pa = metrics.get("policy_agree")
             if pa is not None:
                 base += f"  agree={float(pa) * 100:.1f}%"
+    elif target_mode in ("value_ordinal", "value_categorical"):
+        if target_mode == "value_categorical":
+            val_acc = metrics.get("value_accuracy")
+            if val_acc is not None:
+                base += f"  acc={float(val_acc):.3f}"
+        else:
+            bce_high = metrics.get("value_bce_high")
+            if bce_high is not None:
+                base += f"  bce_high={float(bce_high):.4f}"
     else:
         acc = metrics.get("policy_accuracy")
         if acc is None:
@@ -77,6 +86,7 @@ def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Op
         num_workers_train=12,
         mmap_mode=cfg.dataset.mmap_mode,
         value_sampler=cfg.dataset.value_sampler,
+        value_head_cfg=cfg.value_head,
     )
 
 

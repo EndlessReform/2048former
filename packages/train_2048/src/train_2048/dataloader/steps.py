@@ -11,10 +11,11 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from .collate import (
     make_collate_macroxue,
     make_collate_steps,
+    make_collate_value,
 )
 
 from ..binning import Binner
-from ..config import ValueSamplerConfig
+from ..config import ValueSamplerConfig, ValueHeadConfig
 from ..tokenization.macroxue import MacroxueTokenizerSpec
 from ..tokenization.base import BoardCodec
 
@@ -442,6 +443,18 @@ def _select_positions_for_run(total_steps: int, sampler: ValueSamplerConfig) -> 
         return np.arange(total_steps, dtype=np.int64)
 
     boundaries = np.asarray(sampler.stage_boundaries, dtype=np.float64)
+    if boundaries.size > 2:
+        rng = np.random.default_rng()
+        jittered = boundaries.copy()
+        jitter = rng.uniform(-0.01, 0.01, size=boundaries.size - 2)
+        jittered[1:-1] = np.clip(jittered[1:-1] + jitter, 0.0, 1.0)
+        jittered[0] = boundaries[0]
+        jittered[-1] = boundaries[-1]
+        np.maximum.accumulate(jittered, out=jittered)
+        jittered = np.minimum(jittered, 1.0)
+        jittered[0] = boundaries[0]
+        jittered[-1] = boundaries[-1]
+        boundaries = jittered
     weights = np.asarray(sampler.normalized_weights(), dtype=np.float64)
     num_stages = max(0, boundaries.size - 1)
     if num_stages == 0:
@@ -560,12 +573,18 @@ def _apply_value_sampler(
 
     target_runs = np.unique(run_ids.astype(np.int64, copy=False))
     positions = np.searchsorted(unique_runs, target_runs)
-    valid = (positions < unique_runs.size) & (unique_runs[positions] == target_runs)
-    if not np.any(valid):
+    within_bounds = positions < unique_runs.size
+    if not np.any(within_bounds):
         return np.empty((0,), dtype=np.int64)
 
-    target_runs = target_runs[valid]
-    positions = positions[valid]
+    positions = positions[within_bounds]
+    target_runs = target_runs[within_bounds]
+
+    matches = unique_runs[positions] == target_runs
+    if not np.any(matches):
+        return np.empty((0,), dtype=np.int64)
+
+    positions = positions[matches]
 
     selected = []
     for pos in positions:
@@ -748,6 +767,7 @@ def build_steps_dataloaders(
     step_index_min: Optional[int] = None,
     step_index_max: Optional[int] = None,
     value_sampler: Optional[ValueSamplerConfig] = None,
+    value_head_cfg: Optional[ValueHeadConfig] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], int]:
     """Create train/val DataLoaders from steps.npy + metadata.db.
 
@@ -777,6 +797,27 @@ def build_steps_dataloaders(
         conn.close()
 
     print(f"[data] Selected runs: train={train_rids.size} val={(0 if val_rids is None else val_rids.size)}")
+    if target_mode in {"value_ordinal", "value_categorical"}:
+        if train_num_steps is not None and int(train_num_steps) > 0:
+            planned_steps = int(train_num_steps)
+        else:
+            planned_steps = int(ceil(int(meta_train_steps) / max(1, int(batch_size))))
+        planned_samples = planned_steps * int(batch_size)
+        print(
+            "[value-head] dataset summary: runs={:,} steps={:,} planned_batches={:,} planned_samples~{:,.0f}".format(
+                train_rids.size,
+                int(meta_train_steps),
+                planned_steps,
+                planned_samples,
+            )
+        )
+        if val_rids is not None and val_rids.size > 0:
+            print(
+                "[value-head] validation runs={:,} steps={:,}".format(
+                    val_rids.size,
+                    int(meta_val_steps),
+                )
+            )
     # If no explicit validation split and train==all runs, avoid materialising indices
     # and iterate the full dataset directly.
     if value_sampler is not None and value_sampler.enabled:
@@ -831,11 +872,43 @@ def build_steps_dataloaders(
         if val_indices is not None:
             val_indices = _filter_by_step_index(val_indices)
 
+    if target_mode in {"value_ordinal", "value_categorical"}:
+        if train_indices is None:
+            available_train = len(ds_train)
+        else:
+            available_train = int(train_indices.size)
+        if train_num_steps is not None and int(train_num_steps) > 0:
+            epoch_batches = int(train_num_steps)
+        else:
+            epoch_batches = int(ceil(available_train / max(1, int(batch_size))))
+        print(
+            "[value-head] available samples (train)={:,} epoch_batches={:,}".format(
+                available_train,
+                epoch_batches,
+            )
+        )
+        if val_indices is not None and val_indices.size > 0:
+            available_val = int(val_indices.size)
+            val_batches = int(ceil(available_val / max(1, int(batch_size))))
+            print(
+                "[value-head] available samples (val)={:,} val_batches~{:,.0f}".format(
+                    available_val,
+                    val_batches,
+                )
+            )
+
     ds_train.indices = train_indices
     if target_mode == "macroxue_tokens":
         if tokenizer_path is None:
             raise ValueError("tokenizer_path is required for macroxue_tokens mode")
         collate = make_collate_macroxue(ds_train, tokenizer_path)
+    elif target_mode in {"value_ordinal", "value_categorical"}:
+        vh_cfg = value_head_cfg or ValueHeadConfig()
+        collate = make_collate_value(
+            target_mode,
+            ds_train,
+            tile_thresholds=list(vh_cfg.tile_thresholds),
+        )
     else:
         collate = make_collate_steps(target_mode, ds_train, binner, ev_tokenizer=ev_tokenizer)
 
@@ -902,6 +975,13 @@ def build_steps_dataloaders(
             if tokenizer_path is None:
                 raise ValueError("tokenizer_path is required for macroxue_tokens mode")
             collate_v = make_collate_macroxue(ds_val, tokenizer_path)
+        elif target_mode in {"value_ordinal", "value_categorical"}:
+            vh_cfg = value_head_cfg or ValueHeadConfig()
+            collate_v = make_collate_value(
+                target_mode,
+                ds_val,
+                tile_thresholds=list(vh_cfg.tile_thresholds),
+            )
         else:
             collate_v = make_collate_steps(target_mode, ds_val, binner, ev_tokenizer=ev_tokenizer)
         # Optionally cap validation steps via a sampler

@@ -5,6 +5,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import torch
+import sqlite3
 
 from ..binning import Binner
 from ..tokenization.macroxue import MacroxueTokenizerSpec
@@ -236,7 +237,105 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
     return _collate
 
 
+def make_collate_value(
+    target_mode: str,
+    dataset,
+    *,
+    tile_thresholds: list[int],
+) -> Callable:
+    """Collate function for value-head ordinal/categorical supervision."""
+
+    if target_mode not in {"value_ordinal", "value_categorical"}:
+        raise ValueError(f"Unsupported value target mode: {target_mode}")
+
+    import numpy as _np
+
+    ds_path = Path(dataset.dataset_dir)
+    meta_path = ds_path / "metadata.db"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Missing metadata.db at {meta_path}")
+
+    with sqlite3.connect(str(meta_path)) as conn:
+        rows = conn.execute("SELECT id, highest_tile, steps FROM runs").fetchall()
+    if not rows:
+        raise ValueError(f"metadata.db at {meta_path} contains no runs")
+
+    run_ids = _np.fromiter((int(r[0]) for r in rows), dtype=_np.int64)
+    highest_tiles = _np.fromiter((int(r[1]) for r in rows), dtype=_np.int64)
+    run_steps = _np.fromiter((int(r[2]) if len(r) > 2 else 0 for r in rows), dtype=_np.int64)
+
+    order = _np.argsort(run_ids, kind="mergesort")
+    sorted_run_ids = run_ids[order]
+    sorted_tiles = highest_tiles[order]
+    sorted_steps = run_steps[order]
+
+    thresholds = _np.asarray(tile_thresholds, dtype=_np.int64)
+
+    def _lookup_tiles(batch_run_ids: _np.ndarray) -> _np.ndarray:
+        positions = _np.searchsorted(sorted_run_ids, batch_run_ids, side="left")
+        valid = (positions < sorted_run_ids.size) & (sorted_run_ids[positions] == batch_run_ids)
+        tiles = _np.zeros(batch_run_ids.shape[0], dtype=_np.int64)
+        if valid.any():
+            tiles[valid] = sorted_tiles[positions[valid]]
+        return tiles
+
+    def _lookup_steps(batch_run_ids: _np.ndarray) -> _np.ndarray:
+        positions = _np.searchsorted(sorted_run_ids, batch_run_ids, side="left")
+        valid = (positions < sorted_run_ids.size) & (sorted_run_ids[positions] == batch_run_ids)
+        steps = _np.ones(batch_run_ids.shape[0], dtype=_np.int64)
+        if valid.any():
+            steps[valid] = sorted_steps[positions[valid]].clip(min=1)
+        return steps
+
+    def _decode_tokens(batch):
+        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
+        if 'board' in batch.dtype.names:
+            exps_np = BoardCodec.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
+        elif 'exps' in batch.dtype.names:
+            exps_np = batch['exps'].astype(_np.uint8, copy=False)
+        else:
+            raise KeyError("steps.npy must provide either 'board' or 'exps' field")
+        return torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
+
+    n_thresholds = thresholds.size
+    n_classes = int(n_thresholds + 1)
+
+    def _collate(batch_indices):
+        idxs = _np.asarray(batch_indices, dtype=_np.int64)
+        batch = dataset.get_rows(idxs)
+
+        tokens = _decode_tokens(batch)
+        run_ids_batch = batch['run_id'].astype(_np.int64, copy=False)
+        tiles = _lookup_tiles(run_ids_batch)
+        total_steps = _lookup_steps(run_ids_batch)
+        step_idx = batch[dataset.step_field].astype(_np.int64, copy=False)
+        progress = (step_idx + 1).astype(_np.float32, copy=False) / total_steps.astype(_np.float32, copy=False)
+        _np.clip(progress, 0.0, 1.0, out=progress)
+
+        out = {
+            "tokens": tokens,
+            "highest_tile": torch.from_numpy(tiles.copy()).long(),
+            "run_id": torch.from_numpy(run_ids_batch.copy()).long(),
+            "step_fraction": torch.from_numpy(progress.copy()).float(),
+        }
+
+        if target_mode == "value_ordinal":
+            # Cumulative reachability targets: 1 if highest_tile >= threshold
+            targets = (tiles[:, None] >= thresholds[None, :]).astype(_np.float32, copy=False)
+            out["value_targets_bce"] = torch.from_numpy(targets.copy()).float()
+        else:  # value_categorical
+            # Bucketize highest tile into len(thresholds)+1 classes
+            classes = _np.searchsorted(thresholds, tiles, side="right").astype(_np.int64, copy=False)
+            out["value_targets_ce"] = torch.from_numpy(classes.copy()).long()
+            out["value_num_classes"] = n_classes
+
+        return out
+
+    return _collate
+
+
 __all__ = [
     "make_collate_macroxue",
     "make_collate_steps",
+    "make_collate_value",
 ]

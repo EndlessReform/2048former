@@ -14,7 +14,13 @@ from .binning import BinningConfig
 class TargetConfig(BaseModel):
     """Configure which supervision target to use during training."""
 
-    mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
+    mode: Literal[
+        "binned_ev",
+        "hard_move",
+        "macroxue_tokens",
+        "value_ordinal",
+        "value_categorical",
+    ] = "binned_ev"
 
 
 class ValueSamplerConfig(BaseModel):
@@ -78,6 +84,46 @@ class ValueSamplerConfig(BaseModel):
             return [d / total for d in diffs]
         total = float(sum(weights))
         return [w / total for w in weights]
+
+
+class ValueHeadConfig(BaseModel):
+    """Hyperparameters for value-head fine-tuning."""
+
+    freeze_trunk: bool = True
+    head_type: Literal["probe", "mlp"] = "probe"
+    mlp_hidden_dim: int = 1024
+    mlp_dropout: float = 0.1
+    tile_thresholds: list[int] = Field(
+        default_factory=lambda: [1024, 2048, 4096, 8192, 16384, 32768]
+    )
+
+    @field_validator("mlp_hidden_dim")
+    @classmethod
+    def _mlp_hidden_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("mlp_hidden_dim must be > 0")
+        return v
+
+    @field_validator("mlp_dropout")
+    @classmethod
+    def _dropout_range(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("mlp_dropout must be within [0, 1]")
+        return v
+
+    @field_validator("tile_thresholds")
+    @classmethod
+    def _validate_thresholds(cls, values: list[int]) -> list[int]:
+        if not values:
+            raise ValueError("tile_thresholds must contain at least one entry")
+        prev = 0
+        for tile in values:
+            if tile <= 0:
+                raise ValueError("tile thresholds must be positive integers")
+            if tile <= prev:
+                raise ValueError("tile thresholds must be strictly increasing")
+            prev = tile
+        return values
 
 
 def _find_repo_root() -> Path:
@@ -340,6 +386,7 @@ class TrainingConfig(BaseModel):
     batch: BatchConfig = Field(default_factory=BatchConfig)
     dropout: DropoutConfig = Field(default_factory=DropoutConfig)
     target: TargetConfig = Field(default_factory=TargetConfig)
+    value_head: ValueHeadConfig = Field(default_factory=ValueHeadConfig)
     # Discretization for EV heads
     binning: BinningConfig = Field(default_factory=BinningConfig)
     # Dataset input
@@ -374,6 +421,7 @@ __all__ = [
     "BatchConfig",
     "DropoutConfig",
     "TargetConfig",
+    "ValueHeadConfig",
     "ValueSamplerConfig",
     "CheckpointConfig",
     "TrainingConfig",

@@ -55,8 +55,9 @@ We do not introduce a separate sampling manifest. Use the existing dataset and s
 - Build loaders via `build_steps_dataloaders(...)` in `packages/train_2048/src/train_2048/dataloader/steps.py:500`.
 - Split by run to avoid leakage using either SQL predicates (`run_sql`/`val_run_sql`) or a random run split (`val_run_pct`) — see `packages/train_2048/src/train_2048/dataloader/steps.py:360` and `:404`.
 - Control epoch size with `dataset.num_steps` to stream a fixed number of steps per epoch via `StreamingRandomSampler` or filter by `step_index_min/max` for time‑slicing — see `packages/train_2048/src/train_2048/dataloader/steps.py:86`, `:163`, and `:500`.
-- Enable `mmap_mode=true` in config to memory‑map large step shards.
+- Enable `mmap_mode=true` in config to memory-map large step shards.
 - To keep each episode equally represented, enable `dataset.value_sampler` in the training TOML. The helper caps states per run and draws evenly spaced quantiles inside early/mid/late segments. See `config/value_head/quantile_stratified.toml` for concrete defaults (512 states per run across `[0.0, 0.25, 0.75, 1.0]`).
+- Select the objective with `[target].mode = "value_ordinal"` (BCE reach-rate) or `"value_categorical"` (tile CE). Tune the head via `[value_head]` — freeze/unfreeze the transformer trunk, pick `head_type = "probe"|"mlp"`, adjust `mlp_hidden_dim`/`mlp_dropout`, and override `tile_thresholds` (defaults: `[1024, 2048, 4096, 8192, 16384, 32768]`).
 
 Recommended scale: start with 5–10M steps per epoch, validate on a held‑out run split. Always split by run, not by state.
 
@@ -66,10 +67,11 @@ Recommended scale: start with 5–10M steps per epoch, validate on a held‑out 
 
 Trunk: the existing `Encoder` in `packages/core_2048/src/core_2048/model.py` produces hidden states `(B, L, D)` and head outputs. We will reuse its hidden states and mean‑pooled board representation `(B, D)`.
 
-Implementation (repo‑aligned):
+Implementation (repo-aligned):
 - Add a new objective that attaches a value head to the encoder during `prepare_model(...)` (see `packages/train_2048/src/train_2048/objectives/base.py`).
 - The objective will call `model(tokens)` to get hidden states `x` and then compute `board_repr = x.mean(dim=1)` inside the loss.
 - Freeze the trunk by setting `requires_grad=False` on embeddings/blocks/ln; only the value head parameters remain trainable.
+- The implementation is wired into `packages/train_2048/src/train_2048/objectives/value_head.py`; `prepare_model` now installs either a linear probe or a 1-hidden-layer MLP on top of the pooled board state and respects `[value_head]` toggles when deciding whether to keep the trunk frozen.
 
 Heads:
 - Linear probe: `Linear(D → K)` (ordinal) or `Linear(D → K+1 / n_bins)` (categorical).
