@@ -31,6 +31,7 @@ def build_dataloaders(
         binner=binner,
         target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
+        physical_batch_size=cfg.batch.physical_batch_size(),
         tokenizer_path=ds_cfg.resolved_tokenizer_path(),
         run_sql=getattr(ds_cfg, "run_sql", None),
         sql_params=getattr(ds_cfg, "sql_params", None),

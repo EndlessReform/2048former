@@ -73,15 +73,20 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     weight_candidates = []
     pt_candidates = []
     if init_path.is_dir():
+        # Prefer final or best checkpoints by default. "model-stable" is a
+        # pre-decay snapshot saved early in training for some schedules; keep it
+        # as a fallback so inference does not accidentally load an undertrained
+        # model when a final checkpoint is available.
         weight_candidates = [
             init_path / "model-best.safetensors",
-            init_path / "model-stable.safetensors",
             init_path / "model.safetensors",
             init_path / "model-final.safetensors",
+            init_path / "model-stable.safetensors",
         ]
         pt_candidates = [
-            init_path / "model-stable.pt",
+            init_path / "model-best.pt",
             init_path / "model.pt",
+            init_path / "model-stable.pt",
         ]
     else:
         if init_path.suffix.lower() in {".safetensors", ".bin"}:

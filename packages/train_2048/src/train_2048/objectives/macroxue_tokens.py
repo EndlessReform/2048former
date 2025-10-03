@@ -50,11 +50,16 @@ class MacroxueTokens(Objective):
         batch: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        *,
+        zero_grad: bool = True,
+        optimizer_step: bool = True,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float | list[float] | None]:
         tokens = batch["tokens"].to(device, non_blocking=True)
         targets = batch["targets"].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        if zero_grad:
+            optimizer.zero_grad(set_to_none=True)
 
         if device.type == "cuda":
             autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -105,8 +110,10 @@ class MacroxueTokens(Objective):
 
             loss = sum(per_head_losses)
 
-        loss.backward()
-        optimizer.step()
+        scaled_loss = loss * float(loss_scale)
+        scaled_loss.backward()
+        if optimizer_step:
+            optimizer.step()
 
         head_losses = [float(l.detach().item()) for l in per_head_losses]
         policy_agreement = float((agree_sum / max(1, agree_cnt)).detach().item()) if agree_cnt > 0 else None

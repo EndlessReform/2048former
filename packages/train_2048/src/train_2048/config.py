@@ -196,9 +196,40 @@ class HyperParams(BaseModel):
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
 
 
+class AdaptiveBatchConfig(BaseModel):
+    enabled: bool = False
+    double_at_lr_ratio: float = 0.5
+    quadruple_at_lr_ratio: float = 0.25
+
+    @field_validator("double_at_lr_ratio", "quadruple_at_lr_ratio")
+    @classmethod
+    def _ratio_bounds(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError("adaptive batch ratios must be in (0, 1]")
+        return v
+
+    @field_validator("quadruple_at_lr_ratio")
+    @classmethod
+    def _quad_not_exceed_double(cls, quad: float, info) -> float:
+        double = info.data.get("double_at_lr_ratio", 0.5)
+        if quad > double:
+            raise ValueError("quadruple_at_lr_ratio must be <= double_at_lr_ratio")
+        return quad
+
+    def multiplier_for_ratio(self, lr_ratio: float) -> int:
+        if not self.enabled:
+            return 1
+        if lr_ratio <= self.quadruple_at_lr_ratio:
+            return 4
+        if lr_ratio <= self.double_at_lr_ratio:
+            return 2
+        return 1
+
+
 class BatchConfig(BaseModel):
     batch_size: int = 1024
     micro_batch_size: Optional[int] = None
+    adaptive: AdaptiveBatchConfig = Field(default_factory=AdaptiveBatchConfig)
 
     @field_validator("batch_size")
     @classmethod
@@ -209,16 +240,28 @@ class BatchConfig(BaseModel):
 
     @field_validator("micro_batch_size")
     @classmethod
-    def _micro_positive(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None and v <= 0:
-            raise ValueError("micro_batch_size must be > 0 when provided")
+    def _micro_positive(cls, v: Optional[int], info) -> Optional[int]:
+        if v is not None:
+            if v <= 0:
+                raise ValueError("micro_batch_size must be > 0 when provided")
+            parent = info.data or {}
+            batch_size = parent.get("batch_size")
+            if batch_size is not None and v > batch_size:
+                raise ValueError("micro_batch_size cannot exceed batch_size")
         return v
 
+    def effective_batch_size(self) -> int:
+        return int(self.batch_size)
+
+    def physical_batch_size(self) -> int:
+        return int(self.micro_batch_size or self.batch_size)
+
     def grad_accum_steps(self) -> int:
-        if not self.micro_batch_size:
+        phys = self.physical_batch_size()
+        eff = self.effective_batch_size()
+        if phys >= eff:
             return 1
-        # Ceil division; training loop may handle last partial microbatch
-        return (self.batch_size + self.micro_batch_size - 1) // self.micro_batch_size
+        return (eff + phys - 1) // phys
 
 
 class DropoutConfig(BaseModel):
@@ -307,6 +350,7 @@ __all__ = [
     "LRScheduleConfig",
     "OptimizerConfig",
     "HyperParams",
+    "AdaptiveBatchConfig",
     "BatchConfig",
     "DropoutConfig",
     "TargetConfig",

@@ -21,12 +21,17 @@ class BinnedEV(Objective):
         batch: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        *,
+        zero_grad: bool = True,
+        optimizer_step: bool = True,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float | list[float] | None]:
         tokens = batch["tokens"].to(device, non_blocking=True)
         branch_mask = batch["branch_mask"].to(device, non_blocking=True)
         targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        if zero_grad:
+            optimizer.zero_grad(set_to_none=True)
 
         if device.type == "cuda":
             autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -50,8 +55,10 @@ class BinnedEV(Objective):
                 per_head_losses.append(loss_h)
             loss = sum(per_head_losses)
 
-        loss.backward()
-        optimizer.step()
+        scaled_loss = loss * float(loss_scale)
+        scaled_loss.backward()
+        if optimizer_step:
+            optimizer.step()
 
         head_losses = [float(l.detach().item()) for l in per_head_losses]
         return {"loss": float(loss.detach().item()), "head_losses": head_losses, "policy_accuracy": None, "policy_agreement": None}

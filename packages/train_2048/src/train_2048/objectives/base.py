@@ -26,6 +26,10 @@ class Objective(Protocol):
         batch: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        *,
+        zero_grad: bool = True,
+        optimizer_step: bool = True,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float | list[float] | None]:
         """Perform one optimization step and return metrics."""
 
@@ -40,4 +44,3 @@ class Objective(Protocol):
 
 
 __all__ = ["Objective"]
-

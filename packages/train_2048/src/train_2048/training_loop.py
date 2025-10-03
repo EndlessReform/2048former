@@ -26,8 +26,21 @@ from .checkpointing import (
 )
 
 
-def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, target_mode: str, dt_data_ms: float | None = None, dt_comp_ms: float | None = None) -> str:
+def _format_postfix(
+    metrics: Dict[str, float | list[float] | None],
+    lr: float,
+    target_mode: str,
+    *,
+    global_step: Optional[int] = None,
+    accum_steps: Optional[int] = None,
+    micro_batch_size: Optional[int] = None,
+    dt_data_ms: float | None = None,
+    dt_comp_ms: float | None = None,
+) -> str:
     loss = float(metrics.get("loss", 0.0))
+    parts: list[str] = []
+    if global_step is not None:
+        parts.append(f"step={global_step}")
     base = f"loss={loss:.4f}"
     if target_mode in ("binned_ev", "macroxue_tokens"):
         head_losses = metrics.get("head_losses") or [0.0, 0.0, 0.0, 0.0]
@@ -46,8 +59,13 @@ def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, t
         if acc is not None:
             base += f"  policy_acc={float(acc):.3f}"
     base += f"  lr={lr:.2e}"
+    if accum_steps is not None and micro_batch_size is not None:
+        effective = int(accum_steps) * int(micro_batch_size)
+        parts.append(f"mb={int(micro_batch_size)} eff={effective}")
     if dt_data_ms is not None and dt_comp_ms is not None:
         base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
+    if parts:
+        return f"{' '.join(parts)}  {base}"
     return base
 
 
@@ -61,6 +79,7 @@ def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Op
         binner=None,
         target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
+        physical_batch_size=cfg.batch.physical_batch_size(),
         train_num_steps=cfg.dataset.num_steps,
         seed=cfg.seed,
         shuffle_buffer_size=getattr(cfg.dataset, "shuffle_buffer_size", 1_000_000),
@@ -229,8 +248,23 @@ def _wandb_log(data: Dict[str, float | int], step: int) -> None:
         pass
 
 
-def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: float, target_mode: str, *, epoch: Optional[int], dt_data_ms: float, dt_comp_ms: float) -> Dict[str, float | int]:
-    payload: Dict[str, float | int] = {"train/loss": float(metrics["loss"]), "train/lr": float(lr), "train/data_time_ms": float(dt_data_ms), "train/compute_time_ms": float(dt_comp_ms)}
+def _build_train_payload(
+    metrics: Dict[str, float | list[float] | None],
+    lr: float,
+    target_mode: str,
+    *,
+    epoch: Optional[int],
+    dt_data_ms: float,
+    dt_comp_ms: float,
+    effective_batch_size: Optional[int],
+    accum_steps: Optional[int],
+) -> Dict[str, float | int]:
+    payload: Dict[str, float | int] = {
+        "train/loss": float(metrics["loss"]),
+        "train/lr": float(lr),
+        "train/data_time_ms": float(dt_data_ms),
+        "train/compute_time_ms": float(dt_comp_ms),
+    }
     if epoch is not None:
         payload["train/epoch"] = int(epoch)
     if target_mode in ("binned_ev", "macroxue_tokens"):
@@ -243,6 +277,10 @@ def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: flo
             acc = metrics.get("policy_acc")
         if acc is not None:
             payload["train/policy_accuracy"] = float(acc)
+    if effective_batch_size is not None:
+        payload["train/effective_batch_size"] = int(effective_batch_size)
+    if accum_steps is not None:
+        payload["train/accum_steps"] = int(accum_steps)
     return payload
 
 
@@ -274,6 +312,49 @@ def _maybe_log_val(objective, model, dl_val, device, *, cfg: TrainingConfig, tar
     if wandb_run is not None:
         _wandb_log(_build_val_payload(val_metrics, target_mode, epoch=epoch), step=step)
     return val_metrics
+
+
+def _accumulate_metric_sums(
+    sums: Dict[str, list[float] | float],
+    counts: Dict[str, int],
+    metrics: Dict[str, float | list[float] | None],
+) -> None:
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, list):
+            arr = [float(x) for x in value]
+            prev = sums.get(key)
+            if prev is None or not isinstance(prev, list):
+                sums[key] = arr
+            else:
+                if len(prev) != len(arr):
+                    raise ValueError(f"Metric list length mismatch for '{key}'")
+                sums[key] = [p + a for p, a in zip(prev, arr)]
+            counts[key] = counts.get(key, 0) + 1
+        else:
+            sums[key] = float(sums.get(key, 0.0)) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+
+
+def _finalize_metric_sums(
+    sums: Dict[str, list[float] | float],
+    counts: Dict[str, int],
+    last_metrics: Dict[str, float | list[float] | None],
+) -> Dict[str, float | list[float] | None]:
+    result: Dict[str, float | list[float] | None] = {}
+    keys = set(last_metrics.keys()) | set(sums.keys())
+    for key in keys:
+        count = counts.get(key, 0)
+        if key in sums and count > 0:
+            total = sums[key]
+            if isinstance(total, list):
+                result[key] = [v / count for v in total]
+            else:
+                result[key] = total / count
+        else:
+            result[key] = last_metrics.get(key)
+    return result
 
 
 def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
@@ -315,34 +396,97 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     pre_decay_flag = {"saved": False}
     best_tracker: Dict[str, float] = {}
     wandb_report_every = max(1, int(getattr(getattr(cfg, "wandb", None), "report_every", 1)))
+    base_grad_accum_steps = max(1, cfg.batch.grad_accum_steps())
+    adaptive_cfg = getattr(cfg.batch, "adaptive", None)
+    lr_schedule_name = getattr(cfg.hyperparameters.lr_schedule, "name", "constant")
+    peak_lr = 0.0
+    micro_batch_size = cfg.batch.physical_batch_size()
 
     for epoch in range(epochs):
         it = iter(dl_train)
         pbar = tqdm(range(steps_this_epoch), desc=("Train" if fixed_steps > 0 else f"Epoch {epoch + 1}/{epochs}"), dynamic_ncols=True, total=steps_this_epoch)
         for _ in pbar:
             maybe_save_stable(model, run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, global_step=global_step, decay_steps=sched_meta["decay_steps"], decay_start=sched_meta["decay_start_step"], preflag=pre_decay_flag)
-            lr_now = apply_lr(scale_for_step(global_step))
-            t0 = time.perf_counter()
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(dl_train)
-                batch = next(it)
-            t1 = time.perf_counter()
-            metrics = objective.train_step(model, batch, optimizer, device)
-            agreement = metrics.get("policy_agreement")
+            lr_scale = scale_for_step(global_step)
+            lr_now = apply_lr(lr_scale)
+            peak_lr = max(peak_lr, lr_now)
+            accum_multiplier = 1
+            if adaptive_cfg and adaptive_cfg.enabled and lr_schedule_name == "cosine" and peak_lr > 0.0:
+                lr_ratio = lr_now / peak_lr if peak_lr > 0.0 else 1.0
+                accum_multiplier = adaptive_cfg.multiplier_for_ratio(lr_ratio)
+            accum_steps = max(1, base_grad_accum_steps * accum_multiplier)
+            loss_scale = 1.0 / float(accum_steps)
+
+            metric_sums: Dict[str, list[float] | float] = {}
+            metric_counts: Dict[str, int] = {}
+            last_metrics: Dict[str, float | list[float] | None] = {}
+            total_data_time = 0.0
+            total_comp_time = 0.0
+
+            for accum_idx in range(accum_steps):
+                zero_grad = accum_idx == 0
+                optimizer_step = accum_idx == (accum_steps - 1)
+                t0 = time.perf_counter()
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = iter(dl_train)
+                    batch = next(it)
+                t1 = time.perf_counter()
+                metrics = objective.train_step(
+                    model,
+                    batch,
+                    optimizer,
+                    device,
+                    zero_grad=zero_grad,
+                    optimizer_step=optimizer_step,
+                    loss_scale=loss_scale,
+                )
+                last_metrics = metrics
+                _accumulate_metric_sums(metric_sums, metric_counts, metrics)
+                t2 = time.perf_counter()
+                total_data_time += (t1 - t0)
+                total_comp_time += (t2 - t1)
+
+            aggregated_metrics = _finalize_metric_sums(metric_sums, metric_counts, last_metrics)
+            agreement = aggregated_metrics.get("policy_agreement")
             if agreement is None:
-                agreement = metrics.get("policy_agree")
+                agreement = aggregated_metrics.get("policy_agree")
             if agreement is not None:
                 if not hasattr(run_training, "_pa_ema"):
                     run_training._pa_ema = float(agreement)  # type: ignore[attr-defined]
                 decay = 0.95
                 run_training._pa_ema = float(decay * run_training._pa_ema + (1 - decay) * float(agreement))  # type: ignore[attr-defined]
-                metrics["policy_agreement"] = run_training._pa_ema  # type: ignore[attr-defined]
-            t2 = time.perf_counter()
-            pbar.set_postfix_str(_format_postfix(metrics, lr_now, target_mode, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
+                aggregated_metrics["policy_agreement"] = run_training._pa_ema  # type: ignore[attr-defined]
+            dt_data_ms = total_data_time * 1e3
+            dt_comp_ms = total_comp_time * 1e3
+            effective_batch_now = int(micro_batch_size) * int(accum_steps)
+            pbar.set_postfix_str(
+                _format_postfix(
+                    aggregated_metrics,
+                    lr_now,
+                    target_mode,
+                    global_step=global_step,
+                    accum_steps=accum_steps,
+                    micro_batch_size=micro_batch_size,
+                    dt_data_ms=dt_data_ms,
+                    dt_comp_ms=dt_comp_ms,
+                )
+            )
             if wandb_run is not None and (global_step % wandb_report_every == 0):
-                _wandb_log(_build_train_payload(metrics, lr_now, target_mode, epoch=(None if fixed_steps > 0 else epoch), dt_data_ms=(t1 - t0) * 1e3, dt_comp_ms=(t2 - t1) * 1e3), step=global_step)
+                _wandb_log(
+                    _build_train_payload(
+                        aggregated_metrics,
+                        lr_now,
+                        target_mode,
+                        epoch=(None if fixed_steps > 0 else epoch),
+                        dt_data_ms=dt_data_ms,
+                        dt_comp_ms=dt_comp_ms,
+                        effective_batch_size=effective_batch_now,
+                        accum_steps=accum_steps,
+                    ),
+                    step=global_step,
+                )
             _maybe_log_val(objective, model, dl_val, device, cfg=cfg, target_mode=target_mode, step=global_step, wandb_run=wandb_run, epoch=(None if fixed_steps > 0 else epoch))
             global_step += 1
             maybe_save_pt_interval(model=model, run_dir=run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, step=global_step, interval=getattr(cfg.checkpoint, "save_pt_every_steps", None))

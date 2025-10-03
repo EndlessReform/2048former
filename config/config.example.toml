@@ -34,7 +34,12 @@ eps = 1e-8
 
 [batch]
 batch_size = 1024
-# micro_batch_size = 256
+# micro_batch_size = 256         # optional per-device micro batch; enables grad accumulation
+
+[batch.adaptive]
+enabled = false
+double_at_lr_ratio = 0.5
+quadruple_at_lr_ratio = 0.25
 
 [dropout]
 dropout_prob = 0.1
