@@ -28,9 +28,9 @@ Config
 
 Recording (optional)
 - To enable saving, set `[orchestrator.report].session_dir`. If omitted, no files are written.
-- Files written on completion:
-  - `steps.npy`: structured dtype with rows `[('run_id','<u8'), ('step_idx','<u4'), ('exps','|u1',(16,))]`.
-  - `embeddings-000001.npy` (optional): float32 `[N, D]` shard if `orchestrator.inline_embeddings = true` and all embeddings were collected.
+- Files written when buffers flush (on size/teardown):
+  - `steps-000001.npy`, `steps-000002.npy`, …: structured dtype rows `[('run_id','<u8'), ('step_idx','<u4'), ('exps','|u1',(16,))]`. Default shard size is 1_000_000 rows (`report.shard_max_steps`).
+  - `embeddings-000001.npy`, … (optional): float32 `[N, D]` shards when `orchestrator.inline_embeddings = true` and embeddings are paired.
   - `metadata.db`: SQLite with tables:
     - `runs(id INTEGER PRIMARY KEY, seed BIGINT, steps INT, max_score INT, highest_tile INT)`
     - `session(meta_key TEXT PRIMARY KEY, meta_value TEXT)`
@@ -39,6 +39,7 @@ Safety knobs (optional)
 - `[orchestrator.report]`
   - `max_ram_mb` (approx.): stop collecting new rows if in-memory buffer estimate exceeds this.
   - `max_gb` (approx.): skip writing an artifact if its estimated size exceeds this many GB.
+  - `shard_max_steps` (default 1_000_000): flush steps/embeddings once the buffer reaches this many paired rows.
 - `[orchestrator]`
   - `inline_embeddings`: request embeddings inline and write a shard when complete.
   - `fixed_seed`: if set, seeds are deterministic; otherwise full randomness is used.
