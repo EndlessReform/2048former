@@ -1,10 +1,3 @@
-mod actor;
-mod config;
-mod ds_writer;
-mod feeder;
-mod grpc;
-mod recorder;
-
 use clap::Parser;
 use log::{debug, error, info};
 use std::collections::HashMap;
@@ -18,12 +11,14 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use actor::GameActor;
-use feeder::Feeder;
-use rand::{RngCore, SeedableRng};
-use recorder::{RunSummary, SessionRecorder};
+use game_engine::actor::{self, GameActor, GameResult, StepBudget};
+use game_engine::config::Config;
+use game_engine::ds_writer;
+use game_engine::feeder;
+use game_engine::pipeline;
+use game_engine::recorder::{RunSummary, SessionRecorder};
 
-use config::Config;
+use rand::{RngCore, SeedableRng};
 
 struct ShardedWriter {
     session_dir: PathBuf,
@@ -234,29 +229,12 @@ async fn main() {
     ai_2048::engine::new();
 
     // Establish gRPC connection (UDS preferred when set; else TCP)
-    let conn = &config.orchestrator.connection;
-    let client = if let Some(uds_path) = &conn.uds_path {
-        match grpc::connect_uds(uds_path).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!(
-                    "Failed to connect to inference server over UDS {}: {e}",
-                    uds_path.display()
-                );
-                std::process::exit(2);
-            }
+    let client = match pipeline::connect_inference(&config.orchestrator.connection).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to connect to inference server: {e}");
+            std::process::exit(2);
         }
-    } else if let Some(tcp) = &conn.tcp_addr {
-        match grpc::connect(tcp).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to connect to inference server at {tcp}: {e}");
-                std::process::exit(2);
-            }
-        }
-    } else {
-        eprintln!("Either uds_path or tcp_addr must be set under [orchestrator.connection]");
-        std::process::exit(2);
     };
     if !data_collection_mode {
         println!("Connected to inference server");
@@ -266,7 +244,7 @@ async fn main() {
     let cancel = CancellationToken::new();
 
     // Start feeder
-    let (mut feeder, handle) = Feeder::new(
+    let (mut feeder, handle) = pipeline::build_feeder(
         config.orchestrator.batch.clone(),
         config.orchestrator.argmax_only,
     );
@@ -292,8 +270,8 @@ async fn main() {
     let writer_handle = {
         let results_path = config.orchestrator.report.results_file.clone();
         let session_dir = config.orchestrator.report.session_dir.clone();
-        let max_ram_mb = config.orchestrator.report.max_ram_mb;
-        let max_gb = config.orchestrator.report.max_gb;
+        let _max_ram_mb = config.orchestrator.report.max_ram_mb;
+        let _max_gb = config.orchestrator.report.max_gb;
         if log_regular {
             // Surface where results will be written (or disabled)
             match results_path.as_ref() {
@@ -445,15 +423,15 @@ async fn main() {
     let target_games: Option<usize> = config.num_seeds.map(|v| v as usize);
     let target_steps: Option<u64> = config.max_steps;
     // Shared global step budget across all actors (if max_steps is set)
-    let step_budget = target_steps.map(actor::StepBudget::new);
+    let step_budget = target_steps.map(StepBudget::new);
     let max_conc = config.max_concurrent_games as usize;
     let mut started: usize = 0;
-    let mut finished: usize = 0;
+    let mut _finished: usize = 0;
     let mut total_steps: u64 = 0;
     // Progress accounting
     let started_counter = Arc::new(AtomicUsize::new(0));
     let finished_counter = Arc::new(AtomicUsize::new(0));
-    let mut set: JoinSet<actor::GameResult> = JoinSet::new();
+    let mut set: JoinSet<GameResult> = JoinSet::new();
 
     // Seed strategy (default reproducible):
     // - If random_seeds=true -> fully random per game
@@ -592,7 +570,7 @@ async fn main() {
                     error!("actor task failed: {e}");
                 }
             }
-            finished += 1;
+            _finished += 1;
             finished_counter.fetch_add(1, Ordering::Relaxed);
         } else {
             // This should not be reached if !set.is_empty()

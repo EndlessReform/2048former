@@ -3,6 +3,18 @@ name = "game-engine"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "game_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "game-engine"
+path = "src/main.rs"
+
+[[bin]]
+name = "annotation-engine"
+path = "src/bin/annotate.rs"
+
 [dependencies]
 ai-2048 = { git = "https://github.com/EndlessReform/2048_bench.git", rev = "e517db6" }
 anyhow = "1.0.99"
@@ -24,6 +36,8 @@ bytemuck = { version = "1.18.0", features = ["extern_crate_std"] }
 log = "0.4.28"
 env_logger = "0.11.8"
 tokio-util = "0.7.16"
+dataset-packer = { path = "../dataset-packer" }
+futures = "0.3.31"
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

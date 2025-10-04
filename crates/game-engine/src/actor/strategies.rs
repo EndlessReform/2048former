@@ -350,9 +350,21 @@ fn select_move_tail_agg_conf(
             m = 0.0;
         }
         // w(m) = alpha / (1 + beta*m)^gamma
-        let a = if alpha.is_finite() && alpha >= 0.0 { alpha } else { 0.20 };
-        let b = if beta.is_finite() && beta >= 0.0 { beta } else { 10.0 };
-        let g = if gamma.is_finite() && gamma > 0.0 { gamma } else { 1.0 };
+        let a = if alpha.is_finite() && alpha >= 0.0 {
+            alpha
+        } else {
+            0.20
+        };
+        let b = if beta.is_finite() && beta >= 0.0 {
+            beta
+        } else {
+            10.0
+        };
+        let g = if gamma.is_finite() && gamma > 0.0 {
+            gamma
+        } else {
+            1.0
+        };
         let denom = 1.0 + b * m;
         let w = if denom > 0.0 { a / denom.powf(g) } else { a };
         let s = p1 + w * p2;

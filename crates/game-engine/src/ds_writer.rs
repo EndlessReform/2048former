@@ -2,82 +2,32 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use npyz::{DType, Field, TypeStr, WriterBuilder};
+use anyhow::Result;
+use dataset_packer::{SelfplayStepRow, write_selfplay_steps};
+use npyz::{DType, TypeStr, WriteOptions, WriterBuilder};
 
-/// Minimal v1 step row: matches docs/self-play-v1.md
-/// Fields: run_id: u64, step_idx: u32, exps: [u8; 16]
-#[derive(
-    Clone, Copy, Debug, PartialEq, npyz::Serialize, npyz::Deserialize, npyz::AutoSerialize,
-)]
-pub struct StepRow {
-    pub run_id: u64,
-    pub step_idx: u32,
-    pub exps: [u8; 16],
-}
+/// Re-export the shared step row layout from `dataset-packer` so engine code can
+/// construct rows without duplicating the schema.
+pub type StepRow = SelfplayStepRow;
 
-/// Build the exact dtype for StepRow to ensure NumPy parity.
-/// [('run_id','<u8'), ('step_idx','<u4'), ('exps','|u1',(16,))]
-fn step_row_dtype() -> DType {
-    let u8_le: TypeStr = "<u8".parse().unwrap();
-    let u4_le: TypeStr = "<u4".parse().unwrap();
-    let u1: TypeStr = "|u1".parse().unwrap();
-    DType::Record(vec![
-        Field {
-            name: "run_id".into(),
-            dtype: DType::Plain(u8_le),
-        },
-        Field {
-            name: "step_idx".into(),
-            dtype: DType::Plain(u4_le),
-        },
-        Field {
-            name: "exps".into(),
-            dtype: DType::Array(16, Box::new(DType::Plain(u1))),
-        },
-    ])
-}
-
-/// Write steps.npy with a structured dtype, atomically via a temp path.
-pub fn write_steps_npy(
-    rows: &[StepRow],
-    out_path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = out_path.with_extension("npy.tmp");
-    let file = BufWriter::new(File::create(&tmp)?);
-    let mut w = npyz::WriteOptions::new()
-        .dtype(step_row_dtype())
-        .shape(&[rows.len() as u64])
-        .writer(file)
-        .begin_nd()?;
-    // StepRow is Copy; extend consumes owned values.
-    w.extend(rows.iter().copied())?;
-    w.finish()?;
-    std::fs::rename(&tmp, out_path)?;
-    Ok(())
+/// Write the aggregated `steps.npy` shard via the dataset-packer helper.
+pub fn write_steps_npy(rows: &[StepRow], out_path: &Path) -> Result<()> {
+    write_selfplay_steps(rows, out_path)
 }
 
 /// Write a float32 embeddings shard `[N, D]` to `path`.
-pub fn write_embeddings_npy(
-    floats: &[f32],
-    n_rows: usize,
-    dim: usize,
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write_embeddings_npy(floats: &[f32], n_rows: usize, dim: usize, path: &Path) -> Result<()> {
     assert_eq!(floats.len(), n_rows * dim, "embeddings length must be N*D");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let file = BufWriter::new(File::create(path)?);
     let f4_le: TypeStr = "<f4".parse().unwrap();
-    let mut w = npyz::WriteOptions::new()
+    let mut w = WriteOptions::new()
         .dtype(DType::Plain(f4_le))
         .shape(&[n_rows as u64, dim as u64])
         .writer(file)
         .begin_nd()?;
-    // Write in one go; npyz accepts an iterator of f32
     w.extend(floats.iter().copied())?;
     w.finish()?;
     Ok(())
@@ -117,7 +67,6 @@ mod tests {
         let mut r = BufReader::new(File::open(&path).unwrap());
         let hdr = npyz::NpyHeader::from_reader(&mut r).unwrap();
         assert_eq!(hdr.shape(), &[3]);
-        // Reset reader and pull typed rows
         drop(r);
         let mut r = BufReader::new(File::open(&path).unwrap());
         let npy = npyz::NpyFile::new(&mut r).unwrap();
