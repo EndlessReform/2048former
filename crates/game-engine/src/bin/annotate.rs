@@ -27,7 +27,7 @@ struct Args {
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let cfg = config::Config::from_toml(&args.config)
+    let cfg = config::AnnotationConfig::from_toml(&args.config)
         .map_err(|e| anyhow::anyhow!("failed to load config: {e}"))?;
     annotation::run(annotation::JobConfig {
         dataset_dir: args.dataset,

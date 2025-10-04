@@ -8,7 +8,7 @@ use indicatif::ProgressBar;
 use npyz::NpyFile;
 
 use crate::PackSummary;
-use crate::macrosxue::RunSummary;
+use crate::macroxue::RunSummary;
 use crate::schema::MacroxueStepRow;
 use crate::writer::StepsWriter;
 
@@ -93,7 +93,7 @@ pub fn merge_datasets(opts: MergeOptions) -> Result<PackSummary> {
     let total_steps = left.total_steps + right.total_steps;
 
     let pb = if total_steps > 0 {
-        let pb = crate::macrosxue::default_progress_bar(total_steps as u64);
+        let pb = crate::macroxue::default_progress_bar(total_steps as u64);
         pb.set_message("merging steps");
         Some(pb)
     } else {
@@ -110,8 +110,8 @@ pub fn merge_datasets(opts: MergeOptions) -> Result<PackSummary> {
         pb.finish_with_message("merge complete");
     }
 
-    crate::macrosxue::write_metadata(&opts.output_dir, &new_runs, opts.overwrite)?;
-    crate::macrosxue::write_valuation_types(&opts.output_dir, &valuation_names, opts.overwrite)?;
+    crate::macroxue::write_metadata(&opts.output_dir, &new_runs, opts.overwrite)?;
+    crate::macroxue::write_valuation_types(&opts.output_dir, &valuation_names, opts.overwrite)?;
 
     if opts.delete_inputs {
         let output_canon = fs::canonicalize(&opts.output_dir)
@@ -144,11 +144,11 @@ fn load_dataset_info(dir: &Path) -> Result<DatasetInfo> {
     if steps_files.is_empty() {
         bail!("no steps.npy files found in {}", dir.display());
     }
-    let runs = crate::macrosxue::load_runs(dir)?;
+    let runs = crate::macroxue::load_runs(dir)?;
     if runs.is_empty() {
         bail!("metadata.db in {} has no runs", dir.display());
     }
-    let valuation_names = crate::macrosxue::load_valuation_names(dir)?;
+    let valuation_names = crate::macroxue::load_valuation_names(dir)?;
     let total_steps = runs.iter().map(|r| r.steps).sum();
     Ok(DatasetInfo {
         runs,

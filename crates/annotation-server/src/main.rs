@@ -12,11 +12,12 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
-use dataset_packer::macrosxue::{self, RunSummary};
-use dataset_packer::schema::{AnnotationRow, MacroxueStepRow};
+use dataset_packer::macroxue::{self, RunSummary};
+use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, annotation_kinds};
 use npyz::NpyFile;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json;
 use tokio::signal;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -47,13 +48,17 @@ struct RunSummaryResponse {
     steps: usize,
     max_score: u64,
     highest_tile: u32,
+    policy_kind_mask: u8,
 }
 
 #[derive(Clone, Serialize)]
 struct AnnotationPayload {
+    policy_kind_mask: u8,
     argmax_head: u8,
     argmax_prob: f32,
     policy_p1: [f32; 4],
+    policy_logp: [f32; 4],
+    policy_hard: [f32; 4],
 }
 
 #[derive(Clone, Serialize)]
@@ -65,6 +70,23 @@ struct StepResponse {
     teacher_move: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotation: Option<AnnotationPayload>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PolicyKindLegend {
+    policy_p1: u8,
+    policy_logprobs: u8,
+    policy_hard: u8,
+}
+
+impl Default for PolicyKindLegend {
+    fn default() -> Self {
+        Self {
+            policy_p1: annotation_kinds::POLICY_P1,
+            policy_logprobs: annotation_kinds::POLICY_LOGPROBS,
+            policy_hard: annotation_kinds::POLICY_HARD,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -80,6 +102,7 @@ struct RunsResponse {
     page: usize,
     page_size: usize,
     runs: Vec<RunSummaryResponse>,
+    policy_kind_legend: PolicyKindLegend,
 }
 
 #[derive(Serialize)]
@@ -87,6 +110,7 @@ struct RunDetailResponse {
     run: RunSummaryResponse,
     pagination: Pagination,
     steps: Vec<StepResponse>,
+    policy_kind_legend: PolicyKindLegend,
 }
 
 struct StepRecord {
@@ -101,12 +125,33 @@ struct StepRecord {
 struct RunEntry {
     summary: RunSummary,
     steps: Vec<StepRecord>,
+    policy_kind_mask: u8,
 }
 
 #[derive(Clone)]
 struct AppState {
     runs: Arc<Vec<RunEntry>>,
     run_index: Arc<HashMap<u32, usize>>,
+    policy_kind_legend: Arc<PolicyKindLegend>,
+}
+
+struct DatasetLoad {
+    runs: Vec<RunEntry>,
+    policy_kind_legend: PolicyKindLegend,
+}
+
+struct ManifestData {
+    legend: PolicyKindLegend,
+    run_masks: HashMap<u32, u8>,
+}
+
+impl Default for ManifestData {
+    fn default() -> Self {
+        Self {
+            legend: PolicyKindLegend::default(),
+            run_masks: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -137,20 +182,25 @@ async fn main() -> Result<()> {
         .init();
 
     info!("loading dataset" = %args.dataset.display(), "annotations" = %args.annotations.display());
-    let runs = load_dataset(&args.dataset, &args.annotations)?;
-    let run_index = runs
+    let dataset = load_dataset(&args.dataset, &args.annotations)?;
+    let run_index = dataset
+        .runs
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.summary.run_id, idx))
         .collect::<HashMap<_, _>>();
     let state = AppState {
-        runs: Arc::new(runs),
+        runs: Arc::new(dataset.runs),
         run_index: Arc::new(run_index),
+        policy_kind_legend: Arc::new(dataset.policy_kind_legend),
     };
+
+    use tower_http::cors::CorsLayer;
 
     let router = Router::new()
         .route("/runs", get(list_runs))
         .route("/runs/:run_id", get(get_run))
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
@@ -257,6 +307,7 @@ async fn list_runs(
             steps: entry.summary.steps,
             max_score: entry.summary.max_score,
             highest_tile: entry.summary.highest_tile,
+            policy_kind_mask: entry.policy_kind_mask,
         })
         .collect();
 
@@ -265,6 +316,7 @@ async fn list_runs(
         page,
         page_size,
         runs,
+        policy_kind_legend: (*state.policy_kind_legend).clone(),
     })
 }
 
@@ -296,9 +348,12 @@ async fn get_run(
             legal_mask: step.legal_mask,
             teacher_move: step.teacher_move,
             annotation: step.annotation.map(|ann| AnnotationPayload {
+                policy_kind_mask: ann.policy_kind_mask,
                 argmax_head: ann.argmax_head,
                 argmax_prob: ann.argmax_prob,
                 policy_p1: ann.policy_p1,
+                policy_logp: ann.policy_logp,
+                policy_hard: ann.policy_hard,
             }),
         })
         .collect();
@@ -310,6 +365,7 @@ async fn get_run(
             steps: entry.summary.steps,
             max_score: entry.summary.max_score,
             highest_tile: entry.summary.highest_tile,
+            policy_kind_mask: entry.policy_kind_mask,
         },
         pagination: Pagination {
             offset,
@@ -317,14 +373,16 @@ async fn get_run(
             total,
         },
         steps,
+        policy_kind_legend: (*state.policy_kind_legend).clone(),
     };
     Ok(Json(response))
 }
 
-fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<Vec<RunEntry>> {
-    let runs = macrosxue::load_runs(dataset_dir)?;
+fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<DatasetLoad> {
+    let runs = macroxue::load_runs(dataset_dir)?;
     let step_map = load_macro_steps(dataset_dir)?;
     let annotations = load_annotations(annotations_dir)?;
+    let manifest = load_manifest(annotations_dir).unwrap_or_default();
 
     let mut entries = Vec::with_capacity(runs.len());
     for summary in runs {
@@ -336,10 +394,18 @@ fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<Vec<RunEnt
             }
         };
         let mut records = Vec::with_capacity(steps.len());
+        let mut policy_kind_mask = manifest
+            .run_masks
+            .get(&summary.run_id)
+            .copied()
+            .unwrap_or_default();
         for row in steps {
             let board = decode_board(row.board, row.tile_65536_mask);
             let branch_evs = branch_evs_as_options(row);
             let annotation = annotations.get(&(row.run_id, row.step_index)).copied();
+            if let Some(ann) = annotation {
+                policy_kind_mask |= ann.policy_kind_mask;
+            }
             let legal_mask = row.ev_legal;
             let teacher_move = row.move_dir;
             records.push(StepRecord {
@@ -354,9 +420,44 @@ fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<Vec<RunEnt
         entries.push(RunEntry {
             summary,
             steps: records,
+            policy_kind_mask,
         });
     }
-    Ok(entries)
+    Ok(DatasetLoad {
+        runs: entries,
+        policy_kind_legend: manifest.legend,
+    })
+}
+
+#[derive(Deserialize)]
+struct ManifestFile {
+    #[serde(default)]
+    kinds: Option<PolicyKindLegend>,
+    #[serde(default)]
+    runs: Vec<ManifestEntryFile>,
+}
+
+#[derive(Deserialize)]
+struct ManifestEntryFile {
+    run_id: u32,
+    policy_kind_mask: u8,
+}
+
+fn load_manifest(dir: &Path) -> Result<ManifestData> {
+    let path = dir.join("annotation_manifest.json");
+    if !path.exists() {
+        return Ok(ManifestData::default());
+    }
+    let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let manifest: ManifestFile = serde_json::from_reader(file)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let legend = manifest.kinds.unwrap_or_default();
+    let run_masks = manifest
+        .runs
+        .into_iter()
+        .map(|entry| (entry.run_id, entry.policy_kind_mask))
+        .collect();
+    Ok(ManifestData { legend, run_masks })
 }
 
 fn load_macro_steps(dir: &Path) -> Result<HashMap<u32, Vec<MacroxueStepRow>>> {

@@ -6,13 +6,13 @@
 //! packed datasets, and working with the lean self-play v1 rails. Run
 //! `cargo doc -p dataset-packer --open` to browse the public API.
 
-pub mod macrosxue;
+pub mod macroxue;
 pub mod merge;
 pub mod schema;
 pub mod selfplay;
 pub mod writer;
 
-pub use crate::macrosxue::{PackOptions, pack_dataset};
+pub use crate::macroxue::{PackOptions, pack_dataset};
 pub use crate::merge::{MergeOptions, merge_datasets};
 pub use crate::schema::{MacroxueStepRow, SelfplayStepRow, StepRow};
 pub use crate::selfplay::{collect_selfplay_step_files, load_selfplay_shard, write_selfplay_steps};

@@ -141,9 +141,21 @@ pub struct AnnotationRow {
     pub step_index: u32,
     pub teacher_move: u8,
     pub legal_mask: u8,
+    pub policy_kind_mask: u8,
     pub argmax_head: u8,
     pub argmax_prob: f32,
     pub policy_p1: [f32; 4],
+    pub policy_logp: [f32; 4],
+    pub policy_hard: [f32; 4],
+}
+
+pub mod annotation_kinds {
+    /// Model output includes per-branch probability mass of the top-most bin.
+    pub const POLICY_P1: u8 = 1 << 0;
+    /// Model output includes four-way log-probabilities for each move.
+    pub const POLICY_LOGPROBS: u8 = 1 << 1;
+    /// Teacher signal provides a hard target policy distribution.
+    pub const POLICY_HARD: u8 = 1 << 2;
 }
 
 impl StructuredRow for AnnotationRow {
@@ -169,6 +181,10 @@ impl StructuredRow for AnnotationRow {
                 dtype: DType::Plain(u1.clone()),
             },
             Field {
+                name: "policy_kind_mask".into(),
+                dtype: DType::Plain(u1.clone()),
+            },
+            Field {
                 name: "argmax_head".into(),
                 dtype: DType::Plain(u1.clone()),
             },
@@ -178,6 +194,14 @@ impl StructuredRow for AnnotationRow {
             },
             Field {
                 name: "policy_p1".into(),
+                dtype: DType::Array(4, Box::new(DType::Plain(f4.clone()))),
+            },
+            Field {
+                name: "policy_logp".into(),
+                dtype: DType::Array(4, Box::new(DType::Plain(f4.clone()))),
+            },
+            Field {
+                name: "policy_hard".into(),
                 dtype: DType::Array(4, Box::new(DType::Plain(f4))),
             },
         ])

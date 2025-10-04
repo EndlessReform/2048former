@@ -1,0 +1,31 @@
+# Orchestrator configuration for annotation.
+# This file provides connection and batching settings for the annotation-engine,
+# which reuses the self-play feeder pipeline to score previously recorded boards.
+max_concurrent_games = 256
+max_retries = 1
+
+[orchestrator.connection]
+# UDS socket for the inference server.
+# The annotation engine connects to this to get model predictions.
+uds_path = "/tmp/2048_infer.sock"
+# TCP address is commented out as UDS is preferred for local communication.
+# addr = "http://127.0.0.1:8081"
+
+# Request timeout in milliseconds.
+timeout_ms = 5000
+
+# Number of concurrent requests to the inference server.
+concurrency = 4
+
+[orchestrator.batch]
+# Maximum number of batches to have in-flight to the inference server.
+# This, along with max_batch, controls backpressure.
+target_batch = 32
+inflight_batches = 4
+
+# Maximum number of game states to send in a single batch.
+max_batch = 256
+
+# Seed for the random number generator, if needed.
+# For annotation, this is less critical as we are reading existing datasets.
+seed = 42

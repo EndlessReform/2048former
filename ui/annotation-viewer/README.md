@@ -1,73 +1,52 @@
-# React + TypeScript + Vite
+# Annotation Viewer
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite client for browsing annotated 2048 self-play runs served by the Rust annotation server.
 
-Currently, two official plugins are available:
+## Environment Variables
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+Set these in a `.env.local` or via your shell before starting the dev server/build:
 
-## React Compiler
+- `VITE_ANNOTATION_API_BASE` — Base URL for the annotation server (e.g. `http://localhost:8080`). Omit or leave empty to proxy against the same origin the site is served from.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+### Serving Over LAN / Custom Hosts
 
-## Expanding the ESLint configuration
+`npm run dev` already binds to `0.0.0.0` so any device on the LAN can connect via `http://<host-ip>:5173`. To change the host or port, pass flags directly to Vite:
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run dev -- --host 192.168.1.42 --port 5174
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+If you need to expose the annotation API from a different origin, update `VITE_ANNOTATION_API_BASE` accordingly (e.g. `http://192.168.1.42:8080`). For locked-down environments you can also proxy through Vite by extending `vite.config.ts` with a `server.proxy` entry.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Installation
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+cd ui/annotation-viewer
+npm install
 ```
+
+## Local Development
+
+```bash
+# assumes annotation server listening at http://localhost:8080
+export VITE_ANNOTATION_API_BASE="http://localhost:8080"
+npm run dev
+```
+
+`npm run dev` launches Vite with hot-module reload. Visit `http://localhost:5173` or the LAN URL printed in the console.
+
+## Production Build
+
+```bash
+npm run build
+```
+
+This produces a static bundle under `dist/`. Preview locally with `npm run preview`.
+
+## Current Functionality
+
+- Lists annotated runs with max score, step count, and highest tile metadata.
+- Fetches run details and shows a summary with a representative board snapshot.
+- Highlights teacher move, model argmax, probability, and legal move mask for the sampled step.
+
+Additional panels (timeline, filters, per-branch inspection) are planned but not yet implemented.

@@ -51,36 +51,53 @@ Inference already runs over these boards via the gRPC service in `packages/infer
   - `step_index: u32`
   - `teacher_move: u8` (`0=Up..3=Right`, `255` unknown)
   - `legal_mask: u8` (UDLR bitmask)
+  - `policy_kind_mask: u8` (bitset: `policy_p1`, `policy_logprobs`, `policy_hard` when present)
   - `argmax_head: u8`
   - `argmax_prob: f32`
   - `policy_p1: [f32; 4]` (probability mass of the final bin per branch)
+  - `policy_logp: [f32; 4]` (natural log probabilities over branches)
+  - `policy_hard: [f32; 4]` (teacher one-hot when available)
 - `metadata.db` is copied into the output directory; `valuation_types.json` is preserved for Macroxue pools to keep enum alignment.
+- `annotation_manifest.json` records the per-run `policy_kind_mask` so downstream tools can feature-detect available annotations without scanning shards.
 
 ### Usage quick start
+
+Start inference server:
+
+```bash
+uv run infer-2048 --init checkpoints/20251002_002432 --uds unix:/tmp/2048_infer.sock --device cuda
 ```
-uv run cargo run -p game-engine --bin annotation-engine \
-  --config config/orchestrator.toml \
-  --dataset datasets/macroxue/d6_10g_v1 \
-  --output annotations/d6_10g_v1/model=v1_50m \
+
+Then run the client:
+
+```bash
+cargo run -p game-engine --release --bin annotation-engine -- \
+  --config config/inference/orchestrator.toml \
+  --dataset datasets/raws/d7_test_v1 \
+  --output annotations/d7_test_v1 \
   --overwrite
 ```
+
 Generated artifacts:
 - `annotations-*.npy`
 - `metadata.db` (copy of source)
 - `valuation_types.json` (Macroxue only)
+- `annotation_manifest.json` (policy kind bitmasks per run)
 
 ### Serving annotations over HTTP
 
 Run the Axum server against a base dataset plus its annotation directory:
-```
-uv run cargo run -p annotation-server -- \
+
+```bash
+cargo run -p annotation-server --release -- \
   --dataset datasets/macroxue/d6_10g_v1 \
   --annotations annotations/d6_10g_v1/model=v1_50m \
   --host 127.0.0.1 \
   --port 8080
 ```
 - `GET /runs?page=1&page_size=25&min_score=500_000` returns paginated run summaries with optional filters on score, highest tile, and step counts.
-- `GET /runs/{run_id}?offset=0&limit=200` streams step slices including packed boards, teacher metadata, Macroxue branch EVs, and the annotated policy probabilities (`policy_p1`). The response shape leaves room for future value heads.
+- Each run summary now carries a `policy_kind_mask`, and both list/detail responses export a `policy_kind_legend` object so clients can decode bit assignments without hard-coding constants.
+- `GET /runs/{run_id}?offset=0&limit=200` streams step slices including packed boards, teacher metadata, Macroxue branch EVs, and the annotated policy payload (mask + `policy_p1`, `policy_logp`, `policy_hard`). The response shape leaves room for future value heads.
 
 ## Proposed Annotation Viewer
 
@@ -122,7 +139,7 @@ uv run cargo run -p annotation-server -- \
 - Extend `vite.config.ts` for proxying `/runs` to the Axum backend in dev (`/api` prefix). In production, serve the static bundle next to the Rust binary and point requests at the same origin.
 - Ship a Storybook-like `MockProvider` that feeds snapshot JSONs (captured via `curl`) into components for visual regression without hitting the backend.
 - Co-locate Tailwind component classes via `@apply` in `App.css` until the UI graduates into dedicated feature folders (`features/runs`, `features/board`, `features/insights`).
-- Update the schema writer and server DTOs to persist branch-wise log probabilities (`policy_logp: [f32; 4]`). The UI should prefer log space for numerical stability, deriving `policy_p1 = logp.exp()` only when rendering percentages.
+- Update the schema writer and server DTOs to persist branch-wise log probabilities (`policy_logp: [f32; 4]`) and teacher one-hot annotations (`policy_hard: [f32; 4]`). The UI should prefer log space for numerical stability, deriving `policy_p1 = logp.exp()` only when rendering percentages.
 
 ### Future polish
 - Layer in keyboard tutorials (press `?` to show shortcuts) and quick filters (“Show disagreements”, “High EV swings”).

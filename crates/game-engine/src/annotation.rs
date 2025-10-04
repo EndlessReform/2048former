@@ -1,13 +1,15 @@
 use crate::{config, pipeline};
 use anyhow::{Context, Result, anyhow, bail};
 use dataset_packer;
-use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, SelfplayStepRow};
+use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, SelfplayStepRow, annotation_kinds};
 use dataset_packer::writer::StepsWriter;
 use futures::stream::{FuturesUnordered, StreamExt};
+use log::info;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 
 use crate::feeder::{self, FeederHandle, InferenceOutput};
 
@@ -17,7 +19,7 @@ pub struct JobConfig {
     pub output_dir: PathBuf,
     pub overwrite: bool,
     pub limit: Option<usize>,
-    pub config: config::Config,
+    pub config: config::AnnotationConfig,
 }
 
 /// Run the annotation job end-to-end.
@@ -31,8 +33,6 @@ pub async fn run(job: JobConfig) -> Result<()> {
 
     let client = pipeline::connect_inference(&job.config.orchestrator.connection).await?;
     let (mut feeder, handle) = pipeline::build_feeder(job.config.orchestrator.batch.clone(), false);
-    let cancel = CancellationToken::new();
-    feeder.set_cancel_token(cancel.clone());
     let _emb_tx = if job.config.orchestrator.inline_embeddings {
         let (tx, mut rx) = mpsc::channel::<feeder::EmbeddingRow>(8);
         feeder.set_embeddings_channel(tx.clone());
@@ -44,12 +44,22 @@ pub async fn run(job: JobConfig) -> Result<()> {
     };
     let feeder_task = feeder.spawn(client);
 
+    info!(
+        "Starting annotation: dataset={} output={} overwrite={} limit={:?}",
+        job.dataset_dir.display(),
+        job.output_dir.display(),
+        job.overwrite,
+        job.limit
+    );
+
     let mut writer = StepsWriter::<AnnotationRow>::with_prefix(
         &job.output_dir,
         "annotations",
         Some(job.config.orchestrator.report.shard_max_steps_or_default()),
         job.overwrite,
     )?;
+
+    let mut run_masks: HashMap<u32, u8> = HashMap::new();
 
     let step_files = dataset_packer::selfplay::collect_selfplay_step_files(&job.dataset_dir)?;
     if step_files.is_empty() {
@@ -59,6 +69,12 @@ pub async fn run(job: JobConfig) -> Result<()> {
         );
     }
     let kind = detect_kind(&step_files)?;
+
+    info!(
+        "Discovered {} step shards; dataset kind: {:?}",
+        step_files.len(),
+        kind
+    );
 
     copy_metadata(&job.dataset_dir, &job.output_dir, &kind, job.overwrite)?;
 
@@ -81,6 +97,7 @@ pub async fn run(job: JobConfig) -> Result<()> {
                         max_inflight,
                         StepSample::from_macro(row),
                         &mut writer,
+                        &mut run_masks,
                     )
                     .await?;
                 }
@@ -98,6 +115,7 @@ pub async fn run(job: JobConfig) -> Result<()> {
                         max_inflight,
                         StepSample::from_selfplay(row),
                         &mut writer,
+                        &mut run_masks,
                     )
                     .await?;
                 }
@@ -109,14 +127,22 @@ pub async fn run(job: JobConfig) -> Result<()> {
     }
 
     drop(handle);
-    cancel.cancel();
 
     while let Some(res) = inflight.next().await {
         let row = res??;
-        write_result(row, &mut writer)?;
+        write_result(row, &mut writer, &mut run_masks)?;
     }
 
     writer.finish()?;
+
+    write_manifest(&job.output_dir, &run_masks, job.overwrite)?;
+
+    info!(
+        "Annotation finished: wrote {} steps across {} runs into {}",
+        processed,
+        run_masks.len(),
+        job.output_dir.display()
+    );
 
     if let Err(e) = feeder_task.await {
         return Err(anyhow!("feeder task failed: {e}"));
@@ -131,11 +157,12 @@ async fn enqueue_sample(
     max_inflight: usize,
     sample: StepSample,
     writer: &mut StepsWriter<AnnotationRow>,
+    run_masks: &mut HashMap<u32, u8>,
 ) -> Result<()> {
     while inflight.len() >= max_inflight {
         if let Some(join) = inflight.next().await {
             let row = join??;
-            writer.write(std::slice::from_ref(&row))?;
+            write_result(row, writer, run_masks)?;
         }
     }
     let id = sample.unique_id();
@@ -151,21 +178,48 @@ async fn consume_result(
     sample: StepSample,
     rx: tokio::sync::oneshot::Receiver<Result<InferenceOutput, tonic::Status>>,
 ) -> Result<AnnotationRow> {
-    let output = rx
-        .await
-        .map_err(|e| anyhow!("inference oneshot canceled: {e}"))??;
+    let output = rx.await.map_err(|e| {
+        anyhow!(
+            "inference oneshot canceled for run {} step {} (id {}) : {}",
+            sample.run_id,
+            sample.step_index,
+            sample.unique_id(),
+            e
+        )
+    })??;
     match output {
         InferenceOutput::Bins(heads) => {
             let mut p1 = [0f32; 4];
+            let mut logp = [f32::NEG_INFINITY; 4];
             let mut argmax_head = 0u8;
             let mut argmax_p = -1f32;
+            let mut has_policy = false;
             for (idx, head_probs) in heads.iter().enumerate() {
                 if let Some(val) = head_probs.last() {
-                    p1[idx] = *val;
-                    if *val > argmax_p {
-                        argmax_p = *val;
+                    let prob = *val;
+                    p1[idx] = prob;
+                    logp[idx] = if prob > 0.0 {
+                        prob.ln()
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                    has_policy = true;
+                    if prob > argmax_p {
+                        argmax_p = prob;
                         argmax_head = idx as u8;
                     }
+                }
+            }
+            let mut policy_kind_mask = 0u8;
+            if has_policy {
+                policy_kind_mask |= annotation_kinds::POLICY_P1;
+                policy_kind_mask |= annotation_kinds::POLICY_LOGPROBS;
+            }
+            let mut policy_hard = [0f32; 4];
+            if let Some(move_dir) = sample.teacher_move {
+                if move_dir < 4 {
+                    policy_hard[move_dir as usize] = 1.0;
+                    policy_kind_mask |= annotation_kinds::POLICY_HARD;
                 }
             }
             Ok(AnnotationRow {
@@ -173,9 +227,12 @@ async fn consume_result(
                 step_index: sample.step_index,
                 teacher_move: sample.teacher_move.unwrap_or(255),
                 legal_mask: sample.legal_mask.unwrap_or(0),
+                policy_kind_mask,
                 argmax_head,
                 argmax_prob: argmax_p.max(0.0),
                 policy_p1: p1,
+                policy_logp: logp,
+                policy_hard,
             })
         }
         InferenceOutput::Argmax { head: _, _p1 } => Err(anyhow!(
@@ -185,8 +242,67 @@ async fn consume_result(
     }
 }
 
-fn write_result(row: AnnotationRow, writer: &mut StepsWriter<AnnotationRow>) -> Result<()> {
+fn write_result(
+    row: AnnotationRow,
+    writer: &mut StepsWriter<AnnotationRow>,
+    run_masks: &mut HashMap<u32, u8>,
+) -> Result<()> {
     writer.write(std::slice::from_ref(&row))?;
+    run_masks
+        .entry(row.run_id)
+        .and_modify(|mask| *mask |= row.policy_kind_mask)
+        .or_insert(row.policy_kind_mask);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ManifestKinds {
+    policy_p1: u8,
+    policy_logprobs: u8,
+    policy_hard: u8,
+}
+
+#[derive(Serialize)]
+struct ManifestEntry {
+    run_id: u32,
+    policy_kind_mask: u8,
+}
+
+#[derive(Serialize)]
+struct AnnotationManifest {
+    kinds: ManifestKinds,
+    runs: Vec<ManifestEntry>,
+}
+
+fn write_manifest(output_dir: &Path, run_masks: &HashMap<u32, u8>, overwrite: bool) -> Result<()> {
+    let mut runs: Vec<ManifestEntry> = run_masks
+        .iter()
+        .map(|(run_id, mask)| ManifestEntry {
+            run_id: *run_id,
+            policy_kind_mask: *mask,
+        })
+        .collect();
+    runs.sort_by_key(|entry| entry.run_id);
+
+    let manifest = AnnotationManifest {
+        kinds: ManifestKinds {
+            policy_p1: annotation_kinds::POLICY_P1,
+            policy_logprobs: annotation_kinds::POLICY_LOGPROBS,
+            policy_hard: annotation_kinds::POLICY_HARD,
+        },
+        runs,
+    };
+
+    let json = serde_json::to_vec_pretty(&manifest)?;
+    let path = output_dir.join("annotation_manifest.json");
+    if path.exists() && !overwrite {
+        bail!(
+            "annotation_manifest.json already exists in {} (run with --overwrite to replace)",
+            output_dir.display()
+        );
+    }
+    fs::write(&path, json)
+        .with_context(|| format!("failed to write annotation manifest to {}", path.display()))?;
     Ok(())
 }
 
@@ -323,7 +439,7 @@ fn decode_macro_board(packed: u64, mask: u16) -> [u8; 16] {
     out
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum DatasetKind {
     Macroxue,
     Selfplay,

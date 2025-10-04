@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use npyz::NpyFile;
 
-use crate::macrosxue::RunSummary;
+use crate::macroxue::RunSummary;
 use crate::schema::SelfplayStepRow;
 use crate::writer::write_single_shard;
 
@@ -51,7 +51,7 @@ pub fn collect_selfplay_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Load run summaries from `metadata.db` alongside a self-play dataset.
 pub fn load_selfplay_runs(dir: &Path) -> Result<Vec<RunSummary>> {
-    crate::macrosxue::load_runs(dir)
+    crate::macroxue::load_runs(dir)
 }
 
 /// Ensure that a self-play dataset directory looks structurally valid.
@@ -60,7 +60,7 @@ pub fn validate_selfplay_dataset(dir: &Path) -> Result<()> {
     if steps.is_empty() {
         bail!("no steps.npy files found in {}", dir.display());
     }
-    if crate::macrosxue::load_runs(dir)?.is_empty() {
+    if crate::macroxue::load_runs(dir)?.is_empty() {
         bail!("metadata.db in {} has no runs", dir.display());
     }
     Ok(())

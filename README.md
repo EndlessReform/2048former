@@ -1,29 +1,31 @@
-gRPC Inference (Server + Client)
---------------------------------
+# Playing 2048 with transformers
 
-- Python server (Torch):
-  - Generate stubs once:
-    - uv run python -m grpc_tools.protoc -I proto --python_out=packages/infer_2048/src/infer_2048/proto --grpc_python_out=packages/infer_2048/src/infer_2048/proto proto/train_2048/inference/v1/inference.proto
-  - Start:
-    - UDS (recommended local): uv run infer-2048 --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
-    - TCP: uv run infer-2048 --init inits/v1_50m --tcp 127.0.0.1:50051 --device cpu
+## Inference 
 
-- Rust orchestrator client (game-engine):
-  - Configure one of:
-    - In config TOML: [orchestrator.connection] uds_path = "/tmp/2048_infer.sock"
-    - Or TCP: tcp_addr = "http://127.0.0.1:50051"
-  - Build/run: cargo run -p game-engine -- --config config/inference/top-score.toml
+### gRPC Server + Client
 
-Notes
-- UDS and TCP are both supported; UDS avoids TCP overhead on a single node.
-- The wire format returns per-head probability distributions over bins; selection happens in Rust.
+Python server (Torch):
+- Generate stubs once:
 
-Inference
----------
+```bash
+uv run python -m grpc_tools.protoc -I proto --python_out=packages/infer_2048/src/infer_2048/proto --grpc_python_out=packages/infer_2048/src/infer_2048/proto proto/train_2048/inference/v1/inference.proto
+```
+
+Start server over:
+- UDS (recommended local): uv run infer-2048 --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
+- TCP: uv run infer-2048 --init inits/v1_50m --tcp 127.0.0.1:50051 --device cpu
+
+Rust orchestrator client (game-engine):
+- Configure one of:
+- In config TOML: [orchestrator.connection] uds_path = "/tmp/2048_infer.sock"
+- Or TCP: tcp_addr = "http://127.0.0.1:50051"
+- Build/run: cargo run -p game-engine -- --config config/inference/top-score.toml
+
+### Python-side inference
 
 Example: choose the move with the highest probability of the '1' bin.
 
-```
+```bash
 import torch
 from train_2048.config import load_encoder_from_init
 from train_2048.inference import infer_move
@@ -55,8 +57,7 @@ while not board.is_game_over():
 print("final score:", board.score(), "highest:", board.highest_tile())
 ```
 
-CLI script to run a game
-------------------------
+## CLI script to run a game
 
 A standalone script lives in `bin/play_2048.py` (kept outside the package).
 It runs a single game with the default policy, auto-selects device (mps > cuda > cpu), and supports an optional seed.
@@ -84,18 +85,17 @@ Notes
 - Dtype: the model runs in its native dtype; no implicit conversion.
 - Device: defaults to mps on macOS if available, then cuda, else cpu.
 
-Dataset (NPY + SQLite)
-----------------------
+## Dataset (NPY + SQLite)
 
 Build a dataset from `.a2run2` runs using the Rust CLI (see upstream repo):
 
-```
+```bash
 cargo run -q -p ai-2048 --bin dataset -- build --input /path/to/runs --out dataset_dir
 ```
 
 Python usage (NumPy + sqlite3):
 
-```
+```python
 from pathlib import Path
 import sqlite3
 import numpy as np
@@ -176,8 +176,7 @@ Config changes
 - Validation uses disjoint runs via percentage (`val_run_pct`) or explicit SQL (`val_run_sql`).
 - See `config/config.example.toml` and `config/long-ctxt-sft.toml` for templates.
 
-Training
---------
+## Training
 
 - Install deps once via `uv sync`, then train with `uv run python main.py --config config/config.example.toml` (override `--device` as needed).
 - To resume from a previous run, point `init_dir` at either the original init folder or a saved `.pt` bundle (for example `init_dir = "checkpoints/20240901_120000/model-stable.pt"`).
