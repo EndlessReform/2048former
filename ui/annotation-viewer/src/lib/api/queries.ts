@@ -110,8 +110,8 @@ const fetchRunDetail = async (
 
 type RunDetailQueryOptions = Omit<
   UseQueryOptions<RunDetailResponse, ApiError, RunDetailResponse, [string, number, string]>,
-  'queryKey' | 'queryFn' | 'enabled'
-> & { enabled?: boolean }
+  'queryKey' | 'queryFn'
+>
 
 export const useRunDetailQuery = (
   runId: number | null,
