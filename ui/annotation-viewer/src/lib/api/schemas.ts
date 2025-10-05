@@ -45,10 +45,14 @@ export type AnnotationPayload = z.infer<typeof annotationPayloadSchema>
 export const stepResponseSchema = z.object({
   step_index: z.number().int().nonnegative(),
   board: z.array(z.number().int().nonnegative()).length(16),
+  board_value: z.number(),
   branch_evs: z.array(z.number().nullable()),
+  relative_branch_evs: z.array(z.number().int().nullable()),
+  advantage_branch: z.array(z.number().int().nullable()),
   legal_mask: z.number().int().nonnegative(),
   teacher_move: z.number().int().nonnegative(),
   is_disagreement: z.boolean(),
+  valuation_type: z.string(),
   annotation: annotationPayloadSchema.optional(),
 })
 

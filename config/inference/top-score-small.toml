@@ -1,9 +1,9 @@
-num_seeds = 32
+num_seeds = 64
 max_retries = 1
-max_concurrent_games = 32
+max_concurrent_games = 64
 
 [sampling]
-# strategy = "Argmax"
+strategy = "Argmax"
 
 ## Alternative strategies:
 # Softmax over p1 across heads
@@ -32,10 +32,10 @@ max_concurrent_games = 32
 # stop_gate = 64   # default: unset (never stop)
 
 ## Alternative: Tail aggregation with confidence-based p2 weighting (margin-based)
-strategy = "TailAggConf"
-conf_alpha = 0.34        # max p2 weight when margin (p1-p2) is near zero
-conf_beta = 12.0         # slope: larger -> faster decay of p2 weight as margin grows
-conf_gamma = 1.0         # curvature of decay (1.0=rational, >1 steeper, <1 flatter)
+# strategy = "TailAggConf"
+# conf_alpha = 0.34        # max p2 weight when margin (p1-p2) is near zero
+# conf_beta = 12.0         # slope: larger -> faster decay of p2 weight as margin grows
+# conf_gamma = 1.0         # curvature of decay (1.0=rational, >1 steeper, <1 flatter)
 
 [orchestrator.connection]
 # One of uds_path or tcp_addr must be set for the Python server.
@@ -55,7 +55,7 @@ argmax_only = false
 [orchestrator.batch]
 # Time-based flush interval for micro-batches (microseconds)
 flush_us = 500
-target_batch = 32
+target_batch = 64
 max_batch = 128
 inflight_batches = 2
 per_game_inflight = 8

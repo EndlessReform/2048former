@@ -51,12 +51,18 @@ export const MoveInsights = memo(function MoveInsights({ rows, formatPercent }: 
 
         let severity: Severity | null = null
         if (isStudentDisagree) {
-          const evLoss = row.evDelta !== null ? Math.abs(row.evDelta) : 0
+          const rawEvLoss = row.advantage !== null ? Math.abs(row.advantage) : 0
+          const scaledEvLoss =
+            row.teacher_ev_mode === 'relative' ? rawEvLoss : rawEvLoss * 1000
           const studentProb = row.probability ?? 0
 
-          if (studentProb >= 0.9 || (studentProb >= 0.8 && evLoss >= 0.02) || evLoss >= 0.08) {
+          if (
+            studentProb >= 0.9 ||
+            (studentProb >= 0.8 && scaledEvLoss >= 200) ||
+            scaledEvLoss >= 800
+          ) {
             severity = 'severe'
-          } else if (evLoss <= 0.012 && studentProb <= 0.45) {
+          } else if (scaledEvLoss <= 60 && studentProb <= 0.45) {
             severity = 'soft'
           } else {
             severity = 'medium'
@@ -90,17 +96,11 @@ export const MoveInsights = memo(function MoveInsights({ rows, formatPercent }: 
               ) : null}
               {row.label}
             </span>
-            <span className={cx(styles.value, styles.mono)}>
-              {row.ev === null ? '—' : row.ev.toFixed(3)}
-            </span>
+            <span className={cx(styles.value, styles.mono)}>{row.teacher_ev_display}</span>
             <span className={cx(styles.bar, styles.mono)}>
-              <span className={styles.advBar} style={{ '--fill': row.evNormalized ?? 0 } as CSSProperties} />
+              <span className={styles.advBar} style={{ '--fill': row.advantage_normalized ?? 0 } as CSSProperties} />
               <span className={styles.delta}>
-                {row.evDelta === null
-                  ? '—'
-                  : row.evDelta === 0
-                  ? '+0.000'
-                  : row.evDelta.toFixed(3)}
+                {row.advantage_display}
               </span>
             </span>
             <span className={cx(styles.bar, styles.mono)}>

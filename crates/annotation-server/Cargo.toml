@@ -17,3 +17,4 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 dataset-packer = { path = "../dataset-packer" }
 npyz = "0.8.4"
 thiserror = "1.0.64"
+rayon = "1.11.0"

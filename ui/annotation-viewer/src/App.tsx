@@ -85,12 +85,47 @@ const formatPercent = (value: number | null | undefined) => {
   return `${percent.toFixed(5)}%`
 }
 
+const formatTeacherEvDisplay = (value: number | null, mode: 'relative' | 'raw'): string => {
+  if (value === null || Number.isNaN(value)) return '—'
+  if (mode === 'relative') {
+    if (value === 0) return '+0'
+    return `${value > 0 ? '+' : ''}${value}`
+  }
+  return value.toFixed(4)
+}
+
+const formatAdvantageDisplay = (value: number | null, mode: 'relative' | 'raw'): string => {
+  if (value === null || Number.isNaN(value)) return '—'
+  if (mode === 'relative') {
+    if (value === 0) return '+0'
+    return `${value > 0 ? '+' : ''}${value}`
+  }
+  const magnitude = Math.abs(value)
+  const rounded = magnitude < 0.00005 ? 0 : magnitude
+  const sign = rounded === 0 ? '+' : value >= 0 ? '+' : '-'
+  return `${sign}${rounded.toFixed(4)}`
+}
+
 const branchRows = (step: StepResponse | undefined): InsightRow[] => {
   if (!step) return []
-  const teacherEvs = step.branch_evs.map((value) => (value === null ? null : value))
-  const normalizedTeacher = normalize(teacherEvs)
-  const validTeacherEvs = teacherEvs.filter((value): value is number => value !== null)
-  const teacherBest = validTeacherEvs.length ? Math.max(...validTeacherEvs) : null
+
+  const valuationMode: 'relative' | 'raw' =
+    step.valuation_type.toLowerCase() === 'search' ? 'relative' : 'raw'
+
+  const rawEvs = step.branch_evs.map((value) => (value === null ? null : value))
+  const relativeEvs = step.relative_branch_evs.map((value) => (value === null ? null : value))
+  const teacherValues = valuationMode === 'relative' ? relativeEvs : rawEvs
+  const normalizedTeacher = normalize(teacherValues)
+
+  const finiteTeacher = teacherValues.filter(
+    (value): value is number => value !== null && Number.isFinite(value),
+  )
+  const bestTeacher = finiteTeacher.length ? Math.max(...finiteTeacher) : null
+  const advantageValues = teacherValues.map((value) => {
+    if (value === null || bestTeacher === null) return null
+    return value - bestTeacher
+  })
+  const normalizedAdvantage = normalize(advantageValues)
 
   const student = step.annotation
   const studentProb = student ? student.policy_p1 : null
@@ -102,16 +137,20 @@ const branchRows = (step: StepResponse | undefined): InsightRow[] => {
 
   return MOVE_LABELS.map((label, idx) => {
     const legal = (step.legal_mask & (1 << idx)) !== 0
-    const ev = teacherEvs[idx]
-    const evDelta = ev === null || teacherBest === null ? null : ev - teacherBest
+    const teacher_ev = teacherValues[idx]
+    const advantage = advantageValues[idx]
     const probability = studentProb ? studentProb[idx] : null
     const probExp = studentLogp ? Math.exp(studentLogp[idx]) : null
     return {
       label,
       icon: MOVE_ICONS[idx],
-      ev,
-      evNormalized: normalizedTeacher[idx],
-      evDelta,
+      teacher_ev,
+      teacher_ev_normalized: normalizedTeacher[idx],
+      teacher_ev_mode: valuationMode,
+      teacher_ev_display: formatTeacherEvDisplay(teacher_ev, valuationMode),
+      advantage,
+      advantage_display: formatAdvantageDisplay(advantage, valuationMode),
+      advantage_normalized: normalizedAdvantage[idx],
       probability,
       probabilityNormalized: studentProbNormalized[idx],
       probFromLogp: probExp,
@@ -290,7 +329,6 @@ function App() {
     if (!selectedStepData) return []
     return MOVE_ICONS.filter((_, idx) => (selectedStepData.legal_mask & (1 << idx)) !== 0)
   }, [selectedStepData])
-  const upcoming = selectedIndex >= 0 ? steps.slice(selectedIndex + 1, selectedIndex + 4) : []
   const rows = useMemo<InsightRow[]>(() => branchRows(selectedStepData), [selectedStepData])
 
   const teacherMove = selectedStepData?.teacher_move ?? null
@@ -388,10 +426,6 @@ function App() {
   const handleRunSelect = (runId: number) => {
     if (runId === selectedRunId) return
     setSelectedRunId(runId)
-  }
-
-  const handleSelectStep = (stepIndex: number) => {
-    setSelectedStep(stepIndex)
   }
 
   return (
@@ -563,23 +597,31 @@ function App() {
 
             <section className="board-insights">
               <div className="board-column">
-                <div className="board-frame">
-                  <div className="board-grid">
-                    {selectedStepData ? (
-                      selectedStepData.board.map((value, idx) => (
-                        <div
-                          key={idx}
-                          className={`board-cell${value === 0 ? ' empty' : ''}`}
-                          style={tileStyle(value)}
-                        >
-                          {formatTile(value)}
-                        </div>
-                      ))
-                    ) : (
-                      <div className="board-placeholder">Select a step</div>
-                    )}
+                 <div className="board-frame">
+                   <div className="board-grid">
+                     {selectedStepData ? (
+                       selectedStepData.board.map((value, idx) => (
+                         <div
+                           key={idx}
+                           className={`board-cell${value === 0 ? ' empty' : ''}`}
+                           style={tileStyle(value)}
+                         >
+                           {formatTile(value)}
+                         </div>
+                       ))
+                     ) : (
+                       <div className="board-placeholder">Select a step</div>
+                     )}
+                   </div>
+                 </div>
+                {selectedStepData && (
+                  <div className="board-value-bar" role="status" aria-live="polite">
+                    <span className="board-value-label">Board value</span>
+                    <span className="board-value-number">
+                      {selectedStepData.board_value.toFixed(0)}
+                    </span>
                   </div>
-                </div>
+                )}
                 <div className={`board-meta${movesDisagree ? ' has-disagreement' : ''}`}>
                   <div className="board-meta-entry">
                     <span className="meta-label">Teacher</span>
@@ -608,32 +650,6 @@ function App() {
                     </span>
                   </div>
                 </div>
-                {upcoming.length > 0 && (
-                  <div className="board-preview-rail">
-                    <h3 className="preview-title">Upcoming Boards</h3>
-                    <div className="preview-strip">
-                      {upcoming.map((step) => (
-                        <button
-                          key={step.step_index}
-                          type="button"
-                          className="preview-cell"
-                          onClick={() => handleSelectStep(step.step_index)}
-                        >
-                          <span className="preview-meta">#{step.step_index}</span>
-                          <div className="preview-board">
-                            {step.board.map((value, idx) => (
-                              <span
-                                key={idx}
-                                className={`preview-tile${value === 0 ? ' empty' : ''}`}
-                                style={tileStyle(value)}
-                              />
-                            ))}
-                          </div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
 
               <section className="insights-section">

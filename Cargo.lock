@@ -74,6 +74,7 @@ dependencies = [
  "dataset-packer",
  "http",
  "npyz",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

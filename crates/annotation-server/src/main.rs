@@ -11,16 +11,18 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use tower_http::services::ServeDir;
 use clap::Parser;
+use dataset_packer::evaluate;
 use dataset_packer::macroxue::{self, RunSummary};
 use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, annotation_kinds};
 use npyz::NpyFile;
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json;
 use tokio::signal;
-use tracing::{error, info};
+use tower_http::services::ServeDir;
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -71,10 +73,14 @@ struct AnnotationPayload {
 struct StepResponse {
     step_index: u32,
     board: [u8; 16],
+    board_value: f32,
     branch_evs: Vec<Option<f32>>,
+    relative_branch_evs: Vec<Option<i32>>,
+    advantage_branch: Vec<Option<i32>>,
     legal_mask: u8,
     teacher_move: u8,
     is_disagreement: bool,
+    valuation_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotation: Option<AnnotationPayload>,
 }
@@ -129,16 +135,25 @@ struct DisagreementsResponse {
 struct StepRecord {
     step_index: u32,
     board: [u8; 16],
+    board_value: f32,
     branch_evs: [Option<f32>; 4],
+    relative_branch_evs: [Option<i32>; 4],
+    advantage_branch: [Option<i32>; 4],
     legal_mask: u8,
     teacher_move: u8,
-    annotation: Option<AnnotationRow>,
+    is_disagreement: bool,
+    valuation_type: u8,
+    annotation: Option<AnnotationPayload>,
+    annotation_mask: u8,
 }
 
 struct RunEntry {
     summary: RunSummary,
     steps: Vec<StepRecord>,
     policy_kind_mask: u8,
+    disagreements: Vec<u32>,
+    disagreement_count: usize,
+    disagreement_percentage: f32,
 }
 
 #[derive(Clone)]
@@ -146,11 +161,13 @@ struct AppState {
     runs: Arc<Vec<RunEntry>>,
     run_index: Arc<HashMap<u32, usize>>,
     policy_kind_legend: Arc<PolicyKindLegend>,
+    valuation_names: Arc<Vec<String>>,
 }
 
 struct DatasetLoad {
     runs: Vec<RunEntry>,
     policy_kind_legend: PolicyKindLegend,
+    valuation_names: Vec<String>,
 }
 
 struct ManifestData {
@@ -206,6 +223,7 @@ async fn main() -> Result<()> {
         runs: Arc::new(dataset.runs),
         run_index: Arc::new(run_index),
         policy_kind_legend: Arc::new(dataset.policy_kind_legend),
+        valuation_names: Arc::new(dataset.valuation_names),
     };
 
     use tower_http::cors::CorsLayer;
@@ -322,26 +340,15 @@ async fn list_runs(
 
     let runs = slice
         .iter()
-        .map(|entry| {
-            let total_steps = entry.steps.len();
-            let disagreement_count = entry.steps.iter().filter(|s| {
-                if let Some(ann) = s.annotation {
-                    s.teacher_move != 255 && s.teacher_move != ann.argmax_head
-                } else {
-                    false
-                }
-            }).count();
-            let disagreement_percentage = if total_steps > 0 { disagreement_count as f32 / total_steps as f32 } else { 0.0 };
-            RunSummaryResponse {
-                run_id: entry.summary.run_id,
-                seed: entry.summary.seed,
-                steps: entry.summary.steps,
-                max_score: entry.summary.max_score,
-                highest_tile: entry.summary.highest_tile,
-                policy_kind_mask: entry.policy_kind_mask,
-                disagreement_count,
-                disagreement_percentage,
-            }
+        .map(|entry| RunSummaryResponse {
+            run_id: entry.summary.run_id,
+            seed: entry.summary.seed,
+            steps: entry.summary.steps,
+            max_score: entry.summary.max_score,
+            highest_tile: entry.summary.highest_tile,
+            policy_kind_mask: entry.policy_kind_mask,
+            disagreement_count: entry.disagreement_count,
+            disagreement_percentage: entry.disagreement_percentage,
         })
         .collect();
 
@@ -375,40 +382,27 @@ async fn get_run(
 
     let steps = slice
         .iter()
-        .map(|step| {
-            let is_disagreement = if let Some(ann) = step.annotation {
-                step.teacher_move != 255 && step.teacher_move != ann.argmax_head
-            } else {
-                false
-            };
-            StepResponse {
-                step_index: step.step_index,
-                board: step.board,
-                branch_evs: step.branch_evs.iter().copied().collect(),
-                legal_mask: step.legal_mask,
-                teacher_move: step.teacher_move,
-                is_disagreement,
-                annotation: step.annotation.map(|ann| AnnotationPayload {
-                    policy_kind_mask: ann.policy_kind_mask,
-                    argmax_head: ann.argmax_head,
-                    argmax_prob: ann.argmax_prob,
-                    policy_p1: ann.policy_p1,
-                    policy_logp: ann.policy_logp,
-                    policy_hard: ann.policy_hard,
-                }),
-            }
+        .map(|step| StepResponse {
+            step_index: step.step_index,
+            board: step.board,
+            board_value: step.board_value,
+            branch_evs: step.branch_evs.iter().copied().collect(),
+            relative_branch_evs: step.relative_branch_evs.iter().copied().collect(),
+            advantage_branch: step.advantage_branch.iter().copied().collect(),
+            legal_mask: step.legal_mask,
+            teacher_move: step.teacher_move,
+            is_disagreement: step.is_disagreement,
+            valuation_type: state
+                .valuation_names
+                .get(step.valuation_type as usize)
+                .cloned()
+                .unwrap_or_else(|| "search".to_string()),
+            annotation: step.annotation.clone(),
         })
         .collect();
 
-    let total_steps = entry.steps.len();
-    let disagreement_count = entry.steps.iter().filter(|s| {
-        if let Some(ann) = s.annotation {
-            s.teacher_move != 255 && s.teacher_move != ann.argmax_head
-        } else {
-            false
-        }
-    }).count();
-    let disagreement_percentage = if total_steps > 0 { disagreement_count as f32 / total_steps as f32 } else { 0.0 };
+    let disagreement_count = entry.disagreement_count;
+    let disagreement_percentage = entry.disagreement_percentage;
     let response = RunDetailResponse {
         run: RunSummaryResponse {
             run_id: entry.summary.run_id,
@@ -441,26 +435,14 @@ async fn get_disagreements(
         .get(&run_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("run {run_id} not found")))?;
     let entry = &state.runs[*idx];
-    let mut disagreements: Vec<u32> = entry.steps.iter().filter_map(|s| {
-        if let Some(ann) = s.annotation {
-            if s.teacher_move != 255 && s.teacher_move != ann.argmax_head {
-                Some(s.step_index)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }).collect();
-    disagreements.sort();
-    let total = disagreements.len();
+    let total = entry.disagreements.len();
     let offset = query.offset.unwrap_or(0).min(total);
     let limit = query
         .limit
         .unwrap_or(100)
         .clamp(1, 1000)
         .min(total.saturating_sub(offset));
-    let slice = &disagreements[offset..offset + limit];
+    let slice = &entry.disagreements[offset..offset + limit];
     Ok(Json(DisagreementsResponse {
         disagreements: slice.to_vec(),
         total,
@@ -472,6 +454,10 @@ fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<DatasetLoa
     let step_map = load_macro_steps(dataset_dir)?;
     let annotations = load_annotations(annotations_dir)?;
     let manifest = load_manifest(annotations_dir).unwrap_or_default();
+    let valuation_names = macroxue::load_valuation_names(dataset_dir).unwrap_or_else(|err| {
+        warn!("failed to load valuation_types.json: {err}");
+        vec!["search".to_string()]
+    });
 
     let mut entries = Vec::with_capacity(runs.len());
     for summary in runs {
@@ -482,39 +468,130 @@ fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<DatasetLoa
                 continue;
             }
         };
-        let mut records = Vec::with_capacity(steps.len());
+
+        let records: Vec<StepRecord> = steps
+            .par_iter()
+            .map(|row| {
+                let board = decode_board(row.board, row.tile_65536_mask);
+                let board_i32 = board.map(|x| x as i32);
+                let board_value = evaluate(&board_i32, false) as f32;
+
+                let branch_evs = branch_evs_as_options(row);
+                let valuation_idx = row.valuation_type as usize;
+                let valuation_name = valuation_names
+                    .get(valuation_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("search");
+                let is_search = valuation_name.eq_ignore_ascii_case("search");
+
+                let mut relative_branch_evs = [None; 4];
+                let mut advantage_branch = [None; 4];
+                let mut max_rel: Option<i32> = None;
+                let mut max_ev: Option<f32> = None;
+
+                for (idx, maybe_ev) in branch_evs.iter().enumerate() {
+                    if let Some(ev) = maybe_ev {
+                        if is_search {
+                            let rel = (ev * 1000.0 - board_value).round() as i32;
+                            relative_branch_evs[idx] = Some(rel);
+                            max_rel = Some(match max_rel {
+                                Some(current) => current.max(rel),
+                                None => rel,
+                            });
+                        } else {
+                            max_ev = Some(match max_ev {
+                                Some(current) => current.max(*ev),
+                                None => *ev,
+                            });
+                        }
+                    }
+                }
+
+                if is_search {
+                    let best = max_rel.unwrap_or(0);
+                    for idx in 0..4 {
+                        if let Some(rel) = relative_branch_evs[idx] {
+                            advantage_branch[idx] = Some(rel - best);
+                        }
+                    }
+                } else if let Some(best_ev) = max_ev {
+                    for idx in 0..4 {
+                        if let Some(ev) = branch_evs[idx] {
+                            let delta = (ev - best_ev) * 1000.0;
+                            advantage_branch[idx] = Some(delta.round() as i32);
+                        }
+                    }
+                }
+
+                let annotation_row = annotations.get(&(row.run_id, row.step_index)).copied();
+                let (annotation, annotation_mask, is_disagreement) =
+                    if let Some(ann) = annotation_row {
+                        let payload = AnnotationPayload {
+                            policy_kind_mask: ann.policy_kind_mask,
+                            argmax_head: ann.argmax_head,
+                            argmax_prob: ann.argmax_prob,
+                            policy_p1: ann.policy_p1,
+                            policy_logp: ann.policy_logp,
+                            policy_hard: ann.policy_hard,
+                        };
+                        let disagree = row.move_dir != 255 && row.move_dir != ann.argmax_head;
+                        (Some(payload), ann.policy_kind_mask, disagree)
+                    } else {
+                        (None, 0, false)
+                    };
+
+                StepRecord {
+                    step_index: row.step_index,
+                    board,
+                    board_value,
+                    branch_evs,
+                    relative_branch_evs,
+                    advantage_branch,
+                    legal_mask: row.ev_legal,
+                    teacher_move: row.move_dir,
+                    is_disagreement,
+                    valuation_type: row.valuation_type,
+                    annotation,
+                    annotation_mask,
+                }
+            })
+            .collect();
+
         let mut policy_kind_mask = manifest
             .run_masks
             .get(&summary.run_id)
             .copied()
             .unwrap_or_default();
-        for row in steps {
-            let board = decode_board(row.board, row.tile_65536_mask);
-            let branch_evs = branch_evs_as_options(row);
-            let annotation = annotations.get(&(row.run_id, row.step_index)).copied();
-            if let Some(ann) = annotation {
-                policy_kind_mask |= ann.policy_kind_mask;
-            }
-            let legal_mask = row.ev_legal;
-            let teacher_move = row.move_dir;
-            records.push(StepRecord {
-                step_index: row.step_index,
-                board,
-                branch_evs,
-                legal_mask,
-                teacher_move,
-                annotation,
-            });
+        for record in &records {
+            policy_kind_mask |= record.annotation_mask;
         }
+
+        let disagreements: Vec<u32> = records
+            .iter()
+            .filter(|step| step.is_disagreement)
+            .map(|step| step.step_index)
+            .collect();
+        let disagreement_count = disagreements.len();
+        let disagreement_percentage = if records.is_empty() {
+            0.0
+        } else {
+            disagreement_count as f32 / records.len() as f32
+        };
+
         entries.push(RunEntry {
             summary,
             steps: records,
             policy_kind_mask,
+            disagreements,
+            disagreement_count,
+            disagreement_percentage,
         });
     }
+
     Ok(DatasetLoad {
         runs: entries,
         policy_kind_legend: manifest.legend,
+        valuation_names,
     })
 }
 
@@ -719,13 +796,16 @@ mod tests {
         };
 
         let steps = vec![step1, step2, step3, step4];
-        let disagreement_count = steps.iter().filter(|s| {
-            if let Some(ann) = s.annotation {
-                s.teacher_move != 255 && s.teacher_move != ann.argmax_head
-            } else {
-                false
-            }
-        }).count();
+        let disagreement_count = steps
+            .iter()
+            .filter(|s| {
+                if let Some(ann) = s.annotation {
+                    s.teacher_move != 255 && s.teacher_move != ann.argmax_head
+                } else {
+                    false
+                }
+            })
+            .count();
 
         assert_eq!(disagreement_count, 1);
         let total_steps = steps.len();
