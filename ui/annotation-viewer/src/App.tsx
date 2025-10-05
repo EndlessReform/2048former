@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ChangeEvent, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type CSSProperties } from 'react'
 import { useRunDetailQuery, useRunsQuery } from './lib/api/queries'
 import type { StepResponse } from './lib/api/schemas'
 import './App.css'
@@ -8,6 +8,7 @@ const MOVE_ICONS = ['↑', '↓', '←', '→']
 const RUNS_PAGE_SIZE = 25
 const WINDOW_RADIUS = 128
 const WINDOW_SIZE = WINDOW_RADIUS * 2 + 1
+const SAFETY_BUFFER = 8
 
 const TILE_COLORS: Record<number, { bg: string; fg: string }> = {
   0: { bg: '#d7cec3', fg: '#6e645c' },
@@ -155,23 +156,64 @@ function App() {
 
   useEffect(() => {
     if (!totalSteps) return
+
     const maxOffset = Math.max(totalSteps - WINDOW_SIZE, 0)
-    const targetOffset = Math.min(Math.max(selectedStep - WINDOW_RADIUS, 0), maxOffset)
-    if (targetOffset !== windowOffset) {
-      setWindowOffset(targetOffset)
+    const currentStart = steps.length > 0 ? steps[0].step_index : windowOffset
+    const effectiveEnd = steps.length > 0 ? steps[steps.length - 1].step_index : windowOffset + WINDOW_SIZE - 1
+    const currentEnd = Math.min(effectiveEnd, totalSteps - 1)
+
+    const computeOffset = (stepIndex: number) =>
+      Math.min(Math.max(stepIndex - WINDOW_RADIUS, 0), maxOffset)
+
+    if (selectedStep < currentStart || selectedStep > currentEnd) {
+      const nextOffset = computeOffset(selectedStep)
+      if (nextOffset !== windowOffset) {
+        setWindowOffset(nextOffset)
+      }
+      return
     }
-  }, [selectedStep, totalSteps, windowOffset])
+
+    const distanceFromStart = selectedStep - currentStart
+    const distanceFromEnd = currentEnd - selectedStep
+
+    if (distanceFromStart <= SAFETY_BUFFER && windowOffset > 0) {
+      const nextOffset = computeOffset(selectedStep)
+      if (nextOffset !== windowOffset) {
+        setWindowOffset(nextOffset)
+      }
+      return
+    }
+
+    if (distanceFromEnd <= SAFETY_BUFFER && currentEnd < totalSteps - 1) {
+      const nextOffset = computeOffset(selectedStep)
+      if (nextOffset !== windowOffset) {
+        setWindowOffset(nextOffset)
+      }
+    }
+  }, [selectedStep, totalSteps, windowOffset, steps])
 
   useEffect(() => {
     if (!steps.length) return
     const found = steps.find((step) => step.step_index === selectedStep)
-    if (!found) {
-      const fallback = steps[Math.min(steps.length - 1, selectedStep - windowOffset)] ?? steps[0]
-      if (fallback && fallback.step_index !== selectedStep) {
-        setSelectedStep(fallback.step_index)
-      }
+    if (found) return
+
+    const requestedEndBase = windowOffset + WINDOW_SIZE - 1
+    const requestedEnd = totalSteps
+      ? Math.min(requestedEndBase, totalSteps - 1)
+      : requestedEndBase
+    const withinRequestedWindow =
+      selectedStep >= windowOffset && selectedStep <= requestedEnd
+
+    if (withinRequestedWindow) {
+      return
     }
-  }, [steps, selectedStep, windowOffset])
+
+    const clampedIndex = Math.max(selectedStep - windowOffset, 0)
+    const fallback = steps[Math.min(steps.length - 1, clampedIndex)] ?? steps[0]
+    if (fallback && fallback.step_index !== selectedStep) {
+      setSelectedStep(fallback.step_index)
+    }
+  }, [steps, selectedStep, windowOffset, totalSteps])
 
   const selectedIndex = useMemo(
     () => steps.findIndex((step) => step.step_index === selectedStep),
@@ -193,13 +235,27 @@ function App() {
   const hasStudentMove = studentMove !== null && studentMove !== undefined
   const movesDisagree = hasTeacherMove && hasStudentMove && teacherMove !== studentMove
 
-  const handleStepDelta = (delta: number) => {
+  const handleStepDelta = useCallback((delta: number) => {
     if (!totalSteps) return
     setSelectedStep((current) => {
       const next = Math.min(Math.max(current + delta, 0), Math.max(totalSteps - 1, 0))
       return next
     })
-  }
+  }, [totalSteps])
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'h' || event.key === 'ArrowLeft') {
+        handleStepDelta(-1)
+      } else if (event.key === 'l' || event.key === 'ArrowRight') {
+        handleStepDelta(1)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [handleStepDelta])
 
   const canStepBackward = selectedStep > 0
   const canStepForward = totalSteps > 0 && selectedStep < totalSteps - 1
