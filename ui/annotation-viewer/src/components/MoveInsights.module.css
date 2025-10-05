@@ -1,0 +1,189 @@
+.table {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.header,
+.row {
+  display: grid;
+  grid-template-columns: 120px repeat(4, minmax(0, 1fr));
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.header {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: rgba(63, 56, 47, 0.55);
+}
+
+.row {
+  padding: 0.7rem 0.8rem;
+  border-radius: 0.85rem;
+  background: rgba(248, 245, 239, 0.9);
+  border: 1px solid rgba(95, 87, 78, 0.08);
+  font-size: 0.92rem;
+  transition: box-shadow 160ms ease;
+}
+
+.disabled {
+  opacity: 0.4;
+}
+
+.teacher {
+  border-color: rgba(229, 157, 89, 0.4);
+  background: rgba(252, 236, 214, 0.95);
+}
+
+.student {
+  border-color: rgba(132, 120, 110, 0.35);
+}
+
+.studentDisagree {
+  border-color: rgba(200, 64, 46, 0.4);
+}
+
+.studentDisagreeSoft {
+  background: #fdecea;
+  border-color: rgba(209, 97, 73, 0.32);
+}
+
+.studentDisagreeMedium {
+  background: #f8c6bd;
+  border-color: rgba(204, 71, 54, 0.55);
+}
+
+.studentDisagreeSevere {
+  background: #f3c7c1;
+  border-color: #7d1f2b;
+}
+
+.move {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+  color: #3f382f;
+}
+
+.value {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.9rem;
+  color: #3f382f;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+.moveIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 0.6rem;
+  background: rgba(63, 56, 47, 0.08);
+}
+
+.advBar,
+.probBar {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(145, 134, 122, 0.15);
+  overflow: hidden;
+}
+
+.advBar::after,
+.probBar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  transform-origin: left;
+  transform: scaleX(var(--fill, 0));
+}
+
+.advBar::after {
+  background: linear-gradient(90deg, rgba(194, 160, 114, 0.35), rgba(214, 120, 67, 0.8));
+}
+
+.probBar::after {
+  background: linear-gradient(90deg, rgba(177, 166, 155, 0.35), rgba(233, 181, 92, 0.78));
+}
+
+.studentDisagree .probBar::after {
+  background: linear-gradient(90deg, rgba(227, 130, 106, 0.45), rgba(200, 64, 46, 0.9));
+}
+
+.studentDisagreeSevere .probBar::after {
+  background: linear-gradient(90deg, #d8645b, #7d1f2b);
+}
+
+.mono {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+.delta,
+.probability {
+  font-size: 0.78rem;
+  color: rgba(63, 56, 47, 0.7);
+}
+
+.studentDisagreeSoft .move,
+.studentDisagreeSoft .value,
+.studentDisagreeSoft .probability,
+.studentDisagreeSoft .delta {
+  color: #a74a35;
+}
+
+.studentDisagreeMedium .move,
+.studentDisagreeMedium .value,
+.studentDisagreeMedium .probability,
+.studentDisagreeMedium .delta {
+  color: #8f271d;
+}
+
+.studentDisagreeSevere .move,
+.studentDisagreeSevere .value,
+.studentDisagreeSevere .probability,
+.studentDisagreeSevere .delta {
+  color: #6c1625;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-right: 0.35rem;
+  flex-shrink: 0;
+}
+
+.badgeSoft {
+  background: rgba(200, 64, 46, 0.12);
+  color: #a74a35;
+}
+
+.badgeMedium {
+  background: rgba(200, 64, 46, 0.22);
+  color: #fff3f3;
+}
+
+.badgeSevere {
+  background: #7d1f2b;
+  color: #fff2f2;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28);
+}

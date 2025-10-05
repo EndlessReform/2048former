@@ -15,6 +15,8 @@ export const runSummarySchema = z.object({
   max_score: z.number().int().nonnegative(),
   highest_tile: z.number().int().nonnegative(),
   policy_kind_mask: z.number().int().nonnegative(),
+  disagreement_count: z.number().int().nonnegative(),
+  disagreement_percentage: z.number(),
 })
 
 export type RunSummary = z.infer<typeof runSummarySchema>
@@ -46,6 +48,7 @@ export const stepResponseSchema = z.object({
   branch_evs: z.array(z.number().nullable()),
   legal_mask: z.number().int().nonnegative(),
   teacher_move: z.number().int().nonnegative(),
+  is_disagreement: z.boolean(),
   annotation: annotationPayloadSchema.optional(),
 })
 
@@ -67,3 +70,10 @@ export const runDetailResponseSchema = z.object({
 })
 
 export type RunDetailResponse = z.infer<typeof runDetailResponseSchema>
+
+export const disagreementsResponseSchema = z.object({
+  disagreements: z.array(z.number().int().nonnegative()),
+  total: z.number().int().nonnegative(),
+})
+
+export type DisagreementsResponse = z.infer<typeof disagreementsResponseSchema>

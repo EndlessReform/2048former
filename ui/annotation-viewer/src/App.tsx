@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type CSSProperties } from 'react'
-import { useRunDetailQuery, useRunsQuery } from './lib/api/queries'
+import { useDisagreementsQuery, useRunDetailQuery, useRunsQuery } from './lib/api/queries'
 import type { StepResponse } from './lib/api/schemas'
+import type { InsightRow } from './lib/insightRow'
+import { RunsSidebar } from './components/RunsSidebar'
+import { MoveInsights } from './components/MoveInsights'
 import './App.css'
 
 const MOVE_LABELS = ['Up', 'Down', 'Left', 'Right']
@@ -9,6 +12,8 @@ const RUNS_PAGE_SIZE = 25
 const WINDOW_RADIUS = 128
 const WINDOW_SIZE = WINDOW_RADIUS * 2 + 1
 const SAFETY_BUFFER = 8
+const SEGMENT_LENGTH = 16
+const FOCUS_RADIUS = 8
 
 const TILE_COLORS: Record<number, { bg: string; fg: string }> = {
   0: { bg: '#d7cec3', fg: '#6e645c' },
@@ -80,7 +85,7 @@ const formatPercent = (value: number | null | undefined) => {
   return `${percent.toFixed(5)}%`
 }
 
-const branchRows = (step: StepResponse | undefined) => {
+const branchRows = (step: StepResponse | undefined): InsightRow[] => {
   if (!step) return []
   const teacherEvs = step.branch_evs.map((value) => (value === null ? null : value))
   const normalizedTeacher = normalize(teacherEvs)
@@ -143,9 +148,68 @@ function App() {
     placeholderData: (previous) => previous,
   })
 
+  const disagreementsQuery = useDisagreementsQuery(selectedRunId)
+  const disagreements = disagreementsQuery.data?.disagreements ?? []
+
   const steps = runDetailQuery.data?.steps ?? []
   const pagination = runDetailQuery.data?.pagination
   const totalSteps = pagination?.total ?? 0
+
+  const disagreementSegments = useMemo(() => {
+    if (!totalSteps || disagreements.length === 0) return null
+    const segmentCount = Math.ceil(totalSteps / SEGMENT_LENGTH)
+    const segments: Array<{ pct: number; start: number; end: number }> = []
+    for (let i = 0; i < segmentCount; i++) {
+      const globalStart = i * SEGMENT_LENGTH
+      const globalEnd = Math.min(globalStart + SEGMENT_LENGTH, totalSteps)
+      const count = disagreements.filter(idx => idx >= globalStart && idx < globalEnd).length
+      const span = Math.max(globalEnd - globalStart, 1)
+      segments.push({
+        pct: count / span,
+        start: globalStart,
+        end: globalEnd,
+      })
+    }
+    return segments
+  }, [disagreements, totalSteps])
+
+  const disagreementOverviewGradient = useMemo(() => {
+    if (!disagreementSegments) return null
+    const stops: string[] = []
+    const totalSpan = Math.max(totalSteps - 1, 1)
+    disagreementSegments.forEach(({ pct, start, end }) => {
+      const intensity = Math.pow(pct, 0.7)
+      const alpha = 0.1 + 0.9 * intensity
+      const r = 200
+      const g = 64
+      const b = 46
+      const startPct = (start / totalSpan) * 100
+      const endPct = (Math.max(end - 1, start) / totalSpan) * 100
+      const color = `rgba(${r}, ${g}, ${b}, ${alpha.toFixed(3)})`
+      stops.push(`${color} ${startPct.toFixed(2)}%`, `${color} ${endPct.toFixed(2)}%`)
+    })
+    return `linear-gradient(90deg, ${stops.join(', ')})`
+  }, [disagreementSegments, totalSteps])
+
+  const focusBandGradient = useMemo(() => {
+    if (!totalSteps || totalSteps <= 1) return null
+    const totalSpan = totalSteps - 1
+    const start = Math.max(selectedStep - FOCUS_RADIUS, 0)
+    const end = Math.min(selectedStep + FOCUS_RADIUS, totalSteps - 1)
+    const startPct = (start / totalSpan) * 100
+    const endPct = (end / totalSpan) * 100
+    const softenedStart = Math.max(startPct - 0.6, 0)
+    const softenedEnd = Math.min(endPct + 0.6, 100)
+    return `linear-gradient(90deg,
+      transparent 0%,
+      transparent ${softenedStart.toFixed(2)}%,
+      rgba(255, 214, 181, 0.06) ${softenedStart.toFixed(2)}%,
+      rgba(255, 184, 130, 0.16) ${startPct.toFixed(2)}%,
+      rgba(255, 184, 130, 0.16) ${endPct.toFixed(2)}%,
+      rgba(255, 214, 181, 0.06) ${softenedEnd.toFixed(2)}%,
+      transparent ${softenedEnd.toFixed(2)}%,
+      transparent 100%)`
+  }, [selectedStep, totalSteps])
 
   useEffect(() => {
     if (!totalSteps) return
@@ -227,13 +291,39 @@ function App() {
     return MOVE_ICONS.filter((_, idx) => (selectedStepData.legal_mask & (1 << idx)) !== 0)
   }, [selectedStepData])
   const upcoming = selectedIndex >= 0 ? steps.slice(selectedIndex + 1, selectedIndex + 4) : []
-  const rows = useMemo(() => branchRows(selectedStepData), [selectedStepData])
+  const rows = useMemo<InsightRow[]>(() => branchRows(selectedStepData), [selectedStepData])
 
   const teacherMove = selectedStepData?.teacher_move ?? null
   const studentMove = selectedStepData?.annotation?.argmax_head ?? null
   const hasTeacherMove = teacherMove !== null && teacherMove !== 255
   const hasStudentMove = studentMove !== null && studentMove !== undefined
   const movesDisagree = hasTeacherMove && hasStudentMove && teacherMove !== studentMove
+
+  const disagreementTargets = useMemo(() => {
+    let prev: number | null = null
+    let next: number | null = null
+    let current: number | null = null
+
+    for (const index of disagreements) {
+      if (index < selectedStep) {
+        prev = index
+        continue
+      }
+      if (index === selectedStep) {
+        current = index
+        continue
+      }
+      next = index
+      break
+    }
+
+    return { prev, next, current }
+  }, [disagreements, selectedStep])
+
+  const prevDisagreement = disagreementTargets.prev
+  const nextDisagreement = disagreementTargets.next
+
+  const disagreementsLoading = disagreementsQuery.isLoading || disagreementsQuery.isFetching
 
   const handleStepDelta = useCallback((delta: number) => {
     if (!totalSteps) return
@@ -243,19 +333,47 @@ function App() {
     })
   }, [totalSteps])
 
+  const jumpToPrevDisagreement = useCallback(() => {
+    if (prevDisagreement !== null) {
+      setSelectedStep(prevDisagreement)
+    }
+  }, [prevDisagreement, setSelectedStep])
+
+  const jumpToNextDisagreement = useCallback(() => {
+    if (nextDisagreement !== null) {
+      setSelectedStep(nextDisagreement)
+    }
+  }, [nextDisagreement, setSelectedStep])
+
+  const prevDisagreementDisabled = disagreementsLoading || prevDisagreement === null
+  const nextDisagreementDisabled = disagreementsLoading || nextDisagreement === null
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLElement) {
+        const tagName = event.target.tagName
+        if (tagName === 'INPUT' || tagName === 'TEXTAREA' || event.target.isContentEditable) {
+          return
+        }
+      }
+
       if (event.key === 'h' || event.key === 'ArrowLeft') {
         handleStepDelta(-1)
       } else if (event.key === 'l' || event.key === 'ArrowRight') {
         handleStepDelta(1)
+      } else if (event.key === '[') {
+        event.preventDefault()
+        jumpToPrevDisagreement()
+      } else if (event.key === ']') {
+        event.preventDefault()
+        jumpToNextDisagreement()
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
     }
-  }, [handleStepDelta])
+  }, [handleStepDelta, jumpToPrevDisagreement, jumpToNextDisagreement])
 
   const canStepBackward = selectedStep > 0
   const canStepForward = totalSteps > 0 && selectedStep < totalSteps - 1
@@ -278,52 +396,11 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <h1 className="brand-title">Board Annotation</h1>
-          <p className="brand-subtitle">Compare teacher trajectories with model policy.</p>
-        </div>
-        <div className="sidebar-header">
-          <h2 className="sidebar-title">Runs</h2>
-          <span className="sidebar-count">
-            {runsQuery.data?.total ? `${runsQuery.data.total} loaded` : ''}
-          </span>
-        </div>
-        {runsQuery.isLoading ? (
-          <div className="status-card">Loading runs…</div>
-        ) : runsQuery.isError ? (
-          <div className="status-card status-error">
-            Unable to load runs. Verify the annotation server is reachable.
-          </div>
-        ) : runsQuery.data?.runs.length ? (
-          <div className="run-list">
-            {runsQuery.data.runs.map((run) => (
-              <button
-                key={run.run_id}
-                type="button"
-                className={`run-button${run.run_id === selectedRunId ? ' active' : ''}`}
-                onClick={() => handleRunSelect(run.run_id)}
-              >
-                <span className="run-button-title">Run {run.run_id}</span>
-                <span className="run-button-meta">
-                  <span className="meta-label">Score</span>
-                  <span>{run.max_score.toLocaleString()}</span>
-                </span>
-                <span className="run-button-meta">
-                  <span className="meta-label">Steps</span>
-                  <span>{run.steps.toLocaleString()}</span>
-                </span>
-                <span className="run-button-meta">
-                  <span className="meta-label">Highest Tile</span>
-                  <span>{run.highest_tile}</span>
-                </span>
-              </button>
-            ))}
-          </div>
-        ) : (
-          <div className="status-card">No runs available.</div>
-        )}
-      </aside>
+      <RunsSidebar
+        runsQuery={runsQuery}
+        selectedRunId={selectedRunId}
+        onRunSelect={handleRunSelect}
+      />
       <main className="main-content">
         {selectedRunId === null ? (
           <div className="status-card">Select a run to begin.</div>
@@ -362,70 +439,127 @@ function App() {
                   {runDetailQuery.data.run.steps.toLocaleString()}
                 </span>
               </div>
-            </div>
-
-            <section className="scrubber-section">
-              <div className="scrubber-meta">
-                <div className="scrubber-info">
-                  <span className="scrubber-step">
-                    Step{' '}
-                    <span className="scrubber-step-value">
-                      {selectedStepData ? selectedStepData.step_index + 1 : '—'}
-                    </span>
-                    <span className="scrubber-step-total">
-                      {' '}/ {totalSteps.toLocaleString() || '—'}
-                    </span>
-                  </span>
-                  <span className="scrubber-legals">
-                    Legal:{' '}
-                    {legalMoves.length ? (
-                      <span className="scrubber-legal-list">
-                        {legalMoveIcons.map((icon, idx) => (
-                          <span
-                            key={idx}
-                            className="scrubber-legal-icon"
-                            aria-hidden="true"
-                          >
-                            {icon}
-                          </span>
-                        ))}
-                      </span>
-                    ) : (
-                      'None'
-                    )}
-                  </span>
-                </div>
-                <div className="scrubber-controls">
-                  <button
-                    type="button"
-                    className="scrubber-button"
-                    onClick={() => handleStepDelta(-1)}
-                    disabled={!canStepBackward}
-                    aria-label="Go to previous step"
-                  >
-                    ←
-                  </button>
-                  <button
-                    type="button"
-                    className="scrubber-button"
-                    onClick={() => handleStepDelta(1)}
-                    disabled={!canStepForward}
-                    aria-label="Go to next step"
-                  >
-                    →
-                  </button>
-                </div>
+              <div className="status-item">
+                <span className="status-label">Disagreements</span>
+                <span className="status-value">
+                  {(runDetailQuery.data.run.disagreement_percentage * 100).toFixed(1)}%
+                </span>
               </div>
-              <input
-                className="scrubber-slider"
-                type="range"
-                min={0}
-                max={sliderMax}
-                value={sliderValue}
-                onChange={handleSliderChange}
-                disabled={totalSteps <= 1}
-              />
-            </section>
+             </div>
+
+             <section className="disagreement-overview-section">
+               <div className="disagreement-overview-track">
+                 {disagreementOverviewGradient ? (
+                   <div
+                     className="disagreement-overview-density"
+                     style={{ background: disagreementOverviewGradient }}
+                     aria-hidden="true"
+                   />
+                 ) : null}
+               </div>
+             </section>
+
+             <section className="scrubber-section">
+                <div className="scrubber-meta">
+                  <div className="scrubber-info">
+                    <span className="scrubber-step">
+                      Step{' '}
+                      <span className="scrubber-step-value">
+                        {selectedStepData ? selectedStepData.step_index + 1 : '—'}
+                      </span>
+                      <span className="scrubber-step-total">
+                        {' '}/ {totalSteps.toLocaleString() || '—'}
+                      </span>
+                    </span>
+                    <span className="scrubber-legals">
+                      Legal:{' '}
+                      {legalMoves.length ? (
+                        <span className="scrubber-legal-list">
+                          {legalMoveIcons.map((icon, idx) => (
+                            <span
+                              key={idx}
+                              className="scrubber-legal-icon"
+                              aria-hidden="true"
+                            >
+                              {icon}
+                            </span>
+                          ))}
+                        </span>
+                      ) : (
+                        'None'
+                      )}
+                    </span>
+                  </div>
+                  <div className="scrubber-action-group">
+                    <div className="scrubber-disagreement-controls">
+                      <button
+                        type="button"
+                        className="scrubber-button scrubber-disagree-button"
+                        onClick={jumpToPrevDisagreement}
+                        disabled={prevDisagreementDisabled}
+                        aria-label="Jump to previous disagreement"
+                        aria-keyshortcuts="["
+                        title="Prev disagreement ["
+                      >
+                        ← Δ
+                      </button>
+                      <button
+                        type="button"
+                        className="scrubber-button scrubber-disagree-button"
+                        onClick={jumpToNextDisagreement}
+                        disabled={nextDisagreementDisabled}
+                        aria-label="Jump to next disagreement"
+                        aria-keyshortcuts="]"
+                        title="Next disagreement ]"
+                      >
+                        Δ →
+                      </button>
+                    </div>
+                    <div className="scrubber-controls">
+                      <button
+                        type="button"
+                        className="scrubber-button"
+                        onClick={() => handleStepDelta(-1)}
+                        disabled={!canStepBackward}
+                        aria-label="Go to previous step"
+                      >
+                        ←
+                      </button>
+                      <button
+                        type="button"
+                        className="scrubber-button"
+                        onClick={() => handleStepDelta(1)}
+                        disabled={!canStepForward}
+                        aria-label="Go to next step"
+                      >
+                        →
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                 <div className="scrubber-track">
+                   {focusBandGradient ? (
+                     <div
+                       className="scrubber-focus"
+                       style={{ background: focusBandGradient }}
+                       aria-hidden="true"
+                     />
+                   ) : null}
+                   <input
+                     className="scrubber-slider"
+                     type="range"
+                     min={0}
+                     max={sliderMax}
+                     value={sliderValue}
+                     onChange={handleSliderChange}
+                     disabled={totalSteps <= 1}
+                     style={{
+                       background: 'transparent'
+                     }}
+                   />
+                 </div>
+              </section>
+
 
             <section className="board-insights">
               <div className="board-column">
@@ -505,60 +639,7 @@ function App() {
               <section className="insights-section">
                 <h2 className="section-title">Teacher vs student</h2>
                 <div className="insights-grid">
-                  <div className="insight-table">
-                    <div className="insight-header">
-                      <span className="insight-header-label">Move</span>
-                      <span className="insight-header-label mono">Teacher EV</span>
-                      <span className="insight-header-label mono">Advantage (Teacher)</span>
-                      <span className="insight-header-label mono">Student π₁</span>
-                      <span className="insight-header-label mono">Student prob</span>
-                    </div>
-                    {rows.map((row) => (
-                      <div
-                        key={row.label}
-                        className={[
-                          'insight-row',
-                          row.legal ? '' : 'disabled',
-                          row.isTeacher ? 'teacher' : '',
-                          row.isStudent ? 'student' : '',
-                          row.isStudent && !row.isTeacher ? 'student-disagree' : '',
-                        ]
-                          .filter(Boolean)
-                          .join(' ')}
-                      >
-                        <span className="insight-move">
-                          <span className="move-icon">{row.icon}</span>
-                          {row.label}
-                        </span>
-                        <span className="insight-value mono">
-                          {row.ev === null ? '—' : row.ev.toFixed(3)}
-                        </span>
-                        <span className="insight-bar mono">
-                          <span
-                            className="adv-bar"
-                            style={{ '--fill': row.evNormalized ?? 0 } as CSSProperties}
-                          />
-                          <span className="adv-delta">
-                            {row.evDelta === null
-                              ? '—'
-                              : row.evDelta === 0
-                              ? '+0.000'
-                              : row.evDelta.toFixed(3)}
-                          </span>
-                        </span>
-                        <span className="insight-bar mono">
-                          <span
-                            className="prob-bar"
-                            style={{ '--fill': row.probabilityNormalized ?? 0 } as CSSProperties}
-                          />
-                          <span className="prob-value">{formatPercent(row.probability)}</span>
-                        </span>
-                        <span className="insight-value mono">
-                          {row.probFromLogp === null ? '—' : formatPercent(row.probFromLogp)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
+                  <MoveInsights rows={rows} formatPercent={formatPercent} />
                 </div>
               </section>
             </section>

@@ -43,6 +43,22 @@ npm run build
 
 This produces a static bundle under `dist/`. Preview locally with `npm run preview`.
 
+## Serving UI from Annotation Server
+
+To serve the UI directly from the annotation server (recommended for production), build the UI and pass the `--ui-path` flag to the server:
+
+```bash
+# Build the UI
+npm run build
+
+# Run the annotation server with UI serving
+cargo run --bin annotation-server -- --dataset /path/to/dataset --annotations /path/to/annotations --ui-path dist/
+```
+
+The server will serve the UI at the root path `/` and assets under `/assets/`. Since the UI and API are on the same origin, no `VITE_ANNOTATION_API_BASE` configuration is needed—the UI will automatically proxy API requests to the same host/port.
+
+If running the UI separately (e.g., for development), ensure `VITE_ANNOTATION_API_BASE` points to the annotation server URL.
+
 ## Current Functionality
 
 - Lists annotated runs with max score, step count, and highest tile metadata.

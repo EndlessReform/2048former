@@ -1,7 +1,15 @@
 import { useQuery } from '@tanstack/react-query'
 import { fetchJson } from './client'
-import { runDetailResponseSchema, runsResponseSchema } from './schemas'
-import type { RunDetailResponse, RunsResponse } from './schemas'
+import {
+  disagreementsResponseSchema,
+  runDetailResponseSchema,
+  runsResponseSchema,
+} from './schemas'
+import type {
+  DisagreementsResponse,
+  RunDetailResponse,
+  RunsResponse,
+} from './schemas'
 import type { UseQueryOptions } from '@tanstack/react-query'
 import { ApiError } from './errors'
 
@@ -138,6 +146,77 @@ export const useRunDetailQuery = (
         })
       }
       return fetchRunDetail(runId, params)
+    },
+    enabled: isEnabled,
+    staleTime: 30_000,
+    ...rest,
+  })
+}
+
+const DISAGREEMENT_PAGE_SIZE = 1024
+
+const fetchRunDisagreements = async (runId: number): Promise<DisagreementsResponse> => {
+  let offset = 0
+  let total = 0
+  const disagreements: number[] = []
+
+  try {
+    // Loop to gather all disagreement indices with bounded page size.
+    // The server guarantees sorted order, so we append as-is.
+    for (;;) {
+      const searchParams = new URLSearchParams()
+      searchParams.set('offset', String(offset))
+      searchParams.set('limit', String(DISAGREEMENT_PAGE_SIZE))
+
+      const page = await fetchJson<DisagreementsResponse>({
+        path: `/runs/${runId}/disagreements`,
+        schema: disagreementsResponseSchema,
+        searchParams,
+      })
+
+      if (offset == 0) {
+        total = page.total
+      }
+
+      disagreements.push(...page.disagreements)
+      offset += page.disagreements.length
+
+      if (offset >= page.total || page.disagreements.length === 0) {
+        break
+      }
+    }
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) {
+      return { disagreements: [], total: 0 }
+    }
+    throw error
+  }
+
+  return { disagreements, total }
+}
+
+type DisagreementsQueryOptions = Omit<
+  UseQueryOptions<DisagreementsResponse, ApiError, DisagreementsResponse, [string, number]>,
+  'queryKey' | 'queryFn'
+>
+
+export const useDisagreementsQuery = (
+  runId: number | null,
+  options?: DisagreementsQueryOptions,
+) => {
+  const { enabled, ...rest } = options ?? {}
+  const isEnabled = runId !== null && (enabled ?? true)
+
+  return useQuery({
+    queryKey: ['runDisagreements', runId ?? -1],
+    queryFn: () => {
+      if (runId === null) {
+        throw new ApiError('runId is required to fetch disagreements', {
+          status: 400,
+          url: '/runs/:run_id/disagreements',
+        })
+      }
+      return fetchRunDisagreements(runId)
     },
     enabled: isEnabled,
     staleTime: 30_000,

@@ -177,6 +177,39 @@
   color: #3f382f;
 }
 
+.disagreement-overview-section {
+  padding: 0.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.disagreement-overview-track {
+  position: relative;
+  width: 100%;
+  height: 30px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.93);
+  border: 1px solid rgba(95, 87, 78, 0.12);
+  box-shadow: 0 12px 24px rgba(78, 70, 62, 0.14);
+  display: flex;
+  align-items: center;
+  padding: 0;
+  overflow: hidden;
+}
+
+.disagreement-overview-density {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 100%;
+  border-radius: 0;
+  transform: translateY(-50%);
+  pointer-events: none;
+  opacity: 1;
+}
+
 .scrubber-section {
   padding: 1rem 0;
   display: flex;
@@ -201,14 +234,27 @@
   flex-wrap: wrap;
 }
 
+.scrubber-action-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.scrubber-disagreement-controls {
+  display: inline-flex;
+  gap: 0.35rem;
+  padding-right: 0.65rem;
+  border-right: 1px solid rgba(200, 64, 46, 0.18);
+}
+
 .scrubber-controls {
   display: inline-flex;
   gap: 0.35rem;
 }
 
 .scrubber-button {
-  width: 2.2rem;
   height: 2.2rem;
+  padding: 0 0.4rem;
   border: 1px solid rgba(95, 87, 78, 0.2);
   border-radius: 0.6rem;
   background: rgba(255, 255, 255, 0.9);
@@ -219,6 +265,18 @@
   justify-content: center;
   cursor: pointer;
   transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.scrubber-disagree-button {
+  background: rgba(255, 229, 225, 0.9);
+  border-color: rgba(200, 64, 46, 0.35);
+  color: #a23b2e;
+  font-weight: 600;
+}
+
+.scrubber-disagree-button:hover:not(:disabled) {
+  border-color: rgba(200, 64, 46, 0.55);
+  background: rgba(255, 239, 236, 0.95);
 }
 
 .scrubber-button:hover:not(:disabled) {
@@ -273,13 +331,49 @@
   color: rgba(63, 56, 47, 0.6);
 }
 
+.scrubber-track {
+  position: relative;
+  width: 100%;
+  height: 10px;
+  display: flex;
+  align-items: center;
+  overflow: visible;
+}
+
+.scrubber-focus {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 10px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+  pointer-events: none;
+  box-shadow: 0 0 16px rgba(255, 163, 102, 0.35);
+  transition: background 160ms ease;
+}
+
 .scrubber-slider {
   width: 100%;
   appearance: none;
-  height: 6px;
+  height: 10px;
   border-radius: 999px;
-  background: linear-gradient(90deg, rgba(145, 134, 122, 0.25), rgba(229, 157, 89, 0.55));
   outline: none;
+  background: #c6b9a9;
+  position: relative;
+  z-index: 1;
+}
+
+.scrubber-slider::-webkit-slider-runnable-track {
+  height: 10px;
+  background: #c6b9a9;
+  border-radius: 999px;
+}
+
+.scrubber-slider::-moz-range-track {
+  height: 10px;
+  background: #c6b9a9;
+  border-radius: 999px;
 }
 
 .scrubber-slider::-webkit-slider-thumb {
@@ -499,10 +593,7 @@
   gap: 0.75rem;
 }
 
-.insight-table {
-  display: grid;
-  gap: 0.5rem;
-}
+
 
 .insight-header,
 .insight-row {
@@ -553,9 +644,95 @@
 }
 
 .insight-row.student-disagree {
-  border-color: rgba(200, 64, 46, 0.55);
-  background: rgba(255, 229, 225, 0.95);
+  border-color: rgba(200, 64, 46, 0.4);
 }
+
+.insight-row.student-disagree .prob-bar::after {
+  background: linear-gradient(90deg, rgba(227, 130, 106, 0.45), rgba(200, 64, 46, 0.9));
+}
+
+.insight-row.student-disagree-soft {
+  background: #fdecea;
+  border-color: rgba(209, 97, 73, 0.32);
+}
+
+.insight-row.student-disagree-soft .insight-move,
+.insight-row.student-disagree-soft .insight-value,
+.insight-row.student-disagree-soft .prob-value,
+.insight-row.student-disagree-soft .adv-delta {
+  color: #a74a35;
+}
+
+.insight-row.student-disagree-medium {
+  background: #f8c6bd;
+  border-color: rgba(204, 71, 54, 0.55);
+}
+
+.insight-row.student-disagree-medium .insight-move,
+.insight-row.student-disagree-medium .insight-value,
+.insight-row.student-disagree-medium .prob-value,
+.insight-row.student-disagree-medium .adv-delta {
+  color: #8f271d;
+}
+
+.insight-row.student-disagree-severe {
+  background: #f3c7c1;
+  border-color: #7d1f2b;
+}
+
+.insight-row.student-disagree-severe .insight-move,
+.insight-row.student-disagree-severe .insight-value,
+.insight-row.student-disagree-severe .prob-value,
+.insight-row.student-disagree-severe .adv-delta {
+  color: #6c1625;
+}
+
+.insight-row.student-disagree-severe .prob-bar::after {
+  background: linear-gradient(90deg, #d8645b, #7d1f2b);
+}
+
+.severity-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-right: 0.35rem;
+  flex-shrink: 0;
+}
+
+.severity-soft {
+  background: rgba(200, 64, 46, 0.12);
+  color: #a74a35;
+}
+
+.severity-medium {
+  background: rgba(200, 64, 46, 0.22);
+  color: #fff3f3;
+}
+
+.severity-severe {
+  background: #7d1f2b;
+  color: #fff0f0;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+
+.insight-row.student-disagree-medium .severity-badge,
+.insight-row.student-disagree-severe .severity-badge {
+  color: #fff5f5;
+}
+
+
+.severity-severe {
+  background: #7d0e20;
+  color: #fff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+}
+
 
 .insight-row.student-disagree .insight-move,
 .insight-row.student-disagree .prob-value,
@@ -692,6 +869,18 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 0.5rem;
+  }
+
+  .scrubber-action-group {
+    width: 100%;
+    justify-content: flex-start;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .scrubber-disagreement-controls {
+    padding-right: 0;
+    border-right: none;
   }
 
   .insight-header,

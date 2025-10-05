@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
+use tower_http::services::ServeDir;
 use clap::Parser;
 use dataset_packer::macroxue::{self, RunSummary};
 use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, annotation_kinds};
@@ -30,6 +31,9 @@ struct Args {
     /// Path to the annotation directory containing annotations-*.npy.
     #[arg(long)]
     annotations: PathBuf,
+    /// Optional path to the UI dist directory to serve static files.
+    #[arg(long)]
+    ui_path: Option<PathBuf>,
     /// Host interface to bind (default 0.0.0.0).
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
@@ -49,6 +53,8 @@ struct RunSummaryResponse {
     max_score: u64,
     highest_tile: u32,
     policy_kind_mask: u8,
+    disagreement_count: usize,
+    disagreement_percentage: f32,
 }
 
 #[derive(Clone, Serialize)]
@@ -68,6 +74,7 @@ struct StepResponse {
     branch_evs: Vec<Option<f32>>,
     legal_mask: u8,
     teacher_move: u8,
+    is_disagreement: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotation: Option<AnnotationPayload>,
 }
@@ -111,6 +118,12 @@ struct RunDetailResponse {
     pagination: Pagination,
     steps: Vec<StepResponse>,
     policy_kind_legend: PolicyKindLegend,
+}
+
+#[derive(Serialize)]
+struct DisagreementsResponse {
+    disagreements: Vec<u32>,
+    total: usize,
 }
 
 struct StepRecord {
@@ -200,8 +213,16 @@ async fn main() -> Result<()> {
     let router = Router::new()
         .route("/runs", get(list_runs))
         .route("/runs/:run_id", get(get_run))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .route("/runs/:run_id/disagreements", get(get_disagreements))
+        .layer(CorsLayer::permissive());
+
+    let router = if let Some(ui_path) = &args.ui_path {
+        router.fallback_service(ServeDir::new(ui_path).append_index_html_on_directories(true))
+    } else {
+        router
+    };
+
+    let router = router.with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
@@ -301,13 +322,26 @@ async fn list_runs(
 
     let runs = slice
         .iter()
-        .map(|entry| RunSummaryResponse {
-            run_id: entry.summary.run_id,
-            seed: entry.summary.seed,
-            steps: entry.summary.steps,
-            max_score: entry.summary.max_score,
-            highest_tile: entry.summary.highest_tile,
-            policy_kind_mask: entry.policy_kind_mask,
+        .map(|entry| {
+            let total_steps = entry.steps.len();
+            let disagreement_count = entry.steps.iter().filter(|s| {
+                if let Some(ann) = s.annotation {
+                    s.teacher_move != 255 && s.teacher_move != ann.argmax_head
+                } else {
+                    false
+                }
+            }).count();
+            let disagreement_percentage = if total_steps > 0 { disagreement_count as f32 / total_steps as f32 } else { 0.0 };
+            RunSummaryResponse {
+                run_id: entry.summary.run_id,
+                seed: entry.summary.seed,
+                steps: entry.summary.steps,
+                max_score: entry.summary.max_score,
+                highest_tile: entry.summary.highest_tile,
+                policy_kind_mask: entry.policy_kind_mask,
+                disagreement_count,
+                disagreement_percentage,
+            }
         })
         .collect();
 
@@ -341,23 +375,40 @@ async fn get_run(
 
     let steps = slice
         .iter()
-        .map(|step| StepResponse {
-            step_index: step.step_index,
-            board: step.board,
-            branch_evs: step.branch_evs.iter().copied().collect(),
-            legal_mask: step.legal_mask,
-            teacher_move: step.teacher_move,
-            annotation: step.annotation.map(|ann| AnnotationPayload {
-                policy_kind_mask: ann.policy_kind_mask,
-                argmax_head: ann.argmax_head,
-                argmax_prob: ann.argmax_prob,
-                policy_p1: ann.policy_p1,
-                policy_logp: ann.policy_logp,
-                policy_hard: ann.policy_hard,
-            }),
+        .map(|step| {
+            let is_disagreement = if let Some(ann) = step.annotation {
+                step.teacher_move != 255 && step.teacher_move != ann.argmax_head
+            } else {
+                false
+            };
+            StepResponse {
+                step_index: step.step_index,
+                board: step.board,
+                branch_evs: step.branch_evs.iter().copied().collect(),
+                legal_mask: step.legal_mask,
+                teacher_move: step.teacher_move,
+                is_disagreement,
+                annotation: step.annotation.map(|ann| AnnotationPayload {
+                    policy_kind_mask: ann.policy_kind_mask,
+                    argmax_head: ann.argmax_head,
+                    argmax_prob: ann.argmax_prob,
+                    policy_p1: ann.policy_p1,
+                    policy_logp: ann.policy_logp,
+                    policy_hard: ann.policy_hard,
+                }),
+            }
         })
         .collect();
 
+    let total_steps = entry.steps.len();
+    let disagreement_count = entry.steps.iter().filter(|s| {
+        if let Some(ann) = s.annotation {
+            s.teacher_move != 255 && s.teacher_move != ann.argmax_head
+        } else {
+            false
+        }
+    }).count();
+    let disagreement_percentage = if total_steps > 0 { disagreement_count as f32 / total_steps as f32 } else { 0.0 };
     let response = RunDetailResponse {
         run: RunSummaryResponse {
             run_id: entry.summary.run_id,
@@ -366,6 +417,8 @@ async fn get_run(
             max_score: entry.summary.max_score,
             highest_tile: entry.summary.highest_tile,
             policy_kind_mask: entry.policy_kind_mask,
+            disagreement_count,
+            disagreement_percentage,
         },
         pagination: Pagination {
             offset,
@@ -376,6 +429,42 @@ async fn get_run(
         policy_kind_legend: (*state.policy_kind_legend).clone(),
     };
     Ok(Json(response))
+}
+
+async fn get_disagreements(
+    State(state): State<AppState>,
+    AxumPath(run_id): AxumPath<u32>,
+    Query(query): Query<StepsQuery>,
+) -> Result<Json<DisagreementsResponse>, (StatusCode, String)> {
+    let idx = state
+        .run_index
+        .get(&run_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("run {run_id} not found")))?;
+    let entry = &state.runs[*idx];
+    let mut disagreements: Vec<u32> = entry.steps.iter().filter_map(|s| {
+        if let Some(ann) = s.annotation {
+            if s.teacher_move != 255 && s.teacher_move != ann.argmax_head {
+                Some(s.step_index)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }).collect();
+    disagreements.sort();
+    let total = disagreements.len();
+    let offset = query.offset.unwrap_or(0).min(total);
+    let limit = query
+        .limit
+        .unwrap_or(100)
+        .clamp(1, 1000)
+        .min(total.saturating_sub(offset));
+    let slice = &disagreements[offset..offset + limit];
+    Ok(Json(DisagreementsResponse {
+        disagreements: slice.to_vec(),
+        total,
+    }))
 }
 
 fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<DatasetLoad> {
@@ -548,4 +637,99 @@ fn decode_board(packed: u64, mask: u16) -> [u8; 16] {
         out[i] = val;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_disagreement_calculation() {
+        // Mock a step with teacher_move = 0, argmax_head = 1 -> disagreement
+        let step1 = StepRecord {
+            step_index: 0,
+            board: [0; 16],
+            branch_evs: [None; 4],
+            legal_mask: 0,
+            teacher_move: 0,
+            annotation: Some(AnnotationRow {
+                run_id: 1,
+                step_index: 0,
+                teacher_move: 0,
+                legal_mask: 0,
+                policy_kind_mask: 0,
+                argmax_head: 1,
+                argmax_prob: 0.5,
+                policy_p1: [0.0; 4],
+                policy_logp: [0.0; 4],
+                policy_hard: [0.0; 4],
+            }),
+        };
+
+        // Mock a step with teacher_move = 1, argmax_head = 1 -> no disagreement
+        let step2 = StepRecord {
+            step_index: 1,
+            board: [0; 16],
+            branch_evs: [None; 4],
+            legal_mask: 0,
+            teacher_move: 1,
+            annotation: Some(AnnotationRow {
+                run_id: 1,
+                step_index: 1,
+                teacher_move: 1,
+                legal_mask: 0,
+                policy_kind_mask: 0,
+                argmax_head: 1,
+                argmax_prob: 0.5,
+                policy_p1: [0.0; 4],
+                policy_logp: [0.0; 4],
+                policy_hard: [0.0; 4],
+            }),
+        };
+
+        // Mock a step with teacher_move = 255 -> no disagreement
+        let step3 = StepRecord {
+            step_index: 2,
+            board: [0; 16],
+            branch_evs: [None; 4],
+            legal_mask: 0,
+            teacher_move: 255,
+            annotation: Some(AnnotationRow {
+                run_id: 1,
+                step_index: 2,
+                teacher_move: 255,
+                legal_mask: 0,
+                policy_kind_mask: 0,
+                argmax_head: 0,
+                argmax_prob: 0.5,
+                policy_p1: [0.0; 4],
+                policy_logp: [0.0; 4],
+                policy_hard: [0.0; 4],
+            }),
+        };
+
+        // Mock a step with no annotation -> no disagreement
+        let step4 = StepRecord {
+            step_index: 3,
+            board: [0; 16],
+            branch_evs: [None; 4],
+            legal_mask: 0,
+            teacher_move: 0,
+            annotation: None,
+        };
+
+        let steps = vec![step1, step2, step3, step4];
+        let disagreement_count = steps.iter().filter(|s| {
+            if let Some(ann) = s.annotation {
+                s.teacher_move != 255 && s.teacher_move != ann.argmax_head
+            } else {
+                false
+            }
+        }).count();
+
+        assert_eq!(disagreement_count, 1);
+        let total_steps = steps.len();
+        let percentage = disagreement_count as f32 / total_steps as f32;
+        assert_eq!(percentage, 0.25);
+    }
 }
