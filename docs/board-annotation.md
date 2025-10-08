@@ -92,12 +92,17 @@ Run the Axum server against a base dataset plus its annotation directory:
 cargo run -p annotation-server --release -- \
   --dataset datasets/macroxue/d6_10g_v1 \
   --annotations annotations/d6_10g_v1/model=v1_50m \
+  --tokenizer tokenizer.json \
   --host 127.0.0.1 \
   --port 8080
 ```
+
+The `--tokenizer` flag is optional and enables tokenization features for the UI.
+
+- `GET /health` returns server status including tokenizer information if loaded.
 - `GET /runs?page=1&page_size=25&min_score=500_000` returns paginated run summaries with optional filters on score, highest tile, and step counts.
 - Each run summary now carries a `policy_kind_mask`, and both list/detail responses export a `policy_kind_legend` object so clients can decode bit assignments without hard-coding constants.
-- `GET /runs/{run_id}?offset=0&limit=200` streams step slices including packed boards, teacher metadata, Macroxue branch EVs, and the annotated policy payload (mask + `policy_p1`, `policy_logp`, `policy_hard`). The response shape leaves room for future value heads.
+- `GET /runs/{run_id}?offset=0&limit=200&tokenize=true` streams step slices including packed boards, teacher metadata, Macroxue branch EVs, and the annotated policy payload. When `tokenize=true` is specified and a tokenizer is loaded, each step includes a `tokens` array with the tokenized branch values. The response shape leaves room for future value heads.
 
 ## Proposed Annotation Viewer
 

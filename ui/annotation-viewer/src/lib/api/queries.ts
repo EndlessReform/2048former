@@ -2,11 +2,13 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchJson } from './client'
 import {
   disagreementsResponseSchema,
+  healthResponseSchema,
   runDetailResponseSchema,
   runsResponseSchema,
 } from './schemas'
 import type {
   DisagreementsResponse,
+  HealthResponse,
   RunDetailResponse,
   RunsResponse,
 } from './schemas'
@@ -92,15 +94,17 @@ export const useRunsQuery = (
 export type RunDetailQueryParams = {
   offset?: number
   limit?: number
+  tokenize?: boolean
 }
 
 export const buildRunDetailSearchParams = (
   params: RunDetailQueryParams,
 ): URLSearchParams => {
   const search = new URLSearchParams()
-  const { offset, limit } = params
+  const { offset, limit, tokenize } = params
   if (offset !== undefined) search.set('offset', String(offset))
   if (limit !== undefined) search.set('limit', String(limit))
+  if (tokenize !== undefined) search.set('tokenize', String(tokenize))
   return search
 }
 
@@ -221,5 +225,27 @@ export const useDisagreementsQuery = (
     enabled: isEnabled,
     staleTime: 30_000,
     ...rest,
+  })
+}
+
+const fetchHealth = async (): Promise<HealthResponse> => {
+  return fetchJson<HealthResponse>({
+    path: '/health',
+    schema: healthResponseSchema,
+  })
+}
+
+type HealthQueryOptions = Omit<
+  UseQueryOptions<HealthResponse, ApiError, HealthResponse, [string]>,
+  'queryKey' | 'queryFn'
+>
+
+export const useHealthQuery = (options?: HealthQueryOptions) => {
+  return useQuery({
+    queryKey: ['health'],
+    queryFn: fetchHealth,
+    staleTime: 60_000,
+    retry: 1,
+    ...options,
   })
 }

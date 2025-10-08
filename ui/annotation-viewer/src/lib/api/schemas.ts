@@ -54,6 +54,7 @@ export const stepResponseSchema = z.object({
   is_disagreement: z.boolean(),
   valuation_type: z.string(),
   annotation: annotationPayloadSchema.optional(),
+  tokens: z.array(z.number().int()).optional(),
 })
 
 export type StepResponse = z.infer<typeof stepResponseSchema>
@@ -81,3 +82,19 @@ export const disagreementsResponseSchema = z.object({
 })
 
 export type DisagreementsResponse = z.infer<typeof disagreementsResponseSchema>
+
+export const healthTokenizerInfoSchema = z.object({
+  tokenizer_type: z.string(),
+  num_bins: z.number().int().nonnegative(),
+  vocab_order: z.array(z.string()),
+  valuation_types: z.array(z.string()),
+})
+
+export type HealthTokenizerInfo = z.infer<typeof healthTokenizerInfoSchema>
+
+export const healthResponseSchema = z.object({
+  status: z.string(),
+  tokenizer: healthTokenizerInfoSchema.nullable().optional(),
+})
+
+export type HealthResponse = z.infer<typeof healthResponseSchema>

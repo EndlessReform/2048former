@@ -1,4 +1,5 @@
 export type TeacherEvMode = 'relative' | 'raw'
+export type TokenCategory = 'illegal' | 'failure' | 'winner' | 'bin'
 
 export interface InsightRow {
   label: string
@@ -18,4 +19,10 @@ export interface InsightRow {
   isStudent: boolean
   hasP1: boolean
   hasLogp: boolean
+  tokenId: number | null
+  tokenLabel: string | null
+  tokenCategory: TokenCategory | null
+  tokenBinDisplay: string | null
+  advantageId: number | null
+  advantageIdDisplay: string | null
 }

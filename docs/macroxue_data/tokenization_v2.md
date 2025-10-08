@@ -45,8 +45,8 @@ Across all node types the vocabulary order is fixed and must be respected by any
 - [x] Implement Rust-side tokenization in shared libraries, so annotation-server or other rails can use it. make sure Rust-side implementation can load tokenizer.json and (reasonably efficiently) bin EVs for a step, or parallelize this with rayon
 - [ ] Visualization and sanity checks
     - [ ] Wire tokenization (optionally) to crates/annotation-server and ui/annotation-viewer, to allow humans to sanity-check strategy before release. UI should be able to request tokenization binning (for preview) with macroxue test set (to support future use cases), and view
-        - [ ] Update to API contract
-        - [ ] annotation server can (optionally) load tokenizer; if this isn't done the UI will just not be able to request tokenization (figure out negotiation, don't overthink it though) 
+        - [x] Update to API contract
+        - [x] annotation server can (optionally) load tokenizer; if this isn't done the UI will just not be able to request tokenization (figure out negotiation, don't overthink it though). SEE docs/board-annotation.md for updates to UX
         - [ ] BACKWARDS COMPAT: dropdown in UI. Please implement this as separate component with app state keeping track using zustand of whether we want to see this
         - [ ] Idiomatic UX for: WINNER, ILLEGAL bin, advantage ID vs bin vs actual
     - [ ] TODO once we have a checkpoint: visualize model predicted bin vs actual bin

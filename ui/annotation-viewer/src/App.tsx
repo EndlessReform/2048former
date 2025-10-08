@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState, type ChangeEvent, type CSSProperties } from 'react'
 import { useDisagreementsQuery, useRunDetailQuery, useRunsQuery } from './lib/api/queries'
 import type { StepResponse } from './lib/api/schemas'
-import type { InsightRow } from './lib/insightRow'
+import type { InsightRow, TokenCategory } from './lib/insightRow'
 import { RunsSidebar } from './components/RunsSidebar'
 import { MoveInsights } from './components/MoveInsights'
+import { TokenizationControls } from './components/TokenizationControls'
+import { useViewerPreferences } from './hooks/useViewerPreferences'
 import './App.css'
 
 const MOVE_LABELS = ['Up', 'Down', 'Left', 'Right']
@@ -106,8 +108,27 @@ const formatAdvantageDisplay = (value: number | null, mode: 'relative' | 'raw'):
   return `${sign}${rounded.toFixed(4)}`
 }
 
-const branchRows = (step: StepResponse | undefined): InsightRow[] => {
+const formatAdvantageIdDisplay = (value: number | null, mode: 'relative' | 'raw'): string => {
+  if (value === null || Number.isNaN(value)) return '—'
+  if (mode === 'relative') {
+    if (value === 0) return '+0'
+    return `${value > 0 ? '+' : ''}${value}`
+  }
+  const scaled = value / 1000
+  if (Math.abs(scaled) < 0.0005) {
+    return '+0.000'
+  }
+  const magnitude = Math.abs(scaled)
+  const sign = scaled >= 0 ? '+' : '-'
+  return `${sign}${magnitude.toFixed(3)}`
+}
+
+const branchRows = (
+  step: StepResponse | undefined,
+  options: { vocabOrder?: string[] | null } = {},
+): InsightRow[] => {
   if (!step) return []
+  const { vocabOrder = null } = options
 
   const valuationMode: 'relative' | 'raw' =
     step.valuation_type.toLowerCase() === 'search' ? 'relative' : 'raw'
@@ -134,6 +155,8 @@ const branchRows = (step: StepResponse | undefined): InsightRow[] => {
     ? normalize(student.policy_p1.map((value) => value))
     : [null, null, null, null]
   const annotationMask = student?.policy_kind_mask ?? 0
+  const tokens = step.tokens ?? null
+  const vocabLength = vocabOrder ? vocabOrder.length : 0
 
   return MOVE_LABELS.map((label, idx) => {
     const legal = (step.legal_mask & (1 << idx)) !== 0
@@ -141,6 +164,49 @@ const branchRows = (step: StepResponse | undefined): InsightRow[] => {
     const advantage = advantageValues[idx]
     const probability = studentProb ? studentProb[idx] : null
     const probExp = studentLogp ? Math.exp(studentLogp[idx]) : null
+    const rawToken = tokens && idx < tokens.length ? tokens[idx] : null
+
+    let tokenId: number | null = rawToken ?? null
+    let tokenCategory: TokenCategory | null = null
+    let tokenLabel: string | null = null
+    let tokenBinDisplay: string | null = null
+
+    if (tokenId !== null && Number.isFinite(tokenId)) {
+      if (tokenId === 0) {
+        tokenCategory = 'illegal'
+        tokenLabel = 'Illegal'
+      } else if (tokenId === 1) {
+        tokenCategory = 'failure'
+        tokenLabel = 'Failure'
+      } else if (vocabLength > 0 && tokenId === vocabLength - 1) {
+        tokenCategory = 'winner'
+        tokenLabel = 'Winner'
+      } else if (tokenId >= 0) {
+        tokenCategory = 'bin'
+        const binIndex = tokenId - 2
+        if (binIndex >= 0) {
+          tokenLabel = `Bin ${String(binIndex + 1).padStart(2, '0')}`
+        } else {
+          tokenLabel = `Bin ${tokenId}`
+        }
+      }
+
+      const vocabLabel =
+        vocabOrder && tokenId >= 0 && tokenId < vocabOrder.length
+          ? vocabOrder[tokenId]
+          : null
+      if (vocabLabel) {
+        const normalized = vocabLabel.replace(/_/g, ' ')
+        tokenBinDisplay = normalized
+      } else if (tokenCategory === 'bin' && tokenId !== null) {
+        tokenBinDisplay = `Class ${tokenId}`
+      }
+    }
+
+    const advantageId = step.advantage_branch[idx] ?? null
+    const advantageIdDisplay =
+      advantageId !== null ? formatAdvantageIdDisplay(advantageId, valuationMode) : null
+
     return {
       label,
       icon: MOVE_ICONS[idx],
@@ -159,6 +225,12 @@ const branchRows = (step: StepResponse | undefined): InsightRow[] => {
       isStudent: student?.argmax_head === idx,
       hasP1: Boolean(annotationMask & 1),
       hasLogp: Boolean(annotationMask & 2),
+      tokenId,
+      tokenLabel,
+      tokenCategory,
+      tokenBinDisplay,
+      advantageId,
+      advantageIdDisplay,
     }
   })
 }
@@ -167,6 +239,9 @@ function App() {
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
   const [selectedStep, setSelectedStep] = useState(0)
   const [windowOffset, setWindowOffset] = useState(0)
+  const tokenizationMode = useViewerPreferences((state) => state.tokenizationMode)
+  const tokenizerInfo = useViewerPreferences((state) => state.tokenizerInfo)
+  const tokenizationEnabled = tokenizationMode === 'preview' && tokenizerInfo !== null
 
   const runsQuery = useRunsQuery({ pageSize: RUNS_PAGE_SIZE })
 
@@ -183,9 +258,13 @@ function App() {
     setWindowOffset(0)
   }, [selectedRunId])
 
-  const runDetailQuery = useRunDetailQuery(selectedRunId, { offset: windowOffset, limit: WINDOW_SIZE }, {
-    placeholderData: (previous) => previous,
-  })
+  const runDetailQuery = useRunDetailQuery(
+    selectedRunId,
+    { offset: windowOffset, limit: WINDOW_SIZE, tokenize: tokenizationEnabled },
+    {
+      placeholderData: (previous) => previous,
+    },
+  )
 
   const disagreementsQuery = useDisagreementsQuery(selectedRunId)
   const disagreements = disagreementsQuery.data?.disagreements ?? []
@@ -329,13 +408,15 @@ function App() {
     if (!selectedStepData) return []
     return MOVE_ICONS.filter((_, idx) => (selectedStepData.legal_mask & (1 << idx)) !== 0)
   }, [selectedStepData])
-  const rows = useMemo<InsightRow[]>(() => branchRows(selectedStepData), [selectedStepData])
+  const vocabOrder = tokenizerInfo?.vocabOrder ?? null
+  const rows = useMemo<InsightRow[]>(() => branchRows(selectedStepData, { vocabOrder }), [selectedStepData, vocabOrder])
 
   const teacherMove = selectedStepData?.teacher_move ?? null
   const studentMove = selectedStepData?.annotation?.argmax_head ?? null
   const hasTeacherMove = teacherMove !== null && teacherMove !== 255
   const hasStudentMove = studentMove !== null && studentMove !== undefined
   const movesDisagree = hasTeacherMove && hasStudentMove && teacherMove !== studentMove
+  const showTokenization = tokenizationEnabled
 
   const disagreementTargets = useMemo(() => {
     let prev: number | null = null
@@ -479,6 +560,7 @@ function App() {
                   {(runDetailQuery.data.run.disagreement_percentage * 100).toFixed(1)}%
                 </span>
               </div>
+              <TokenizationControls />
              </div>
 
              <section className="disagreement-overview-section">
@@ -655,7 +737,11 @@ function App() {
               <section className="insights-section">
                 <h2 className="section-title">Teacher vs student</h2>
                 <div className="insights-grid">
-                  <MoveInsights rows={rows} formatPercent={formatPercent} />
+                  <MoveInsights
+                    rows={rows}
+                    formatPercent={formatPercent}
+                    showTokenization={showTokenization}
+                  />
                 </div>
               </section>
             </section>

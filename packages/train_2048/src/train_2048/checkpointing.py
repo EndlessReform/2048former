@@ -76,6 +76,7 @@ def create_run_dir(base_dir: str) -> Path:
 
 
 def dump_training_and_model_config(run_dir: Path, training_cfg: object, model: torch.nn.Module) -> None:
+    import shutil
     try:
         with (run_dir / "training-config.json").open("w", encoding="utf-8") as f:
             json.dump(training_cfg.model_dump(), f, indent=2)
@@ -86,6 +87,23 @@ def dump_training_and_model_config(run_dir: Path, training_cfg: object, model: t
         if enc_cfg is not None:
             with (run_dir / "config.json").open("w", encoding="utf-8") as f:
                 json.dump(enc_cfg.model_dump(), f, indent=2)
+    except Exception:
+        pass
+
+    # If using a macroxue tokenizer, copy the spec to the run dir for reproducibility.
+    try:
+        if (
+            hasattr(training_cfg, "target")
+            and getattr(training_cfg.target, "mode", "") == "macroxue_tokens"
+        ):
+            if hasattr(training_cfg, "dataset") and hasattr(
+                training_cfg.dataset, "resolved_tokenizer_path"
+            ):
+                tokenizer_path_str = training_cfg.dataset.resolved_tokenizer_path()
+                if tokenizer_path_str:
+                    tokenizer_path = Path(tokenizer_path_str)
+                    if tokenizer_path.is_file():
+                        shutil.copy(tokenizer_path, run_dir / "tokenizer.json")
     except Exception:
         pass
 

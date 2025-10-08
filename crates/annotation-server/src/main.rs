@@ -14,6 +14,7 @@ use axum::{
 use clap::Parser;
 use dataset_packer::evaluate;
 use dataset_packer::macroxue::{self, RunSummary};
+use dataset_packer::macroxue::tokenizer::{MacroxueTokenizerV2, Tokenizer};
 use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, annotation_kinds};
 use npyz::NpyFile;
 use rayon::prelude::*;
@@ -33,6 +34,9 @@ struct Args {
     /// Path to the annotation directory containing annotations-*.npy.
     #[arg(long)]
     annotations: PathBuf,
+    /// Optional path to the tokenizer JSON file for tokenization support.
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
     /// Optional path to the UI dist directory to serve static files.
     #[arg(long)]
     ui_path: Option<PathBuf>,
@@ -83,6 +87,8 @@ struct StepResponse {
     valuation_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     annotation: Option<AnnotationPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<Vec<u16>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -132,6 +138,20 @@ struct DisagreementsResponse {
     total: usize,
 }
 
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    tokenizer: Option<HealthTokenizerInfo>,
+}
+
+#[derive(Serialize)]
+struct HealthTokenizerInfo {
+    tokenizer_type: String,
+    num_bins: usize,
+    vocab_order: Vec<String>,
+    valuation_types: Vec<String>,
+}
+
 struct StepRecord {
     step_index: u32,
     board: [u8; 16],
@@ -162,6 +182,7 @@ struct AppState {
     run_index: Arc<HashMap<u32, usize>>,
     policy_kind_legend: Arc<PolicyKindLegend>,
     valuation_names: Arc<Vec<String>>,
+    tokenizer: Arc<Option<MacroxueTokenizerV2>>,
 }
 
 struct DatasetLoad {
@@ -201,6 +222,7 @@ struct RunsQuery {
 struct StepsQuery {
     offset: Option<usize>,
     limit: Option<usize>,
+    tokenize: Option<bool>,
 }
 
 #[tokio::main]
@@ -219,16 +241,26 @@ async fn main() -> Result<()> {
         .enumerate()
         .map(|(idx, entry)| (entry.summary.run_id, idx))
         .collect::<HashMap<_, _>>();
+
+    let tokenizer = if let Some(tokenizer_path) = &args.tokenizer {
+        info!("loading tokenizer" = %tokenizer_path.display());
+        Some(MacroxueTokenizerV2::from_path(tokenizer_path).with_context(|| format!("failed to load tokenizer from {}", tokenizer_path.display()))?)
+    } else {
+        None
+    };
+
     let state = AppState {
         runs: Arc::new(dataset.runs),
         run_index: Arc::new(run_index),
         policy_kind_legend: Arc::new(dataset.policy_kind_legend),
         valuation_names: Arc::new(dataset.valuation_names),
+        tokenizer: Arc::new(tokenizer),
     };
 
     use tower_http::cors::CorsLayer;
 
     let router = Router::new()
+        .route("/health", get(get_health))
         .route("/runs", get(list_runs))
         .route("/runs/:run_id", get(get_run))
         .route("/runs/:run_id/disagreements", get(get_disagreements))
@@ -380,7 +412,7 @@ async fn get_run(
         .min(total.saturating_sub(offset));
     let slice = &entry.steps[offset..offset + limit];
 
-    let steps = slice
+    let mut steps: Vec<StepResponse> = slice
         .iter()
         .map(|step| StepResponse {
             step_index: step.step_index,
@@ -398,8 +430,41 @@ async fn get_run(
                 .cloned()
                 .unwrap_or_else(|| "search".to_string()),
             annotation: step.annotation.clone(),
+            tokens: None,
         })
         .collect();
+
+    // Tokenize if requested and tokenizer is available
+    if query.tokenize.unwrap_or(false) {
+        if let Some(tokenizer) = state.tokenizer.as_ref().as_ref() {
+            for (step_resp, step_record) in steps.iter_mut().zip(slice.iter()) {
+                let valuation_type = &step_resp.valuation_type;
+                let branch_evs: [f32; 4] = step_record.branch_evs.map(|opt| opt.unwrap_or(0.0));
+                let board_eval = if valuation_type == "search" {
+                    Some((step_record.board_value * 1000.0).round() as i32)
+                } else {
+                    None
+                };
+
+                match tokenizer.encode_row(
+                    valuation_type,
+                    &branch_evs,
+                    step_record.teacher_move,
+                    step_record.legal_mask,
+                    board_eval,
+                ) {
+                    Ok(tokens) => {
+                        step_resp.tokens = Some(tokens.to_vec());
+                    }
+                    Err(err) => {
+                        warn!("failed to tokenize step {}: {}", step_record.step_index, err);
+                    }
+                }
+            }
+        } else {
+            warn!("tokenization requested but no tokenizer loaded");
+        }
+    }
 
     let disagreement_count = entry.disagreement_count;
     let disagreement_percentage = entry.disagreement_percentage;
@@ -447,6 +512,20 @@ async fn get_disagreements(
         disagreements: slice.to_vec(),
         total,
     }))
+}
+
+async fn get_health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let tokenizer_info = state.tokenizer.as_ref().as_ref().map(|tokenizer| HealthTokenizerInfo {
+        tokenizer_type: tokenizer.tokenizer_type().to_string(),
+        num_bins: tokenizer.num_bins(),
+        vocab_order: tokenizer.vocab_order().to_vec(),
+        valuation_types: tokenizer.valuation_types().to_vec(),
+    });
+
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        tokenizer: tokenizer_info,
+    })
 }
 
 fn load_dataset(dataset_dir: &Path, annotations_dir: &Path) -> Result<DatasetLoad> {
@@ -726,14 +805,15 @@ mod tests {
         let step1 = StepRecord {
             step_index: 0,
             board: [0; 16],
+            board_value: 0.0,
             branch_evs: [None; 4],
+            relative_branch_evs: [None; 4],
+            advantage_branch: [None; 4],
             legal_mask: 0,
             teacher_move: 0,
-            annotation: Some(AnnotationRow {
-                run_id: 1,
-                step_index: 0,
-                teacher_move: 0,
-                legal_mask: 0,
+            is_disagreement: false,
+            valuation_type: 0,
+            annotation: Some(AnnotationPayload {
                 policy_kind_mask: 0,
                 argmax_head: 1,
                 argmax_prob: 0.5,
@@ -741,20 +821,22 @@ mod tests {
                 policy_logp: [0.0; 4],
                 policy_hard: [0.0; 4],
             }),
+            annotation_mask: 0,
         };
 
         // Mock a step with teacher_move = 1, argmax_head = 1 -> no disagreement
         let step2 = StepRecord {
             step_index: 1,
             board: [0; 16],
+            board_value: 0.0,
             branch_evs: [None; 4],
+            relative_branch_evs: [None; 4],
+            advantage_branch: [None; 4],
             legal_mask: 0,
             teacher_move: 1,
-            annotation: Some(AnnotationRow {
-                run_id: 1,
-                step_index: 1,
-                teacher_move: 1,
-                legal_mask: 0,
+            is_disagreement: false,
+            valuation_type: 0,
+            annotation: Some(AnnotationPayload {
                 policy_kind_mask: 0,
                 argmax_head: 1,
                 argmax_prob: 0.5,
@@ -762,20 +844,22 @@ mod tests {
                 policy_logp: [0.0; 4],
                 policy_hard: [0.0; 4],
             }),
+            annotation_mask: 0,
         };
 
         // Mock a step with teacher_move = 255 -> no disagreement
         let step3 = StepRecord {
             step_index: 2,
             board: [0; 16],
+            board_value: 0.0,
             branch_evs: [None; 4],
+            relative_branch_evs: [None; 4],
+            advantage_branch: [None; 4],
             legal_mask: 0,
             teacher_move: 255,
-            annotation: Some(AnnotationRow {
-                run_id: 1,
-                step_index: 2,
-                teacher_move: 255,
-                legal_mask: 0,
+            is_disagreement: false,
+            valuation_type: 0,
+            annotation: Some(AnnotationPayload {
                 policy_kind_mask: 0,
                 argmax_head: 0,
                 argmax_prob: 0.5,
@@ -783,23 +867,30 @@ mod tests {
                 policy_logp: [0.0; 4],
                 policy_hard: [0.0; 4],
             }),
+            annotation_mask: 0,
         };
 
         // Mock a step with no annotation -> no disagreement
         let step4 = StepRecord {
             step_index: 3,
             board: [0; 16],
+            board_value: 0.0,
             branch_evs: [None; 4],
+            relative_branch_evs: [None; 4],
+            advantage_branch: [None; 4],
             legal_mask: 0,
             teacher_move: 0,
+            is_disagreement: false,
+            valuation_type: 0,
             annotation: None,
+            annotation_mask: 0,
         };
 
         let steps = vec![step1, step2, step3, step4];
         let disagreement_count = steps
             .iter()
             .filter(|s| {
-                if let Some(ann) = s.annotation {
+                if let Some(ann) = &s.annotation {
                     s.teacher_move != 255 && s.teacher_move != ann.argmax_head
                 } else {
                     false

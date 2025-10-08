@@ -164,6 +164,49 @@
   color: #3f382f;
 }
 
+.tokenization-control {
+  align-items: center;
+  gap: 0.7rem;
+}
+
+.tokenization-select {
+  min-width: 10.5rem;
+  padding: 0.38rem 0.65rem;
+  border-radius: 0.65rem;
+  border: 1px solid rgba(95, 87, 78, 0.25);
+  background: rgba(255, 253, 249, 0.92);
+  color: #3f382f;
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.tokenization-select:focus {
+  outline: none;
+  border-color: rgba(233, 147, 74, 0.55);
+  box-shadow: 0 0 0 2px rgba(233, 147, 74, 0.2);
+}
+
+.tokenization-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.tokenization-meta {
+  font-size: 0.8rem;
+  color: rgba(63, 56, 47, 0.55);
+}
+
+.tokenization-meta-active {
+  color: rgba(200, 90, 45, 0.92);
+  font-weight: 600;
+}
+
+.tokenization-meta-warning {
+  color: #8f2f20;
+  font-weight: 600;
+}
+
 .status-mono {
   font-family: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   font-size: 0.9rem;
