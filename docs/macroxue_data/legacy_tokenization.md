@@ -1,5 +1,9 @@
 Title: Winner+Margins Tokenization for Cross-Type 2048 Action Values
 
+> [!IMPORTANT]
+> This tokenization scheme is deprecated due to truly awful downstream performance. Please do not use this!
+> this is only for reference for understanding soon-to-be-removed code.
+
 Motivation
 - Convey teacher action-value structure to a transformer while hiding the valuation backend (`search/tuple10/tuple11`).
 - Encode both the chosen move and how wrong each alternative is, despite wildly different EV scales between early/late game and heuristics.

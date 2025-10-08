@@ -105,6 +105,7 @@ STEP_ROW_DTYPE = np.dtype(
         ("run_id", np.uint32),           # sequential game id
         ("step_index", np.uint32),       # index within the run
         ("board", np.uint64),            # 16 packed 4-bit tiles (MSB nibble = cell 0)
+        ("board_eval", np.int32),        # macroxue heuristic score for the current board
         ("tile_65536_mask", np.uint16),  # bit i set when tile exponent >= 16 (>= 2**16)
         ("move_dir", np.uint8),          # UDLR: 0=up, 1=down, 2=left, 3=right
         ("valuation_type", np.uint8),    # enum (see valuation_types.json)
@@ -119,6 +120,8 @@ STEP_ROW_DTYPE = np.dtype(
 assert STEP_ROW_DTYPE.itemsize == 48
 
 Dataset pack shards preserve this layout. `crates/dataset-packer` walks `.meta.json` files lexicographically, assigns sequential `run_id`s (matching `runs.id`), and appends each run's rows in the order they appear in the source JSONL. Readers should rely on `run_id` + `step_index` when reconstructing trajectories rather than assuming global contiguity beyond per-run grouping.
+
+`board_eval` is re-computed during packing using the Rust port of the original Macroxue heuristic (see `crates/dataset-packer/src/macroxue/board_eval.rs`). Values match `packages/train_2048/tokenization/macroxue/board_eval.py` and remain within 32-bit signed range. Downstream tokenization code can use this field directly when constructing advantage bins without re-running the heuristic in Python.
 ```
 
 ### Runs metadata

@@ -30,6 +30,7 @@ pub struct MacroxueStepRow {
     pub run_id: u32,
     pub step_index: u32,
     pub board: u64,
+    pub board_eval: i32,
     pub tile_65536_mask: u16,
     pub move_dir: u8,
     pub valuation_type: u8,
@@ -46,6 +47,7 @@ impl StructuredRow for MacroxueStepRow {
         let u4: TypeStr = "<u4".parse().unwrap();
         let u8: TypeStr = "<u8".parse().unwrap();
         let f4: TypeStr = "<f4".parse().unwrap();
+        let i4: TypeStr = "<i4".parse().unwrap();
         DType::Record(vec![
             Field {
                 name: "run_id".into(),
@@ -58,6 +60,10 @@ impl StructuredRow for MacroxueStepRow {
             Field {
                 name: "board".into(),
                 dtype: DType::Plain(u8),
+            },
+            Field {
+                name: "board_eval".into(),
+                dtype: DType::Plain(i4),
             },
             Field {
                 name: "tile_65536_mask".into(),

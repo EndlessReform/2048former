@@ -1,3 +1,5 @@
+pub mod board_eval;
+
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -408,6 +410,10 @@ fn parse_steps_file(
         let encoded = encoder.encode(record.valuation_type.as_deref().unwrap_or("search"))?;
 
         let (board, mask) = pack_board(&record.board);
+        let board_eval = board_eval::evaluate(&record.board, false)
+            .with_context(|| format!("failed to evaluate board in {}", path.display()))?;
+        let board_eval = i32::try_from(board_eval)
+            .with_context(|| format!("board evaluation overflow in {}", path.display()))?;
         let mut branch_evs = [0f32; 4];
         let mut legal_bits = 0u8;
         for (name, value) in record.branch_evs.iter() {
@@ -431,6 +437,7 @@ fn parse_steps_file(
             run_id,
             step_index: idx,
             board,
+            board_eval,
             tile_65536_mask: mask,
             move_dir: record.move_dir.code(),
             valuation_type: encoded,
@@ -595,6 +602,7 @@ pub fn load_valuation_names(dir: &Path) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::board_eval;
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -667,6 +675,8 @@ mod tests {
         let (exp_board, exp_mask) = pack_board_msb_ref(&cell_arr);
         assert_eq!(row.board, exp_board);
         assert_eq!(row.tile_65536_mask, exp_mask);
+        let expected_eval = board_eval::evaluate(&cell_arr, false).unwrap();
+        assert_eq!(row.board_eval, i32::try_from(expected_eval).unwrap());
 
         // Verify move_dir UDLR encoding (Right = 3)
         assert_eq!(row.move_dir, 3u8);

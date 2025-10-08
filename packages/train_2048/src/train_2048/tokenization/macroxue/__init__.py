@@ -1,13 +1,15 @@
-"""Tokenization utilities for Macroxue 2048 datasets."""
+"""Macroxue tokenization helpers."""
 
-from .macroxue import (
+from .tokenizer_v1 import (
     ACTIONS,
     MacroxueTokenizer,
     MacroxueTokenizerSpec,
-    MacroxueTokenizerV2,
-    MacroxueTokenizerV2Spec,
     TokenizedState,
     fit_macroxue_tokenizer,
+)
+from .tokenizer_v2 import (
+    MacroxueTokenizerV2,
+    MacroxueTokenizerV2Spec,
     fit_macroxue_tokenizer_v2,
 )
 
