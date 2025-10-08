@@ -1,4 +1,5 @@
 pub mod board_eval;
+pub mod tokenizer;
 
 use std::collections::HashMap;
 use std::fs::{self, File};

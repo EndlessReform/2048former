@@ -42,10 +42,16 @@ Across all node types the vocabulary order is fixed and must be respected by any
 - [x] Port branch evaluation logic from python to Rust (if not already done)
 - [x] add board valuation in dataset (if not already implemented)
 - [x] Implement tokenization strategy in packages/train_2048
-- [ ] Verify existing inference rails can use this successfully
+- [x] Implement Rust-side tokenization in shared libraries, so annotation-server or other rails can use it. make sure Rust-side implementation can load tokenizer.json and (reasonably efficiently) bin EVs for a step, or parallelize this with rayon
 - [ ] Visualization and sanity checks
-    - [ ] Wire tokenization (optionally) to crates/annotation-server and ui/annotation-viewer, to allow humans to sanity-check strategy before release
-    - [ ] Get predictions using this strategy during annotation; visualize predicted bin vs actual
+    - [ ] Wire tokenization (optionally) to crates/annotation-server and ui/annotation-viewer, to allow humans to sanity-check strategy before release. UI should be able to request tokenization binning (for preview) with macroxue test set (to support future use cases), and view
+        - [ ] Update to API contract
+        - [ ] annotation server can (optionally) load tokenizer; if this isn't done the UI will just not be able to request tokenization (figure out negotiation, don't overthink it though) 
+        - [ ] BACKWARDS COMPAT: dropdown in UI. Please implement this as separate component with app state keeping track using zustand of whether we want to see this
+        - [ ] Idiomatic UX for: WINNER, ILLEGAL bin, advantage ID vs bin vs actual
+    - [ ] TODO once we have a checkpoint: visualize model predicted bin vs actual bin
+- [x] Ensure training `collate.py` can use new tokenization scheme
+- [x] Verify existing inference rails can use this successfully
 
 ### Tokenizer artifact format
 
