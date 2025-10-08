@@ -62,6 +62,14 @@ class DatasetConfig(BaseModel):
     # - If True, use buffered shuffle to avoid materializing a full permutation
     shuffle: bool = False
     shuffle_buffer_size: int = 1_000_000
+    # Optional shard-aware locality controls
+    shard_locality: bool = False
+    # When >0, sample at most this many rows from a shard before advancing.
+    shard_locality_block_size: Optional[int] = None
+    # When true, keep the active shard as an in-memory copy to reduce OS page faults.
+    shard_cache_in_memory: bool = False
+    # Number of fully materialised shards to retain simultaneously (>=1).
+    shard_cache_keep_shards: int = 1
     # Validation limits
     # Cap validation to a fixed number of steps (batches). When >0, overrides val_steps_pct.
     val_num_steps: Optional[int] = None
@@ -102,6 +110,20 @@ class DatasetConfig(BaseModel):
         if v < 0.0 or v > 1.0:
             if v != 0.0:
                 raise ValueError("dataset.val_steps_pct must be in [0,1] (0 disables)")
+        return v
+
+    @field_validator("shard_locality_block_size")
+    @classmethod
+    def _block_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("dataset.shard_locality_block_size must be > 0 when provided")
+        return v
+
+    @field_validator("shard_cache_keep_shards")
+    @classmethod
+    def _keep_shards_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("dataset.shard_cache_keep_shards must be >= 1")
         return v
 
     def resolved_dataset_dir(self) -> str:

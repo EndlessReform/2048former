@@ -2,6 +2,14 @@
 
 This package contains tools for training a 2048 AI model.
 
+## Data Loading
+
+Large datasets (100GB+) can cause OS page thrashing when randomising across shards. The training config exposes a shard-aware path that keeps one shard resident in RAM at a time:
+
+- Set `dataset.shard_locality = true` to traverse shards sequentially while still sampling randomly within each shard.
+- Optionally cap per-shard draws via `dataset.shard_locality_block_size` (default is the full shard).
+- Enable `dataset.shard_cache_in_memory = true` (with `dataset.shard_cache_keep_shards`) to materialise the active shard into RAM while keeping only a small number cached.
+
 ## Tokenization
 
 The `train_2048.tokenization.macroxue` module provides a tokenizer for "Macroxue" game states. This tokenizer converts game states with expectimax-derived action values into a sequence of tokens that can be used to train a transformer model.

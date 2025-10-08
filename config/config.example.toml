@@ -78,6 +78,12 @@ val_split_seed = 42
 # Validate every N training steps (0 disables)
 val_every = 1000
 
+# Shard locality controls (optional). Enable to keep one shard in RAM and shuffle locally.
+# shard_locality = true
+# shard_locality_block_size = 500000    # Draw at most this many rows per shard before rotating
+# shard_cache_in_memory = true          # Materialise the active shard into RAM
+# shard_cache_keep_shards = 1           # Number of cached shards to retain simultaneously
+
 [checkpoint]
 # every_epochs = 1
 # save_best_every_steps = 1000

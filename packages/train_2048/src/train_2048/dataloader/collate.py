@@ -65,6 +65,9 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
         def _unpack_board_to_exps_u8(packed, *, mask65536=None):
             return BoardCodec.decode_packed_board_to_exps_u8(packed, mask65536=mask65536)
 
+        # Track if we've warned about missing board_eval
+        _warned_missing_board_eval = [False]
+
         def _collate_v2(batch_indices):
             import numpy as _np
 
@@ -85,9 +88,26 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
             valuation_types_ds = batch["valuation_type"].astype(_np.int64, copy=False)
             ev_legal = batch["ev_legal"]
             move_dirs = batch["move_dir"]
-            board_evals = (
-                batch["board_eval"] if "board_eval" in batch.dtype.names else None
-            )
+
+            # Check for board_eval field
+            has_board_eval = "board_eval" in batch.dtype.names
+            if has_board_eval:
+                board_evals = batch["board_eval"]
+            else:
+                # Compute board_eval on the fly
+                if not _warned_missing_board_eval[0]:
+                    import warnings
+                    warnings.warn(
+                        "Dataset missing 'board_eval' field - computing on-the-fly (this may impact performance). "
+                        "Consider re-packing dataset with latest Rust tooling.",
+                        UserWarning,
+                        stacklevel=2
+                    )
+                    _warned_missing_board_eval[0] = True
+
+                # Import board eval function
+                from ..tokenization.macroxue.board_eval import evaluate_board_batch
+                board_evals = evaluate_board_batch(exps)
 
             legal_mask = BoardCodec.legal_mask_from_bits_udlr(ev_legal)
 
@@ -107,7 +127,7 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
                     branch_evs=branch_evs[i],
                     move_dir=move_dirs[i],
                     legal_mask=legal_mask[i],
-                    board_eval=board_evals[i] if board_evals is not None else None,
+                    board_eval=board_evals[i],
                 )
 
             return {
