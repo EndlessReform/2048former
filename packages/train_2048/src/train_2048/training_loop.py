@@ -442,6 +442,7 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                     batch,
                     optimizer,
                     device,
+                    cfg=cfg,
                     zero_grad=zero_grad,
                     optimizer_step=optimizer_step,
                     loss_scale=loss_scale,

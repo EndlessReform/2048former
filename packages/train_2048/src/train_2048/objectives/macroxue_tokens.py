@@ -51,6 +51,7 @@ class MacroxueTokens(Objective):
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         *,
+        cfg: object,
         zero_grad: bool = True,
         optimizer_step: bool = True,
         loss_scale: float = 1.0,
@@ -113,6 +114,8 @@ class MacroxueTokens(Objective):
         scaled_loss = loss * float(loss_scale)
         scaled_loss.backward()
         if optimizer_step:
+            if cfg.hyperparameters.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.hyperparameters.grad_clip_norm)
             optimizer.step()
 
         head_losses = [float(l.detach().item()) for l in per_head_losses]

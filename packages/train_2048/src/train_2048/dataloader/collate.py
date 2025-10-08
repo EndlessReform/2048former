@@ -335,7 +335,206 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
     return _collate
 
 
+def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> Callable:
+    """Worker-safe collate that creates its own shard loader per worker."""
+    # Import here to avoid circular deps
+    from .shard_loader import ShardLoader
+
+    # Each worker will create its own loader (lazy, thread-safe)
+    _worker_loader = [None]  # Mutable container to cache per-worker
+
+    def _get_loader():
+        if _worker_loader[0] is None:
+            _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=True)
+        return _worker_loader[0]
+
+    # Load tokenizer config once
+    import json
+    from pathlib import Path
+    from ..tokenization.macroxue.tokenizer_v2 import (
+        MacroxueTokenizerV2,
+        MacroxueTokenizerV2Spec,
+    )
+    from ..tokenization.macroxue import MacroxueTokenizerSpec as MacroxueTokenizerV1Spec
+
+    p = Path(tokenizer_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Tokenizer spec not found at {p}")
+    with open(p) as f:
+        payload = json.load(f)
+
+    tokenizer_type = payload.get("tokenizer_type")
+
+    # Build the appropriate collate based on tokenizer type
+    if tokenizer_type == "macroxue_ev_advantage_v2":
+        spec = MacroxueTokenizerV2Spec.from_dict(payload)
+        tokenizer = MacroxueTokenizerV2(spec)
+        n_classes = len(spec.vocab_order)
+
+        # Load valuation type mapping
+        try:
+            vt_path = Path(dataset_dir) / "valuation_types.json"
+            if vt_path.is_file():
+                with open(vt_path) as f:
+                    vt_payload = json.load(f)
+                    if isinstance(vt_payload, list):
+                        vt_name_to_ds_id = {name: i for i, name in enumerate(vt_payload)}
+                    elif isinstance(vt_payload, dict):
+                        vt_name_to_ds_id = {v: int(k) for k, v in vt_payload.items()}
+                    else:
+                        raise TypeError("Unsupported valuation_types.json format")
+            else:
+                vt_name_to_ds_id = {"search": 0, "tuple10": 1, "tuple11": 2}
+        except Exception:
+            vt_name_to_ds_id = {"search": 0, "tuple10": 1, "tuple11": 2}
+
+        _warned_missing_board_eval = [False]
+
+        def _collate(batch_indices):
+            import numpy as _np
+
+            loader = _get_loader()
+            idxs = _np.asarray(batch_indices, dtype=_np.int64)
+            batch = loader.get_rows(idxs)
+
+            if "board" not in batch.dtype.names:
+                raise KeyError("Expected 'board' field in steps.npy")
+            mask65536 = batch["tile_65536_mask"] if "tile_65536_mask" in batch.dtype.names else None
+            exps = BoardCodec.decode_packed_board_to_exps_u8(batch["board"], mask65536=mask65536)
+            tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
+
+            branch_evs = batch["branch_evs"]
+            valuation_types_ds = batch["valuation_type"].astype(_np.int64, copy=False)
+            ev_legal = batch["ev_legal"]
+            move_dirs = batch["move_dir"]
+
+            has_board_eval = "board_eval" in batch.dtype.names
+            if has_board_eval:
+                board_evals = batch["board_eval"]
+            else:
+                if not _warned_missing_board_eval[0]:
+                    import warnings
+                    warnings.warn(
+                        "Dataset missing 'board_eval' field - computing on-the-fly",
+                        UserWarning,
+                        stacklevel=2
+                    )
+                    _warned_missing_board_eval[0] = True
+                from ..tokenization.macroxue.board_eval import evaluate_board_batch
+                board_evals = evaluate_board_batch(exps)
+
+            legal_mask = BoardCodec.legal_mask_from_bits_udlr(ev_legal)
+            targets = np.zeros((len(idxs), 4), dtype=np.int64)
+
+            for i in range(len(idxs)):
+                vt_ds_id = valuation_types_ds[i]
+                vt_name = next(
+                    (name for name, ds_id in vt_name_to_ds_id.items() if ds_id == vt_ds_id),
+                    None,
+                )
+                if vt_name is None:
+                    raise KeyError(f"Unrecognized valuation_type ID: {vt_ds_id}")
+
+                targets[i, :] = tokenizer.encode_row(
+                    valuation_type=vt_name,
+                    branch_evs=branch_evs[i],
+                    move_dir=move_dirs[i],
+                    legal_mask=legal_mask[i],
+                    board_eval=board_evals[i],
+                )
+
+            return {
+                "tokens": tokens,
+                "targets": torch.from_numpy(targets.copy()).long(),
+                "n_classes": n_classes,
+            }
+
+        return _collate
+    else:
+        # V1 tokenizer path - similar pattern
+        # For brevity, raising error here - implement if needed
+        raise NotImplementedError("Worker-safe V1 tokenizer not yet implemented - use V2")
+
+
+def make_collate_steps_worker_safe(
+    dataset_dir: str,
+    target_mode: str,
+    binner: Optional[Binner],
+    *,
+    ev_tokenizer: Optional[object] = None
+) -> Callable:
+    """Worker-safe collate for regular steps datasets."""
+    from .shard_loader import ShardLoader
+
+    _worker_loader = [None]
+
+    def _get_loader():
+        if _worker_loader[0] is None:
+            _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=True)
+        return _worker_loader[0]
+
+    if target_mode not in {"binned_ev", "hard_move"}:
+        raise ValueError(f"Unknown target mode: {target_mode}")
+
+    def _collate(batch_indices):
+        import numpy as _np
+
+        loader = _get_loader()
+        idxs = _np.asarray(batch_indices, dtype=_np.int64)
+        batch = loader.get_rows(idxs)
+
+        if 'board' not in batch.dtype.names:
+            raise KeyError("'board' field required")
+        mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
+        exps_np = BoardCodec.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
+        tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
+
+        if 'branch_evs' in batch.dtype.names:
+            evs = batch['branch_evs'].astype(_np.float32, copy=False)
+        elif 'ev_values' in batch.dtype.names:
+            evs = batch['ev_values'].astype(_np.float32, copy=False)
+        else:
+            raise KeyError("'branch_evs' or 'ev_values' missing")
+
+        legal = BoardCodec.legal_mask_from_bits_udlr(batch['ev_legal']) if 'ev_legal' in batch.dtype.names else _np.isfinite(evs)
+        branch_values = torch.from_numpy(evs.copy()).to(dtype=torch.float32)
+        branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))
+
+        out = {
+            "tokens": tokens,
+            "branch_values": branch_values,
+        }
+
+        if target_mode == "binned_ev":
+            if ev_tokenizer is not None:
+                try:
+                    ev_tokenizer.to(branch_values.device)
+                except Exception:
+                    pass
+                targets = ev_tokenizer.build_targets(evs=branch_values, legal_mask=branch_mask)
+                out.update(targets)
+            else:
+                assert binner is not None
+                binner.to_device(branch_values.device)
+                out["branch_bin_targets"] = binner.bin_values(branch_values).long()
+                out["n_bins"] = int(binner.n_bins)
+        else:
+            if 'move_dir' in batch.dtype.names:
+                dirs_arr = batch['move_dir'].astype(_np.int64, copy=False)
+            elif 'move' in batch.dtype.names:
+                dirs_arr = batch['move'].astype(_np.int64, copy=False)
+            else:
+                raise KeyError("move_dir/move missing")
+            out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
+
+        return out
+
+    return _collate
+
+
 __all__ = [
     "make_collate_macroxue",
     "make_collate_steps",
+    "make_collate_macroxue_worker_safe",
+    "make_collate_steps_worker_safe",
 ]

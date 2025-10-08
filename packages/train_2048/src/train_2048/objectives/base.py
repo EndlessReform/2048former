@@ -27,6 +27,7 @@ class Objective(Protocol):
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         *,
+        cfg: object,
         zero_grad: bool = True,
         optimizer_step: bool = True,
         loss_scale: float = 1.0,

@@ -2,9 +2,6 @@ init_dir = "inits/v2/10m_ablations/narrow_n3_5_binned"
 checkpoint_dir = "checkpoints"
 seed = 42
 
-# TODO remove this
-# compile_enabled = false
-
 [wandb]
 enabled = false
 project = "train-2048-macroxue-32bin"

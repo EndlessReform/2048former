@@ -5,7 +5,9 @@ from typing import Optional, Tuple
 from torch.utils.data import DataLoader
 
 from ..config import TrainingConfig
-from .steps import build_steps_dataloaders
+
+# Use new shard-based implementation by default
+from .steps_v2 import build_steps_dataloaders
 
 
 def build_dataloaders(
@@ -50,6 +52,7 @@ def build_dataloaders(
         shard_cache_in_memory=bool(getattr(ds_cfg, "shard_cache_in_memory", False)),
         shard_cache_keep_shards=int(getattr(ds_cfg, "shard_cache_keep_shards", 1) or 1),
         train_num_steps=getattr(ds_cfg, "num_steps", None),
+        num_epochs=getattr(ds_cfg, "num_epochs", None),
         val_num_steps=getattr(ds_cfg, "val_num_steps", None),
         val_steps_pct=float(getattr(ds_cfg, "val_steps_pct", 0.0) or 0.0),
     )

@@ -214,6 +214,8 @@ class OptimizerConfig(BaseModel):
 class HyperParams(BaseModel):
     learning_rate: float = 3e-4
     muon_lr: Optional[float] = None  # only used if optimizer=muon
+    # Clip global gradient norm each step (None to disable)
+    grad_clip_norm: Optional[float] = None
     lr_schedule: LRScheduleConfig = Field(default_factory=LRScheduleConfig)
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
 
