@@ -204,10 +204,15 @@ impl MacroxueTokenizerV2 {
         for i in 0..NUM_BRANCHES {
             if legal[i] && advantages[i] < self.search_failure_cutoff {
                 failure_mask[i] = true;
-                tokens[i] = self.token_failure;
             }
         }
         failure_mask[move_dir] = false;
+
+        for i in 0..NUM_BRANCHES {
+            if failure_mask[i] {
+                tokens[i] = self.token_failure;
+            }
+        }
 
         let winner_adv = advantages[move_dir];
         let mut disadvantages = [0.0f64; NUM_BRANCHES];
@@ -263,8 +268,14 @@ impl MacroxueTokenizerV2 {
 
         let mut failure_mask = [false; NUM_BRANCHES];
         for i in 0..NUM_BRANCHES {
-            if legal[i] && i != move_dir && branch_values[i] <= self.zero_tolerance {
+            if legal[i] && branch_values[i] <= self.zero_tolerance {
                 failure_mask[i] = true;
+            }
+        }
+        failure_mask[move_dir] = false;
+
+        for i in 0..NUM_BRANCHES {
+            if failure_mask[i] {
                 tokens[i] = self.token_failure;
             }
         }
@@ -529,5 +540,31 @@ mod tests {
         let tokenizer = MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
         let err = tokenizer.encode_row("search", &[0.5, 0.4, 0.3, 0.6], 0, 0b1111, None);
         assert!(err.is_err(), "board_eval should be mandatory for search tokenization");
+    }
+
+    #[test]
+    fn search_winner_not_overwritten_by_failure_mask() {
+        let tokenizer = MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
+        // Simulate: advantages = [-93, 0, -31, -74784], winner is branch 1
+        // Branch 3 should be FAILURE (advantage < -1500)
+        // Branches 0, 2 should be binned
+        // Branch 1 should remain WINNER
+        let tokens = tokenizer
+            .encode_row(
+                "search",
+                &[0.407, 0.500, 0.469, -74.284],  // scaled: [407, 500, 469, -74284]
+                1,                                   // winner
+                0b1111,
+                Some(500),                          // board_eval = 500
+            )
+            .expect("search tokenization should succeed");
+
+        let winner_token = TOKEN_OFFSET + tokenizer.num_bins() as u16;
+
+        // Expected: [4, 6, 4, 1] (matching Python implementation)
+        assert_eq!(tokens[0], 4, "Branch 0: disadvantage -93 should map to bin 2 (token 4)");
+        assert_eq!(tokens[1], winner_token, "Branch 1: winner must be WINNER token (6)");
+        assert_eq!(tokens[2], 4, "Branch 2: disadvantage -31 should map to bin 2 (token 4)");
+        assert_eq!(tokens[3], TOKEN_FAILURE, "Branch 3: advantage -74784 should be FAILURE (1)");
     }
 }

@@ -239,6 +239,7 @@ function App() {
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
   const [selectedStep, setSelectedStep] = useState(0)
   const [windowOffset, setWindowOffset] = useState(0)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const tokenizationMode = useViewerPreferences((state) => state.tokenizationMode)
   const tokenizerInfo = useViewerPreferences((state) => state.tokenizerInfo)
   const tokenizationEnabled = tokenizationMode === 'preview' && tokenizerInfo !== null
@@ -510,11 +511,13 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
       <RunsSidebar
         runsQuery={runsQuery}
         selectedRunId={selectedRunId}
         onRunSelect={handleRunSelect}
+        collapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed(c => !c)}
       />
       <main className="main-content">
         {selectedRunId === null ? (

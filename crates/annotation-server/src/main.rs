@@ -441,7 +441,7 @@ async fn get_run(
                 let valuation_type = &step_resp.valuation_type;
                 let branch_evs: [f32; 4] = step_record.branch_evs.map(|opt| opt.unwrap_or(0.0));
                 let board_eval = if valuation_type == "search" {
-                    Some((step_record.board_value * 1000.0).round() as i32)
+                    Some(step_record.board_value as i32)
                 } else {
                     None
                 };

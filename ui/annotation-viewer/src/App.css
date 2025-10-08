@@ -840,37 +840,33 @@
   }
 }
 
-@media (max-width: 1024px) {
-  .app-shell {
-    flex-direction: column;
-    height: auto;
-  }
-
-  .sidebar {
-    width: auto;
-    flex-direction: row;
-    align-items: flex-start;
-    flex-wrap: wrap;
-    gap: 1.25rem;
-    border-right: none;
-    border-bottom: 1px solid rgba(95, 87, 78, 0.12);
-    box-shadow: none;
-    height: auto;
-    overflow: visible;
-  }
-
-  .run-list {
-    flex-direction: row;
-    gap: 0.75rem;
-    width: 100%;
-    max-height: none;
-  }
-
-  .main-content {
-    padding: 1.5rem;
-    height: auto;
-  }
+.sidebar.collapsed {
+  width: 60px;
+  padding: 1.75rem 0;
+  align-items: center;
 }
+
+.sidebar-toggle {
+  background: none;
+  border: none;
+  color: #5b534b;
+  cursor: pointer;
+  padding: 0.5rem;
+  border-radius: 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sidebar-toggle:hover {
+  background: rgba(95, 87, 78, 0.1);
+}
+
+.app-shell.sidebar-collapsed .main-content {
+  margin-left: 60px;
+}
+
+
 
 @media (max-width: 768px) {
   .run-statusline {
