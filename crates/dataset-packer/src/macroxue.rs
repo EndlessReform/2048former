@@ -1,6 +1,9 @@
 pub mod board_eval;
 pub mod tokenizer;
 
+/// Number of tiles in a 2048 board.
+pub const BOARD_LEN: usize = 16;
+
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -88,6 +91,17 @@ struct StepRecord {
     max_rank: Option<u8>,
     #[serde(default)]
     branch_evs: HashMap<String, Option<f32>>,
+}
+
+/// Decode a packed Macroxue board back into exponent form.
+pub fn decode_board(packed: u64, mask: u16) -> [u8; BOARD_LEN] {
+    let mut out = [0u8; BOARD_LEN];
+    for idx in 0..BOARD_LEN {
+        let shift = (BOARD_LEN - 1 - idx) * 4;
+        let nib = ((packed >> shift) & 0xF) as u8;
+        out[idx] = if (mask >> idx) & 1 == 1 { 16 } else { nib };
+    }
+    out
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -689,5 +703,17 @@ mod tests {
         assert!((row.branch_evs[3] - 0.0).abs() < 1e-6);
         // ev_legal bits: Up(1) + Down(2) + Left(4) = 0b0111 = 7
         assert_eq!(row.ev_legal, 0b0111u8);
+    }
+
+    #[test]
+    fn decode_board_roundtrip() {
+        let mut cells = [0u8; BOARD_LEN];
+        for (idx, slot) in cells.iter_mut().enumerate() {
+            *slot = (idx % 15) as u8;
+        }
+        cells[5] = 16;
+        let (packed, mask) = pack_board_msb_ref(&cells);
+        let decoded = decode_board(packed, mask);
+        assert_eq!(decoded, cells);
     }
 }

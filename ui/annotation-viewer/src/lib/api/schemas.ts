@@ -4,6 +4,7 @@ export const policyKindLegendSchema = z.object({
   policy_p1: z.number().int(),
   policy_logprobs: z.number().int(),
   policy_hard: z.number().int(),
+  policy_student_bins: z.number().int(),
 })
 
 export type PolicyKindLegend = z.infer<typeof policyKindLegendSchema>

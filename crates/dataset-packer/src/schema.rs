@@ -138,6 +138,8 @@ impl StructuredRow for SelfplayStepRow {
 pub type StepRow = MacroxueStepRow;
 
 /// Annotation row written by the offline policy annotator.
+pub const MAX_STUDENT_BINS: usize = 64;
+
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, npyz::Serialize, npyz::Deserialize, npyz::AutoSerialize,
@@ -162,6 +164,8 @@ pub mod annotation_kinds {
     pub const POLICY_LOGPROBS: u8 = 1 << 1;
     /// Teacher signal provides a hard target policy distribution.
     pub const POLICY_HARD: u8 = 1 << 2;
+    /// Student policy includes per-bin log probabilities (sidecar shard).
+    pub const POLICY_STUDENT_BINS: u8 = 1 << 3;
 }
 
 impl StructuredRow for AnnotationRow {

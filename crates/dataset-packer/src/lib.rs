@@ -13,8 +13,11 @@ pub mod selfplay;
 pub mod valuation;
 pub mod writer;
 
-pub use crate::macroxue::tokenizer::{MacroxueTokenizerV2, MacroxueTokenizerV2Spec, MacroxueTokenizerV2TypeConfig, TokenArray, Tokenizer};
-pub use crate::macroxue::{tokenizer, PackOptions, pack_dataset};
+pub use crate::macroxue::tokenizer::{
+    MacroxueTokenizerV2, MacroxueTokenizerV2Spec, MacroxueTokenizerV2TypeConfig, TokenArray,
+    Tokenizer,
+};
+pub use crate::macroxue::{PackOptions, pack_dataset, tokenizer};
 pub use crate::merge::{MergeOptions, merge_datasets};
 pub use crate::schema::{MacroxueStepRow, SelfplayStepRow, StepRow};
 pub use crate::selfplay::{collect_selfplay_step_files, load_selfplay_shard, write_selfplay_steps};

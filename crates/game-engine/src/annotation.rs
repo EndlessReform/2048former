@@ -1,17 +1,32 @@
 use crate::{config, pipeline};
 use anyhow::{Context, Result, anyhow, bail};
 use dataset_packer;
-use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, SelfplayStepRow, annotation_kinds};
+use dataset_packer::macroxue;
+use dataset_packer::schema::{
+    AnnotationRow, MAX_STUDENT_BINS, MacroxueStepRow, SelfplayStepRow, annotation_kinds,
+};
 use dataset_packer::writer::StepsWriter;
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::info;
+use npyz::WriterBuilder;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-use crate::feeder::{self, FeederHandle, InferenceOutput};
+use crate::feeder::{self, InferenceOutput};
+
+struct StudentBinsPayload {
+    bin_count: usize,
+    probs: [[f32; MAX_STUDENT_BINS]; 4],
+}
+
+struct AnnotatedOutput {
+    seq: u64,
+    annotation: AnnotationRow,
+    bins: Option<StudentBinsPayload>,
+}
 
 /// Configuration for running the annotation job.
 pub struct JobConfig {
@@ -52,12 +67,15 @@ pub async fn run(job: JobConfig) -> Result<()> {
         job.limit
     );
 
+    let shard_max = job.config.orchestrator.report.shard_max_steps_or_default();
     let mut writer = StepsWriter::<AnnotationRow>::with_prefix(
         &job.output_dir,
         "annotations",
-        Some(job.config.orchestrator.report.shard_max_steps_or_default()),
+        Some(shard_max),
         job.overwrite,
     )?;
+    let mut student_writer =
+        StudentBinsWriter::new(&job.output_dir, Some(shard_max), job.overwrite)?;
 
     let mut run_masks: HashMap<u32, u8> = HashMap::new();
 
@@ -78,9 +96,12 @@ pub async fn run(job: JobConfig) -> Result<()> {
 
     copy_metadata(&job.dataset_dir, &job.output_dir, &kind, job.overwrite)?;
 
-    let mut processed: usize = 0;
-    let mut inflight = FuturesUnordered::new();
     let max_inflight = pipeline::max_inflight_items(&job.config.orchestrator.batch).max(1);
+    let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut buffer: BTreeMap<u64, AnnotatedOutput> = BTreeMap::new();
+    let mut next_seq_to_write: u64 = 0;
+    let mut next_seq: u64 = 0;
+    let mut processed: usize = 0;
 
     for path in step_files {
         match kind {
@@ -90,16 +111,29 @@ pub async fn run(job: JobConfig) -> Result<()> {
                     if job.limit.map_or(false, |lim| processed >= lim) {
                         break;
                     }
+                    let seq = next_seq;
+                    next_seq += 1;
                     processed += 1;
-                    enqueue_sample(
-                        &handle,
-                        &mut inflight,
-                        max_inflight,
-                        StepSample::from_macro(row),
-                        &mut writer,
-                        &mut run_masks,
-                    )
-                    .await?;
+                    let sample = StepSample::from_macro(row, seq);
+                    let rx = handle
+                        .submit(sample.unique_id(), sample.run_id, sample.board)
+                        .await;
+                    inflight.push(tokio::spawn(
+                        async move { consume_result(sample, rx).await },
+                    ));
+                    while inflight.len() >= max_inflight {
+                        if let Some(join) = inflight.next().await {
+                            let output = join??;
+                            buffer.insert(output.seq, output);
+                            flush_ready_outputs(
+                                &mut buffer,
+                                &mut next_seq_to_write,
+                                &mut writer,
+                                &mut student_writer,
+                                &mut run_masks,
+                            )?;
+                        }
+                    }
                 }
             }
             DatasetKind::Selfplay => {
@@ -108,16 +142,29 @@ pub async fn run(job: JobConfig) -> Result<()> {
                     if job.limit.map_or(false, |lim| processed >= lim) {
                         break;
                     }
+                    let seq = next_seq;
+                    next_seq += 1;
                     processed += 1;
-                    enqueue_sample(
-                        &handle,
-                        &mut inflight,
-                        max_inflight,
-                        StepSample::from_selfplay(row),
-                        &mut writer,
-                        &mut run_masks,
-                    )
-                    .await?;
+                    let sample = StepSample::from_selfplay(row, seq);
+                    let rx = handle
+                        .submit(sample.unique_id(), sample.run_id, sample.board)
+                        .await;
+                    inflight.push(tokio::spawn(
+                        async move { consume_result(sample, rx).await },
+                    ));
+                    while inflight.len() >= max_inflight {
+                        if let Some(join) = inflight.next().await {
+                            let output = join??;
+                            buffer.insert(output.seq, output);
+                            flush_ready_outputs(
+                                &mut buffer,
+                                &mut next_seq_to_write,
+                                &mut writer,
+                                &mut student_writer,
+                                &mut run_masks,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -128,14 +175,36 @@ pub async fn run(job: JobConfig) -> Result<()> {
 
     drop(handle);
 
-    while let Some(res) = inflight.next().await {
-        let row = res??;
-        write_result(row, &mut writer, &mut run_masks)?;
+    while let Some(join) = inflight.next().await {
+        let output = join??;
+        buffer.insert(output.seq, output);
+        flush_ready_outputs(
+            &mut buffer,
+            &mut next_seq_to_write,
+            &mut writer,
+            &mut student_writer,
+            &mut run_masks,
+        )?;
     }
 
-    writer.finish()?;
+    flush_ready_outputs(
+        &mut buffer,
+        &mut next_seq_to_write,
+        &mut writer,
+        &mut student_writer,
+        &mut run_masks,
+    )?;
 
-    write_manifest(&job.output_dir, &run_masks, job.overwrite)?;
+    writer.finish()?;
+    student_writer.finish()?;
+    let student_bin_count = student_writer.bin_count().unwrap_or(0);
+
+    write_manifest(
+        &job.output_dir,
+        &run_masks,
+        student_bin_count,
+        job.overwrite,
+    )?;
 
     info!(
         "Annotation finished: wrote {} steps across {} runs into {}",
@@ -151,33 +220,10 @@ pub async fn run(job: JobConfig) -> Result<()> {
     Ok(())
 }
 
-async fn enqueue_sample(
-    handle: &FeederHandle,
-    inflight: &mut FuturesUnordered<tokio::task::JoinHandle<Result<AnnotationRow>>>,
-    max_inflight: usize,
-    sample: StepSample,
-    writer: &mut StepsWriter<AnnotationRow>,
-    run_masks: &mut HashMap<u32, u8>,
-) -> Result<()> {
-    while inflight.len() >= max_inflight {
-        if let Some(join) = inflight.next().await {
-            let row = join??;
-            write_result(row, writer, run_masks)?;
-        }
-    }
-    let id = sample.unique_id();
-    let board = sample.board;
-    let rx = handle.submit(id, sample.run_id as u32, board).await;
-    inflight.push(tokio::spawn(
-        async move { consume_result(sample, rx).await },
-    ));
-    Ok(())
-}
-
 async fn consume_result(
     sample: StepSample,
     rx: tokio::sync::oneshot::Receiver<Result<InferenceOutput, tonic::Status>>,
-) -> Result<AnnotationRow> {
+) -> Result<AnnotatedOutput> {
     let output = rx.await.map_err(|e| {
         anyhow!(
             "inference oneshot canceled for run {} step {} (id {}) : {}",
@@ -194,6 +240,28 @@ async fn consume_result(
             let mut argmax_head = 0u8;
             let mut argmax_p = -1f32;
             let mut has_policy = false;
+            let mut bins_payload = None;
+            let mut bin_count = 0usize;
+            if !heads.is_empty() {
+                bin_count = heads[0].len();
+                if bin_count > MAX_STUDENT_BINS {
+                    return Err(anyhow!(
+                        "student bin count {} exceeds MAX_STUDENT_BINS ({})",
+                        bin_count,
+                        MAX_STUDENT_BINS
+                    ));
+                }
+                for head in &heads {
+                    if head.len() != bin_count {
+                        return Err(anyhow!(
+                            "inconsistent bin counts: expected {}, got {}",
+                            bin_count,
+                            head.len()
+                        ));
+                    }
+                }
+            }
+            let mut branch_probs = [[0f32; MAX_STUDENT_BINS]; 4];
             for (idx, head_probs) in heads.iter().enumerate() {
                 if let Some(val) = head_probs.last() {
                     let prob = *val;
@@ -209,6 +277,9 @@ async fn consume_result(
                         argmax_head = idx as u8;
                     }
                 }
+                for (bin_idx, &prob) in head_probs.iter().enumerate() {
+                    branch_probs[idx][bin_idx] = prob;
+                }
             }
             let mut policy_kind_mask = 0u8;
             if has_policy {
@@ -222,17 +293,27 @@ async fn consume_result(
                     policy_kind_mask |= annotation_kinds::POLICY_HARD;
                 }
             }
-            Ok(AnnotationRow {
-                run_id: sample.run_id,
-                step_index: sample.step_index,
-                teacher_move: sample.teacher_move.unwrap_or(255),
-                legal_mask: sample.legal_mask.unwrap_or(0),
-                policy_kind_mask,
-                argmax_head,
-                argmax_prob: argmax_p.max(0.0),
-                policy_p1: p1,
-                policy_logp: logp,
-                policy_hard,
+            if bin_count > 0 {
+                bins_payload = Some(StudentBinsPayload {
+                    bin_count,
+                    probs: branch_probs,
+                });
+            }
+            Ok(AnnotatedOutput {
+                seq: sample.seq,
+                annotation: AnnotationRow {
+                    run_id: sample.run_id,
+                    step_index: sample.step_index,
+                    teacher_move: sample.teacher_move.unwrap_or(255),
+                    legal_mask: sample.legal_mask.unwrap_or(0),
+                    policy_kind_mask,
+                    argmax_head,
+                    argmax_prob: argmax_p.max(0.0),
+                    policy_p1: p1,
+                    policy_logp: logp,
+                    policy_hard,
+                },
+                bins: bins_payload,
             })
         }
         InferenceOutput::Argmax { head: _, _p1 } => Err(anyhow!(
@@ -243,15 +324,39 @@ async fn consume_result(
 }
 
 fn write_result(
-    row: AnnotationRow,
+    output: AnnotatedOutput,
     writer: &mut StepsWriter<AnnotationRow>,
+    bins_writer: &mut StudentBinsWriter,
     run_masks: &mut HashMap<u32, u8>,
 ) -> Result<()> {
-    writer.write(std::slice::from_ref(&row))?;
-    run_masks
-        .entry(row.run_id)
-        .and_modify(|mask| *mask |= row.policy_kind_mask)
-        .or_insert(row.policy_kind_mask);
+    let AnnotatedOutput {
+        seq: _,
+        annotation,
+        bins,
+    } = output;
+    writer.write(std::slice::from_ref(&annotation))?;
+    let entry = run_masks
+        .entry(annotation.run_id)
+        .and_modify(|mask| *mask |= annotation.policy_kind_mask)
+        .or_insert(annotation.policy_kind_mask);
+    if let Some(payload) = bins {
+        bins_writer.write(payload.bin_count, &payload.probs)?;
+        *entry |= annotation_kinds::POLICY_STUDENT_BINS;
+    }
+    Ok(())
+}
+
+fn flush_ready_outputs(
+    buffer: &mut BTreeMap<u64, AnnotatedOutput>,
+    next_seq: &mut u64,
+    writer: &mut StepsWriter<AnnotationRow>,
+    bins_writer: &mut StudentBinsWriter,
+    run_masks: &mut HashMap<u32, u8>,
+) -> Result<()> {
+    while let Some(output) = buffer.remove(&*next_seq) {
+        write_result(output, writer, bins_writer, run_masks)?;
+        *next_seq += 1;
+    }
     Ok(())
 }
 
@@ -260,6 +365,7 @@ struct ManifestKinds {
     policy_p1: u8,
     policy_logprobs: u8,
     policy_hard: u8,
+    policy_student_bins: u8,
 }
 
 #[derive(Serialize)]
@@ -269,12 +375,24 @@ struct ManifestEntry {
 }
 
 #[derive(Serialize)]
+struct StudentBinsManifest {
+    dtype: String,
+    num_bins: usize,
+}
+
+#[derive(Serialize)]
 struct AnnotationManifest {
     kinds: ManifestKinds,
     runs: Vec<ManifestEntry>,
+    student_bins: StudentBinsManifest,
 }
 
-fn write_manifest(output_dir: &Path, run_masks: &HashMap<u32, u8>, overwrite: bool) -> Result<()> {
+fn write_manifest(
+    output_dir: &Path,
+    run_masks: &HashMap<u32, u8>,
+    num_bins: usize,
+    overwrite: bool,
+) -> Result<()> {
     let mut runs: Vec<ManifestEntry> = run_masks
         .iter()
         .map(|(run_id, mask)| ManifestEntry {
@@ -289,8 +407,13 @@ fn write_manifest(output_dir: &Path, run_masks: &HashMap<u32, u8>, overwrite: bo
             policy_p1: annotation_kinds::POLICY_P1,
             policy_logprobs: annotation_kinds::POLICY_LOGPROBS,
             policy_hard: annotation_kinds::POLICY_HARD,
+            policy_student_bins: annotation_kinds::POLICY_STUDENT_BINS,
         },
         runs,
+        student_bins: StudentBinsManifest {
+            dtype: "f32".to_string(),
+            num_bins,
+        },
     };
 
     let json = serde_json::to_vec_pretty(&manifest)?;
@@ -304,6 +427,178 @@ fn write_manifest(output_dir: &Path, run_masks: &HashMap<u32, u8>, overwrite: bo
     fs::write(&path, json)
         .with_context(|| format!("failed to write annotation manifest to {}", path.display()))?;
     Ok(())
+}
+
+struct StudentBinsWriter {
+    output_dir: PathBuf,
+    shard_max: Option<usize>,
+    shard_idx: usize,
+    steps_in_shard: usize,
+    bin_count: Option<usize>,
+    buffer: Vec<f32>,
+}
+
+impl StudentBinsWriter {
+    fn new(output_dir: &Path, shard_max: Option<usize>, overwrite: bool) -> Result<Self> {
+        let output_dir = output_dir.to_path_buf();
+        let prefix = Self::prefix();
+        if overwrite {
+            Self::clean_existing(&output_dir, prefix)?;
+        } else {
+            Self::check_no_existing(&output_dir, prefix)?;
+        }
+        Ok(Self {
+            output_dir,
+            shard_max,
+            shard_idx: 0,
+            steps_in_shard: 0,
+            bin_count: None,
+            buffer: Vec::new(),
+        })
+    }
+
+    fn write(&mut self, bin_count: usize, probs: &[[f32; MAX_STUDENT_BINS]; 4]) -> Result<()> {
+        if bin_count > MAX_STUDENT_BINS {
+            bail!(
+                "bin count {} exceeds MAX_STUDENT_BINS ({})",
+                bin_count,
+                MAX_STUDENT_BINS
+            );
+        }
+        match self.bin_count {
+            Some(existing) if existing != bin_count => {
+                bail!(
+                    "student bin count mismatch: expected {}, got {}",
+                    existing,
+                    bin_count
+                );
+            }
+            None => {
+                self.bin_count = Some(bin_count);
+            }
+            _ => {}
+        }
+
+        self.buffer.reserve(4 * bin_count);
+        for head in 0..4 {
+            self.buffer.extend_from_slice(&probs[head][..bin_count]);
+        }
+        self.steps_in_shard += 1;
+
+        if let Some(limit) = self.shard_max {
+            if self.steps_in_shard >= limit {
+                self.flush_current_shard()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.flush_current_shard()?;
+        Ok(())
+    }
+
+    fn bin_count(&self) -> Option<usize> {
+        self.bin_count
+    }
+
+    fn flush_current_shard(&mut self) -> Result<()> {
+        if self.steps_in_shard == 0 {
+            return Ok(());
+        }
+        let bin_count = self
+            .bin_count
+            .ok_or_else(|| anyhow!("student bin writer flushed before any bins recorded"))?;
+        let prefix = Self::prefix();
+        let file_name = if self.shard_max.is_some() {
+            format!("{prefix}-{idx:05}.npy", idx = self.shard_idx)
+        } else {
+            format!("{prefix}.npy")
+        };
+        let tmp_name = format!("{file_name}.tmp");
+        let final_path = self.output_dir.join(&file_name);
+        let tmp_path = self.output_dir.join(tmp_name);
+        let file = std::io::BufWriter::new(
+            std::fs::File::create(&tmp_path)
+                .with_context(|| format!("failed to create {}", tmp_path.display()))?,
+        );
+        let mut writer = npyz::WriteOptions::new()
+            .default_dtype()
+            .shape(&[self.steps_in_shard as u64, 4, bin_count as u64])
+            .writer(file)
+            .begin_nd()?;
+        writer.extend(self.buffer.iter().copied())?;
+        writer.finish()?;
+        std::fs::rename(&tmp_path, &final_path).with_context(|| {
+            format!(
+                "failed to rename {} to {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+
+        self.buffer.clear();
+        self.steps_in_shard = 0;
+        if self.shard_max.is_some() {
+            self.shard_idx += 1;
+        }
+        Ok(())
+    }
+
+    fn clean_existing(dir: &Path, prefix: &str) -> Result<()> {
+        let single = dir.join(format!("{prefix}.npy"));
+        if single.exists() {
+            std::fs::remove_file(&single)
+                .with_context(|| format!("failed to remove {}", single.display()))?;
+        }
+        if dir.exists() {
+            for entry in std::fs::read_dir(dir)
+                .with_context(|| format!("failed to read {}", dir.display()))?
+            {
+                let entry = entry?;
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(prefix) && name.ends_with(".npy") {
+                        std::fs::remove_file(entry.path()).with_context(|| {
+                            format!("failed to remove {}", entry.path().display())
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_no_existing(dir: &Path, prefix: &str) -> Result<()> {
+        let single = dir.join(format!("{prefix}.npy"));
+        if single.exists() {
+            bail!(
+                "{} already exists in {} (use --overwrite)",
+                single.file_name().unwrap().to_string_lossy(),
+                dir.display()
+            );
+        }
+        if dir.exists() {
+            for entry in std::fs::read_dir(dir)
+                .with_context(|| format!("failed to read {}", dir.display()))?
+            {
+                let entry = entry?;
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(prefix) && name.ends_with(".npy") {
+                        bail!(
+                            "found existing {} in {} (use --overwrite)",
+                            name,
+                            dir.display()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prefix() -> &'static str {
+        "annotations-student"
+    }
 }
 
 fn load_macro_shard(path: &Path) -> Result<Vec<MacroxueStepRow>> {
@@ -392,6 +687,7 @@ fn copy_metadata(src: &Path, dst: &Path, kind: &DatasetKind, overwrite: bool) ->
 
 #[derive(Clone, Copy)]
 struct StepSample {
+    seq: u64,
     run_id: u32,
     step_index: u32,
     teacher_move: Option<u8>,
@@ -400,18 +696,20 @@ struct StepSample {
 }
 
 impl StepSample {
-    fn from_macro(row: MacroxueStepRow) -> Self {
+    fn from_macro(row: MacroxueStepRow, seq: u64) -> Self {
         Self {
+            seq,
             run_id: row.run_id,
             step_index: row.step_index,
             teacher_move: Some(row.move_dir),
             legal_mask: Some(row.ev_legal),
-            board: decode_macro_board(row.board, row.tile_65536_mask),
+            board: macroxue::decode_board(row.board, row.tile_65536_mask),
         }
     }
 
-    fn from_selfplay(row: SelfplayStepRow) -> Self {
+    fn from_selfplay(row: SelfplayStepRow, seq: u64) -> Self {
         Self {
+            seq,
             run_id: row.run_id as u32,
             step_index: row.step_idx,
             teacher_move: None,
@@ -423,20 +721,6 @@ impl StepSample {
     fn unique_id(&self) -> u64 {
         ((self.run_id as u64) << 32) | (self.step_index as u64)
     }
-}
-
-fn decode_macro_board(packed: u64, mask: u16) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    for i in 0..16 {
-        let shift = (15 - i) * 4;
-        let nib = ((packed >> shift) & 0xF) as u8;
-        let mut val = nib;
-        if (mask >> i) & 1 == 1 {
-            val = 16;
-        }
-        out[i] = val;
-    }
-    out
 }
 
 #[derive(Clone, Copy, Debug)]

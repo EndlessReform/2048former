@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
@@ -76,7 +76,8 @@ impl MacroxueTokenizerV2Spec {
     /// Load a tokenizer specification from a JSON file on disk.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         Self::from_reader(file)
     }
 }
@@ -105,10 +106,7 @@ impl MacroxueTokenizerV2 {
     }
 
     /// Construct the tokenizer with a custom zero tolerance for tuple valuations.
-    pub fn with_zero_tolerance(
-        spec: MacroxueTokenizerV2Spec,
-        zero_tolerance: f64,
-    ) -> Result<Self> {
+    pub fn with_zero_tolerance(spec: MacroxueTokenizerV2Spec, zero_tolerance: f64) -> Result<Self> {
         ensure!(zero_tolerance >= 0.0, "zero_tolerance must be non-negative");
 
         let num_bins = usize::try_from(spec.num_bins)
@@ -130,7 +128,8 @@ impl MacroxueTokenizerV2 {
         let search_failure_cutoff = spec
             .search
             .failure_cutoff
-            .ok_or_else(|| anyhow::anyhow!("search failure cutoff must be present in spec"))? as f64;
+            .ok_or_else(|| anyhow::anyhow!("search failure cutoff must be present in spec"))?
+            as f64;
 
         let token_illegal = TOKEN_ILLEGAL;
         let token_failure = TOKEN_FAILURE;
@@ -342,7 +341,10 @@ impl Tokenizer for MacroxueTokenizerV2 {
         ensure!(move_dir < NUM_BRANCHES, "move_dir {move_dir} out of range");
 
         let legal = decode_legal_mask(legal_mask);
-        ensure!(legal.iter().any(|&flag| flag), "legal mask has no legal branches");
+        ensure!(
+            legal.iter().any(|&flag| flag),
+            "legal mask has no legal branches"
+        );
 
         let mut tokens = initial_tokens(
             self.token_illegal,
@@ -356,9 +358,9 @@ impl Tokenizer for MacroxueTokenizerV2 {
 
         match kind {
             ValuationKind::Search => {
-                let board_eval = board_eval
-                    .map(|v| v as f64)
-                    .ok_or_else(|| anyhow::anyhow!("board_eval is required for search tokenization"))?;
+                let board_eval = board_eval.map(|v| v as f64).ok_or_else(|| {
+                    anyhow::anyhow!("board_eval is required for search tokenization")
+                })?;
                 self.encode_search(&mut tokens, &branch_values, move_dir, &legal, board_eval);
             }
             ValuationKind::Tuple10 => {
@@ -412,7 +414,11 @@ fn validate_edges(label: &str, edges: &[f64], num_bins: usize) -> Result<()> {
         num_bins + 1
     );
     for window in edges.windows(2) {
-        ensure!(window[1] > window[0], "{} bin_edges must be strictly increasing", label);
+        ensure!(
+            window[1] > window[0],
+            "{} bin_edges must be strictly increasing",
+            label
+        );
     }
     Ok(())
 }
@@ -498,53 +504,65 @@ mod tests {
 
     #[test]
     fn tuple_tokenization_assigns_failure_zero_and_bins() {
-        let tokenizer = MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
+        let tokenizer =
+            MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
         let tokens = tokenizer
-            .encode_row(
-                "tuple10",
-                &[1.0, 0.2, 0.0, 0.0],
-                0,
-                0b0111,
-                None,
-            )
+            .encode_row("tuple10", &[1.0, 0.2, 0.0, 0.0], 0, 0b0111, None)
             .expect("tuple tokenization should succeed");
         let winner_token = TOKEN_OFFSET + tokenizer.num_bins() as u16;
         let bin_token = TOKEN_OFFSET + 1;
         let failure_token = TOKEN_FAILURE;
         let zero_bin = TOKEN_OFFSET + tokenizer.num_bins() as u16 - 1;
-        assert_eq!(tokens[0], winner_token, "winner branch should map to WINNER token");
-        assert_eq!(tokens[1], bin_token, "disadvantage should map into quantised bin");
-        assert_eq!(tokens[2], failure_token, "branches with zero value fall back to FAILURE");
-        assert_eq!(tokens[3], zero_bin, "illegal branches inherit zero-disadvantage bin");
+        assert_eq!(
+            tokens[0], winner_token,
+            "winner branch should map to WINNER token"
+        );
+        assert_eq!(
+            tokens[1], bin_token,
+            "disadvantage should map into quantised bin"
+        );
+        assert_eq!(
+            tokens[2], failure_token,
+            "branches with zero value fall back to FAILURE"
+        );
+        assert_eq!(
+            tokens[3], zero_bin,
+            "illegal branches inherit zero-disadvantage bin"
+        );
     }
 
     #[test]
     fn search_tokenization_bins_disadvantages() {
-        let tokenizer = MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
+        let tokenizer =
+            MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
         let tokens = tokenizer
-            .encode_row(
-                "search",
-                &[0.90, 0.80, 0.60, 0.95],
-                3,
-                0b1111,
-                Some(500),
-            )
+            .encode_row("search", &[0.90, 0.80, 0.60, 0.95], 3, 0b1111, Some(500))
             .expect("search tokenization should succeed");
         let winner_token = TOKEN_OFFSET + tokenizer.num_bins() as u16;
-        let expected = [TOKEN_OFFSET + 2, TOKEN_OFFSET + 2, TOKEN_OFFSET + 1, winner_token];
+        let expected = [
+            TOKEN_OFFSET + 2,
+            TOKEN_OFFSET + 2,
+            TOKEN_OFFSET + 1,
+            winner_token,
+        ];
         assert_eq!(tokens, expected);
     }
 
     #[test]
     fn search_requires_board_eval() {
-        let tokenizer = MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
+        let tokenizer =
+            MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
         let err = tokenizer.encode_row("search", &[0.5, 0.4, 0.3, 0.6], 0, 0b1111, None);
-        assert!(err.is_err(), "board_eval should be mandatory for search tokenization");
+        assert!(
+            err.is_err(),
+            "board_eval should be mandatory for search tokenization"
+        );
     }
 
     #[test]
     fn search_winner_not_overwritten_by_failure_mask() {
-        let tokenizer = MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
+        let tokenizer =
+            MacroxueTokenizerV2::from_spec(test_spec()).expect("failed to build tokenizer");
         // Simulate: advantages = [-93, 0, -31, -74784], winner is branch 1
         // Branch 3 should be FAILURE (advantage < -1500)
         // Branches 0, 2 should be binned
@@ -552,19 +570,31 @@ mod tests {
         let tokens = tokenizer
             .encode_row(
                 "search",
-                &[0.407, 0.500, 0.469, -74.284],  // scaled: [407, 500, 469, -74284]
-                1,                                   // winner
+                &[0.407, 0.500, 0.469, -74.284], // scaled: [407, 500, 469, -74284]
+                1,                               // winner
                 0b1111,
-                Some(500),                          // board_eval = 500
+                Some(500), // board_eval = 500
             )
             .expect("search tokenization should succeed");
 
         let winner_token = TOKEN_OFFSET + tokenizer.num_bins() as u16;
 
         // Expected: [4, 6, 4, 1] (matching Python implementation)
-        assert_eq!(tokens[0], 4, "Branch 0: disadvantage -93 should map to bin 2 (token 4)");
-        assert_eq!(tokens[1], winner_token, "Branch 1: winner must be WINNER token (6)");
-        assert_eq!(tokens[2], 4, "Branch 2: disadvantage -31 should map to bin 2 (token 4)");
-        assert_eq!(tokens[3], TOKEN_FAILURE, "Branch 3: advantage -74784 should be FAILURE (1)");
+        assert_eq!(
+            tokens[0], 4,
+            "Branch 0: disadvantage -93 should map to bin 2 (token 4)"
+        );
+        assert_eq!(
+            tokens[1], winner_token,
+            "Branch 1: winner must be WINNER token (6)"
+        );
+        assert_eq!(
+            tokens[2], 4,
+            "Branch 2: disadvantage -31 should map to bin 2 (token 4)"
+        );
+        assert_eq!(
+            tokens[3], TOKEN_FAILURE,
+            "Branch 3: advantage -74784 should be FAILURE (1)"
+        );
     }
 }

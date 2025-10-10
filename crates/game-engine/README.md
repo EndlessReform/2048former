@@ -1,57 +1,96 @@
-Game Engine Orchestrator (Rust)
+# Game Engine Orchestrator
 
-Overview
-- Tokio-based orchestrator that runs many 2048 games concurrently, batches boards via a Feeder, and calls a Python inference server over gRPC.
-- The gRPC API returns per-head probabilities over bins (float32); the Rust side selects moves (max-p1) and applies them.
+## Overview
+- Tokio-based runner that reuses the self-play feeder to batch boards, call the gRPC inference service, and apply moves with `ai-2048`.
+- Ships two binaries:
+  - `game-engine` &mdash; drives on-policy self-play and records new datasets.
+  - `annotation-engine` &mdash; re-scores existing Macroxue or self-play shards and writes annotation sidecars (including per-bin log-probabilities).
+- Inference responses carry per-head bin distributions (`InferenceOutput::Bins`). The annotator now persists both the legacy summary (`annotations-*.npy`) and a new log-probability sidecar (`annotations-logp-<dtype>-*.npy`, `dtype = f32` by default, `f16` via CLI).
 
-Prereqs
-- A running inference server that implements proto `train_2048.inference.v1.Infer`.
-- Connection options (choose one in your TOML under `[orchestrator.connection]`):
-  - UDS (recommended locally): `uds_path = "/tmp/2048_infer.sock"`
-  - TCP: `tcp_addr = "http://127.0.0.1:50051"`
+## Prerequisites
+- A running inference server that implements `train_2048.inference.v1.Infer` (see `packages/infer_2048`).
+- Rust toolchain (1.80+) with Cargo.
+- Optional: tokenizer JSON for Macroxue tokenization previews.
 
-Build
-- cargo build -p game-engine
+## Building
 
-Run
-- Start the server (example):
-  - `uv run infer-2048 --init inits/v1_pretrained_50m --uds unix:/tmp/2048_infer.sock --device cpu --compile-mode none`
-- Start the client (example):
-  - `cargo run -p game-engine -- --config config/selfplay/collect-10m.toml`
+```bash
+cargo build -p game-engine
+```
 
-Config
-- See CONFIG.md for all keys. Minimal required fields:
-  - `[orchestrator.connection]` — set exactly one of:
-    - `uds_path = "/tmp/2048_infer.sock"`
-    - `tcp_addr = "http://127.0.0.1:50051"`
-  - `[orchestrator.batch]` (defaults are sensible; tune later)
+## Running Self-Play
+1. Start the inference server (example):
 
-Recording (optional)
-- To enable saving, set `[orchestrator.report].session_dir`. If omitted, no files are written.
-- Files written when buffers flush (on size/teardown):
-  - `steps-000001.npy`, `steps-000002.npy`, …: structured dtype rows `[('run_id','<u8'), ('step_idx','<u4'), ('exps','|u1',(16,))]`. Default shard size is 1_000_000 rows (`report.shard_max_steps`).
-  - `embeddings-000001.npy`, … (optional): float32 `[N, D]` shards when `orchestrator.inline_embeddings = true` and embeddings are paired.
-  - `metadata.db`: SQLite with tables:
-    - `runs(id INTEGER PRIMARY KEY, seed BIGINT, steps INT, max_score INT, highest_tile INT)`
-    - `session(meta_key TEXT PRIMARY KEY, meta_value TEXT)`
+   ```bash
+   uv run infer-2048 \
+     --init inits/v1_pretrained_50m \
+     --uds unix:/tmp/2048_infer.sock \
+     --device cuda
+   ```
 
-Safety knobs (optional)
-- `[orchestrator.report]`
-  - `max_ram_mb` (approx.): stop collecting new rows if in-memory buffer estimate exceeds this.
-  - `max_gb` (approx.): skip writing an artifact if its estimated size exceeds this many GB.
-  - `shard_max_steps` (default 1_000_000): flush steps/embeddings once the buffer reaches this many paired rows.
-- `[orchestrator]`
-  - `inline_embeddings`: request embeddings inline and write a shard when complete.
-  - `fixed_seed`: if set, seeds are deterministic; otherwise full randomness is used.
+2. Launch the orchestrator with a TOML config:
 
-What it does
-- Starts a Feeder with micro-batching and a sliding in-flight window.
-- Spawns up to `max_concurrent_games` per-game actors (GameActor) and runs until `num_seeds` games and/or `max_steps` total steps (whichever comes first).
-- Each actor:
-  - Submits current board (16 exponents) via Feeder and awaits probabilities.
-  - Selects a move using max-p1 (probability of the 1-bin) with a legality mask.
-  - Applies the move via `ai_2048` and continues until the game ends.
+   ```bash
+   cargo run -p game-engine -- \
+     --config config/inference/top-score.toml
+   ```
 
-Notes
-- UDS and TCP are both supported. Prefer UDS for local single-node runs (lower overhead, no TCP stack).
-- The Feeder integrates the response router (per-item oneshots) to keep the design simple.
+### Sample Config (copy/paste)
+
+```toml
+# save as config/selfplay/example.toml
+max_concurrent_games = 256
+max_steps = 10_000_000
+
+[orchestrator.connection]
+# Prefer UDS locally; comment this section out and set tcp_addr for remote.
+uds_path = "/tmp/2048_infer.sock"
+
+[orchestrator.batch]
+target_batch = 32
+max_batch = 256
+inflight_batches = 4
+
+[orchestrator.report]
+session_dir = "runs/example"
+shard_max_steps = 1_000_000
+max_gb = 16.0
+
+[sampling]
+strategy = "TailAggConf"
+temperature = 0.8
+top_p = 0.9
+top_k = 2
+```
+
+## Running Annotation
+1. Ensure the inference server above is running.
+2. Annotate an existing dataset:
+
+   ```bash
+   cargo run -p game-engine --release --bin annotation-engine -- \
+     --config config/inference/orchestrator.toml \
+     --dataset datasets/macroxue/d6_10g_v1 \
+     --output annotations/d6_10g_v1/new-model \
+     --student-bins-dtype f16 \
+     --overwrite
+   ```
+
+   - `--student-bins-dtype` selects the dtype for the log-probability sidecar (`f32` default, `f16` optional).
+   - Use `--limit N` for smoke tests and `--overwrite` to replace previous shards.
+   - The inference server now advertises tokenizer metadata (`model_metadata.policy`), so the annotator sizes the log-probability sidecar automatically from the first response.
+
+## Output Artifacts
+
+| Binary             | Artifacts                                                                                                      |
+|--------------------|---------------------------------------------------------------------------------------------------------------|
+| `game-engine`      | `steps-*.npy`, optional `embeddings-*.npy`, and `metadata.db` inside `session_dir`.                             |
+| `annotation-engine`| `annotations-*.npy` (summary row), `annotations-logp-<dtype>-*.npy` (per-bin log-probs), copied `metadata.db`, `valuation_types.json`, and `annotation_manifest.json` capturing bitmasks, dtype, and max bin count. |
+
+Manifest `policy_kind_mask` now exposes `POLICY_P1`, `POLICY_LOGPROBS`, `POLICY_HARD`, and `POLICY_STUDENT_BINS` bits so downstream tools can detect available annotations without scanning shards.
+
+## Notes & Safety Knobs
+- `max_concurrent_games`, `max_steps`, and `[orchestrator.batch]` control throughput/backpressure.
+- `orchestrator.report.*` sets shard sizing (`shard_max_steps`), output directory, and optional size caps (`max_gb`).
+- `inline_embeddings = true` requests embeddings from the server; they are paired against steps before writing `embeddings-*.npy`.
+- Annotation requires `argmax_only = false` in the orchestrator config so full distributions are returned.
