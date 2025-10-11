@@ -20,5 +20,12 @@ export const useViewerPreferences = create<ViewerPreferencesState>((set) => ({
   tokenizationMode: 'off',
   setTokenizationMode: (mode) => set({ tokenizationMode: mode }),
   tokenizerInfo: null,
-  setTokenizerInfo: (info) => set({ tokenizerInfo: info }),
+  setTokenizerInfo: (info) =>
+    set((state) => ({
+      tokenizerInfo: info,
+      tokenizationMode:
+        info && state.tokenizerInfo === null && state.tokenizationMode === 'off'
+          ? 'preview'
+          : state.tokenizationMode,
+    })),
 }))

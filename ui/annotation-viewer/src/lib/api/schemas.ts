@@ -9,6 +9,19 @@ export const policyKindLegendSchema = z.object({
 
 export type PolicyKindLegend = z.infer<typeof policyKindLegendSchema>
 
+export const studentBinsMetadataSchema = z.object({
+  num_bins: z.number().int().nonnegative(),
+})
+
+export type StudentBinsMetadata = z.infer<typeof studentBinsMetadataSchema>
+
+export const studentBinsPayloadSchema = z.object({
+  num_bins: z.number().int().nonnegative(),
+  heads: z.array(z.array(z.number())).length(4),
+})
+
+export type StudentBinsPayload = z.infer<typeof studentBinsPayloadSchema>
+
 export const runSummarySchema = z.object({
   run_id: z.number().int(),
   seed: z.number().int().nonnegative(),
@@ -28,6 +41,7 @@ export const runsResponseSchema = z.object({
   page_size: z.number().int().min(1),
   runs: z.array(runSummarySchema),
   policy_kind_legend: policyKindLegendSchema,
+  student_bins: studentBinsMetadataSchema.optional(),
 })
 
 export type RunsResponse = z.infer<typeof runsResponseSchema>
@@ -55,6 +69,7 @@ export const stepResponseSchema = z.object({
   is_disagreement: z.boolean(),
   valuation_type: z.string(),
   annotation: annotationPayloadSchema.optional(),
+  student_bins: studentBinsPayloadSchema.optional(),
   tokens: z.array(z.number().int()).optional(),
 })
 
@@ -73,6 +88,7 @@ export const runDetailResponseSchema = z.object({
   pagination: paginationSchema,
   steps: z.array(stepResponseSchema),
   policy_kind_legend: policyKindLegendSchema,
+  student_bins: studentBinsMetadataSchema.optional(),
 })
 
 export type RunDetailResponse = z.infer<typeof runDetailResponseSchema>
@@ -96,6 +112,7 @@ export type HealthTokenizerInfo = z.infer<typeof healthTokenizerInfoSchema>
 export const healthResponseSchema = z.object({
   status: z.string(),
   tokenizer: healthTokenizerInfoSchema.nullable().optional(),
+  student_bins: studentBinsMetadataSchema.optional(),
 })
 
 export type HealthResponse = z.infer<typeof healthResponseSchema>

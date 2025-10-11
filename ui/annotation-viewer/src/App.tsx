@@ -125,10 +125,12 @@ const formatAdvantageIdDisplay = (value: number | null, mode: 'relative' | 'raw'
 
 const branchRows = (
   step: StepResponse | undefined,
-  options: { vocabOrder?: string[] | null } = {},
+  options: { vocabOrder?: string[] | null; tokenizerType?: string | null } = {},
 ): InsightRow[] => {
   if (!step) return []
-  const { vocabOrder = null } = options
+  const { vocabOrder = null, tokenizerType = null } = options
+  const isMacroxueTokenizer =
+    tokenizerType !== null && tokenizerType.toLowerCase().includes('macroxue')
 
   const valuationMode: 'relative' | 'raw' =
     step.valuation_type.toLowerCase() === 'search' ? 'relative' : 'raw'
@@ -158,6 +160,36 @@ const branchRows = (
   const tokens = step.tokens ?? null
   const vocabLength = vocabOrder ? vocabOrder.length : 0
 
+  const normalizeVocabLabel = (raw: string): string => {
+    const normalized = raw.replace(/_/g, ' ').trim()
+    const lower = normalized.toLowerCase()
+    if (lower === 'illegal' || lower === 'failure' || lower === 'winner') {
+      return normalized.toUpperCase()
+    }
+    return normalized
+  }
+
+  const getVocabLabel = (tokenId: number | null): string | null => {
+    if (!vocabOrder) return null
+    if (tokenId === null || !Number.isFinite(tokenId)) return null
+    if (tokenId < 0 || tokenId >= vocabOrder.length) return null
+    const label = vocabOrder[tokenId]
+    if (!label) return null
+    return normalizeVocabLabel(label)
+  }
+
+  const describeBinLabel = (index: number): string => {
+    if (isMacroxueTokenizer) {
+      if (index === 0) return 'ILLEGAL'
+      if (index === 1) return 'FAILURE'
+    }
+    const vocabLabel = getVocabLabel(index + 2)
+    if (vocabLabel) {
+      return vocabLabel
+    }
+    return `BIN ${String(index + 1).padStart(2, '0')}`
+  }
+
   return MOVE_LABELS.map((label, idx) => {
     const legal = (step.legal_mask & (1 << idx)) !== 0
     const teacher_ev = teacherValues[idx]
@@ -170,38 +202,77 @@ const branchRows = (
     let tokenCategory: TokenCategory | null = null
     let tokenLabel: string | null = null
     let tokenBinDisplay: string | null = null
+    let teacherBinIndex: number | null = null
 
     if (tokenId !== null && Number.isFinite(tokenId)) {
       if (tokenId === 0) {
         tokenCategory = 'illegal'
-        tokenLabel = 'Illegal'
+        tokenLabel = 'ILLEGAL'
+        tokenBinDisplay = getVocabLabel(tokenId) ?? 'ILLEGAL'
       } else if (tokenId === 1) {
         tokenCategory = 'failure'
-        tokenLabel = 'Failure'
+        tokenLabel = 'FAILURE'
+        tokenBinDisplay = getVocabLabel(tokenId) ?? 'FAILURE'
       } else if (vocabLength > 0 && tokenId === vocabLength - 1) {
         tokenCategory = 'winner'
-        tokenLabel = 'Winner'
+        tokenLabel = 'WINNER'
+        tokenBinDisplay = getVocabLabel(tokenId) ?? 'WINNER'
+      } else if (tokenId >= 2) {
+        const binIndex = tokenId - 2
+        teacherBinIndex = binIndex
+        const binLabel = describeBinLabel(binIndex)
+        if (isMacroxueTokenizer && binIndex === 0) {
+          tokenCategory = 'illegal'
+          tokenLabel = 'ILLEGAL'
+        } else if (isMacroxueTokenizer && binIndex === 1) {
+          tokenCategory = 'failure'
+          tokenLabel = 'FAILURE'
+        } else {
+          tokenCategory = 'bin'
+          tokenLabel = binLabel
+        }
+        tokenBinDisplay = getVocabLabel(tokenId) ?? binLabel
       } else if (tokenId >= 0) {
         tokenCategory = 'bin'
-        const binIndex = tokenId - 2
-        if (binIndex >= 0) {
-          tokenLabel = `Bin ${String(binIndex + 1).padStart(2, '0')}`
-        } else {
-          tokenLabel = `Bin ${tokenId}`
-        }
+        const fallback = `BIN ${tokenId}`
+        const label = getVocabLabel(tokenId)
+        tokenLabel = label ?? fallback
+        tokenBinDisplay = label ?? fallback
       }
 
-      const vocabLabel =
-        vocabOrder && tokenId >= 0 && tokenId < vocabOrder.length
-          ? vocabOrder[tokenId]
-          : null
-      if (vocabLabel) {
-        const normalized = vocabLabel.replace(/_/g, ' ')
-        tokenBinDisplay = normalized
-      } else if (tokenCategory === 'bin' && tokenId !== null) {
-        tokenBinDisplay = `Class ${tokenId}`
+      if (tokenCategory === 'bin' && !tokenBinDisplay) {
+        tokenBinDisplay = getVocabLabel(tokenId) ?? (tokenId !== null ? `BIN ${tokenId}` : null)
       }
     }
+
+    const studentBinHead = step.student_bins?.heads?.[idx] ?? null
+    const studentBinLabels = studentBinHead
+      ? studentBinHead.map((_, binIdx) => describeBinLabel(binIdx))
+      : null
+    const studentTopBinIndex =
+      studentBinHead && studentBinHead.length
+        ? studentBinHead.reduce<number | null>((best, value, candidateIdx) => {
+            if (best === null) return candidateIdx
+            const bestValue = studentBinHead[best] ?? Number.NEGATIVE_INFINITY
+            return value > bestValue ? candidateIdx : best
+          }, null)
+        : null
+    const studentSummaryLabel =
+      studentTopBinIndex !== null ? describeBinLabel(studentTopBinIndex) : null
+    const teacherSummaryLabel =
+      teacherBinIndex !== null ? describeBinLabel(teacherBinIndex) : null
+    const summaryParts: string[] = []
+    if (studentSummaryLabel) {
+      summaryParts.push(`S:${studentSummaryLabel}`)
+    } else if (studentTopBinIndex !== null) {
+      summaryParts.push(`S:BIN ${String(studentTopBinIndex + 1).padStart(2, '0')}`)
+    }
+    if (teacherSummaryLabel) {
+      summaryParts.push(`T:${teacherSummaryLabel}`)
+    } else if (teacherBinIndex !== null) {
+      summaryParts.push(`T:BIN ${String(teacherBinIndex + 1).padStart(2, '0')}`)
+    }
+    const studentBinSummary = summaryParts.length ? summaryParts.join(' · ') : null
 
     const advantageId = step.advantage_branch[idx] ?? null
     const advantageIdDisplay =
@@ -231,6 +302,11 @@ const branchRows = (
       tokenBinDisplay,
       advantageId,
       advantageIdDisplay,
+      studentBins: studentBinHead,
+      studentBinTopIndex: studentTopBinIndex,
+      teacherBinIndex,
+      studentBinSummary,
+      studentBinLabels,
     }
   })
 }
@@ -243,6 +319,7 @@ function App() {
   const tokenizationMode = useViewerPreferences((state) => state.tokenizationMode)
   const tokenizerInfo = useViewerPreferences((state) => state.tokenizerInfo)
   const tokenizationEnabled = tokenizationMode === 'preview' && tokenizerInfo !== null
+  const tokenizerType = tokenizerInfo?.tokenizer_type ?? null
 
   const runsQuery = useRunsQuery({ pageSize: RUNS_PAGE_SIZE })
 
@@ -410,7 +487,14 @@ function App() {
     return MOVE_ICONS.filter((_, idx) => (selectedStepData.legal_mask & (1 << idx)) !== 0)
   }, [selectedStepData])
   const vocabOrder = tokenizerInfo?.vocabOrder ?? null
-  const rows = useMemo<InsightRow[]>(() => branchRows(selectedStepData, { vocabOrder }), [selectedStepData, vocabOrder])
+  const rows = useMemo<InsightRow[]>(
+    () =>
+      branchRows(selectedStepData, {
+        vocabOrder,
+        tokenizerType,
+      }),
+    [selectedStepData, vocabOrder, tokenizerType],
+  )
 
   const teacherMove = selectedStepData?.teacher_move ?? null
   const studentMove = selectedStepData?.annotation?.argmax_head ?? null

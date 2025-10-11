@@ -25,4 +25,9 @@ export interface InsightRow {
   tokenBinDisplay: string | null
   advantageId: number | null
   advantageIdDisplay: string | null
+  studentBins: number[] | null
+  studentBinTopIndex: number | null
+  teacherBinIndex: number | null
+  studentBinSummary: string | null
+  studentBinLabels: string[] | null
 }

@@ -3,25 +3,20 @@
   gap: 0.5rem;
 }
 
-.header,
-.row {
-  display: grid;
-  grid-template-columns: 120px repeat(4, minmax(0, 1fr));
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.headerTokenized {
-  grid-template-columns: 120px repeat(5, minmax(0, 1fr));
-}
-
 .header {
   font-size: 0.8rem;
   font-weight: 500;
   color: rgba(63, 56, 47, 0.55);
+  display: grid;
+  grid-template-columns: 120px 1fr 1fr minmax(0, 1fr);
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
   padding: 0.7rem 0.8rem;
   border-radius: 0.85rem;
   background: rgba(248, 245, 239, 0.9);
@@ -30,8 +25,11 @@
   transition: box-shadow 160ms ease;
 }
 
-.rowTokenized {
-  grid-template-columns: 120px repeat(5, minmax(0, 1fr));
+.rowPrimary {
+  display: grid;
+  grid-template-columns: 120px 1fr 1fr minmax(0, 1fr);
+  align-items: center;
+  gap: 0.75rem;
 }
 
 .disabled {
@@ -197,9 +195,10 @@
 }
 
 .tokenCell {
-  display: inline-flex;
-  align-items: center;
+  display: flex;
+  align-items: flex-start;
   gap: 0.5rem;
+  width: 100%;
 }
 
 .tokenChip {
@@ -249,4 +248,124 @@
 .tokenMetaRow {
   font-family: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
   letter-spacing: -0.01em;
+}
+
+.rowSecondary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.2rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid rgba(95, 87, 78, 0.12);
+}
+
+.secondarySection {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 160px;
+  flex: 1 1 220px;
+}
+
+.secondaryLabel {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(63, 56, 47, 0.55);
+}
+
+.binCell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  width: 100%;
+}
+
+.binColumn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.binSpark {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.18rem;
+  height: 42px;
+}
+
+.binSegment {
+  flex: 1;
+  min-width: 6px;
+  border-radius: 0.35rem;
+  background: rgba(233, 181, 92, 0.28);
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.binSegmentTeacher {
+  box-shadow: 0 0 0 2px rgba(125, 31, 43, 0.55);
+}
+
+.binSegmentArgmax {
+  transform: translateY(-2px);
+  box-shadow: 0 3px 6px rgba(63, 56, 47, 0.22);
+}
+
+.binSegmentIllegal {
+  background: rgba(63, 56, 47, 0.58);
+}
+
+.binSegmentFailure {
+  background: rgba(200, 64, 46, 0.62);
+}
+
+.binSummary {
+  font-size: 0.72rem;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  letter-spacing: -0.01em;
+  color: rgba(63, 56, 47, 0.7);
+}
+
+.binPlaceholder {
+  font-size: 0.8rem;
+  color: rgba(63, 56, 47, 0.4);
+}
+
+.probSection {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.probRow {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.probLabel {
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: rgba(63, 56, 47, 0.55);
+  text-transform: uppercase;
+}
+
+.probBarWrapper {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  flex: 1;
+}
+
+.probBarWrapper .probBar {
+  flex: 1;
+}
+
+.logValue {
+  font-size: 0.78rem;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  color: rgba(63, 56, 47, 0.72);
 }
