@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from torch.utils.data import DataLoader
 
@@ -14,7 +14,7 @@ def build_dataloaders(
     cfg: TrainingConfig,
     *,
     num_workers_train: int = 12,
-) -> Tuple[DataLoader, Optional[DataLoader], int]:
+) -> Tuple[DataLoader, Optional[DataLoader], int, Dict[str, Any]]:
     """Construct train/val DataLoaders from steps.npy + metadata.db.
 
     Splits are disjoint by runs, configured via SQL or random run split.

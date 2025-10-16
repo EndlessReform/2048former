@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import json
 import time
@@ -11,6 +12,16 @@ from safetensors.torch import save_file as safe_save_file
 
 from .config import normalize_state_dict_keys
 
+CHECKPOINT_METADATA_VERSION = 2
+
+
+@dataclass
+class ResumeState:
+    global_step: Optional[int]
+    bundle_path: Path
+    optimizer_loaded: bool
+    bundle_metadata: Dict[str, Any]
+
 
 def save_pt_bundle(
     path: Path,
@@ -19,6 +30,9 @@ def save_pt_bundle(
     optimizer: Optional[torch.optim.Optimizer],
     training_cfg: Optional[object],
     global_step: Optional[int],
+    resume_state: Optional[Dict[str, Any]] = None,
+    dataset_metadata: Optional[Dict[str, Any]] = None,
+    metadata_version: int = CHECKPOINT_METADATA_VERSION,
 ) -> Path:
     """Persist a torch ``.pt`` bundle with weights, optimizer state, and metadata."""
 
@@ -29,40 +43,66 @@ def save_pt_bundle(
         "optimizer": (optimizer.state_dict() if optimizer is not None else None),
         "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
         "training_config": training_cfg.model_dump() if training_cfg is not None and hasattr(training_cfg, "model_dump") else None,
+        "metadata_version": int(metadata_version),
     }
+    if dataset_metadata is not None:
+        payload["dataset"] = dataset_metadata
+    if resume_state is not None:
+        payload["resume"] = resume_state
     torch.save(payload, str(path))
     return path
 
 
-def maybe_resume_optimizer_from_init(init_dir: str, optimizer: torch.optim.Optimizer) -> Optional[int]:
-    """If an init folder or checkpoint bundle contains a PT payload, load state.
+def maybe_resume_optimizer_from_init(
+    init_dir: str,
+    optimizer: torch.optim.Optimizer,
+    *,
+    bundle_path: Optional[str] = None,
+) -> Optional[ResumeState]:
+    """Attempt to resume optimizer state from the provided init source.
 
-    Returns the saved global_step when available, else None. Safe no-op on failure.
+    Returns a :class:`ResumeState` carrying metadata even when no optimizer state is available.
     """
     init_path = Path(init_dir)
-    if init_path.is_file():
-        pt_candidates = [init_path]
+    if bundle_path is not None:
+        candidates = [Path(bundle_path)]
+    elif init_path.is_file():
+        candidates = [init_path]
     else:
-        pt_candidates = [
+        candidates = [
             init_path / "model-stable.pt",
             init_path / "model.pt",
         ]
-    for pt in pt_candidates:
-        if pt.is_file():
+
+    for pt in candidates:
+        if not pt.is_file():
+            continue
+        try:
+            bundle = torch.load(str(pt), map_location="cpu")
+        except Exception as e:
+            print(f"[resume] Failed to load checkpoint bundle {pt}: {e}")
+            return None
+        if not isinstance(bundle, dict):
+            continue
+        optimizer_loaded = False
+        opt_blob = bundle.get("optimizer")
+        if isinstance(opt_blob, dict):
             try:
-                bundle = torch.load(str(pt), map_location="cpu")
-                if isinstance(bundle, dict) and isinstance(bundle.get("optimizer"), dict):
-                    optimizer.load_state_dict(bundle["optimizer"])  # type: ignore[arg-type]
-                    gs = bundle.get("global_step")
-                    try:
-                        gs_int = int(gs) if gs is not None else None
-                    except Exception:
-                        gs_int = None
-                    print(f"[resume] Loaded optimizer state from {pt}")
-                    return gs_int
+                optimizer.load_state_dict(opt_blob)  # type: ignore[arg-type]
+                optimizer_loaded = True
+                print(f"[resume] Loaded optimizer state from {pt}")
             except Exception as e:
                 print(f"[resume] Failed to load optimizer from {pt}: {e}")
-                return None
+                optimizer_loaded = False
+        else:
+            print(f"[resume] No optimizer state found in {pt}; continuing without optimizer resume")
+        metadata = {k: v for k, v in bundle.items() if k not in ("model", "optimizer")}
+        gs = metadata.get("global_step")
+        try:
+            gs_int = int(gs) if gs is not None else None
+        except Exception:
+            gs_int = None
+        return ResumeState(global_step=gs_int, bundle_path=pt, optimizer_loaded=optimizer_loaded, bundle_metadata=metadata)
     return None
 
 
@@ -123,6 +163,9 @@ def _save_stable_bundle(
     optimizer: Optional[torch.optim.Optimizer],
     training_cfg: Optional[object],
     global_step: Optional[int],
+    resume_state: Optional[Dict[str, Any]],
+    dataset_metadata: Optional[Dict[str, Any]],
+    metadata_version: int,
 ) -> None:
     """Write both safetensors and a .pt bundle for stable checkpoint.
 
@@ -138,6 +181,9 @@ def _save_stable_bundle(
             optimizer=optimizer,
             training_cfg=training_cfg,
             global_step=global_step,
+            resume_state=resume_state,
+            dataset_metadata=dataset_metadata,
+            metadata_version=metadata_version,
         )
     except Exception:
         pass
@@ -153,13 +199,25 @@ def maybe_save_stable(
     decay_steps: int,
     decay_start: int,
     preflag: dict,
+    resume_state: Optional[Dict[str, Any]] = None,
+    dataset_metadata: Optional[Dict[str, Any]] = None,
+    metadata_version: int = CHECKPOINT_METADATA_VERSION,
 ) -> None:
     if preflag.get("saved", False):
         return
     if decay_steps <= 0:
         return
     if global_step == decay_start:
-        _save_stable_bundle(run_dir, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=global_step)
+        _save_stable_bundle(
+            run_dir,
+            model=model,
+            optimizer=optimizer,
+            training_cfg=training_cfg,
+            global_step=global_step,
+            resume_state=resume_state,
+            dataset_metadata=dataset_metadata,
+            metadata_version=metadata_version,
+        )
         preflag["saved"] = True
 
 
@@ -177,6 +235,9 @@ def maybe_save_best(
     optimizer: Optional[torch.optim.Optimizer],
     training_cfg: Optional[object],
     wandb_run: Optional[object] = None,
+    resume_state: Optional[Dict[str, Any]] = None,
+    dataset_metadata: Optional[Dict[str, Any]] = None,
+    metadata_version: int = CHECKPOINT_METADATA_VERSION,
 ):
     if cfg_checkpoint is None or cfg_checkpoint.save_best_every_steps is None or dl_val is None:
         return
@@ -196,6 +257,9 @@ def maybe_save_best(
                 optimizer=optimizer,
                 training_cfg=training_cfg,
                 global_step=step,
+                resume_state=resume_state,
+                dataset_metadata=dataset_metadata,
+                metadata_version=metadata_version,
             )
         except Exception as e:
             print(f"[ckpt] Failed to write best checkpoint at step {step}: {e}")
@@ -222,6 +286,7 @@ def dangerous_dump_pt(*, cfg, run_dir: Path, model: torch.nn.Module, optimizer: 
             "optimizer": optimizer.state_dict(),
             "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
             "training_config": cfg.model_dump(),
+            "metadata_version": CHECKPOINT_METADATA_VERSION,
         }
         path = run_dir / f"dangerous-step-{step:08d}.pt"
         try:
@@ -239,6 +304,9 @@ def maybe_save_pt_interval(
     training_cfg: Optional[object],
     step: int,
     interval: Optional[int],
+    resume_state: Optional[Dict[str, Any]] = None,
+    dataset_metadata: Optional[Dict[str, Any]] = None,
+    metadata_version: int = CHECKPOINT_METADATA_VERSION,
 ) -> None:
     if interval is None or interval <= 0:
         return
@@ -246,7 +314,16 @@ def maybe_save_pt_interval(
         return
     path = run_dir / f"model-step-{step:08d}.pt"
     try:
-        save_pt_bundle(path, model=model, optimizer=optimizer, training_cfg=training_cfg, global_step=step)
+        save_pt_bundle(
+            path,
+            model=model,
+            optimizer=optimizer,
+            training_cfg=training_cfg,
+            global_step=step,
+            resume_state=resume_state,
+            dataset_metadata=dataset_metadata,
+            metadata_version=metadata_version,
+        )
         print(f"[ckpt] Saved step checkpoint: {path}")
     except Exception as e:
         print(f"[ckpt] Failed to write step checkpoint at step {step}: {e}")
@@ -262,4 +339,5 @@ __all__ = [
     "dangerous_dump_pt",
     "maybe_resume_optimizer_from_init",
     "maybe_save_pt_interval",
+    "ResumeState",
 ]

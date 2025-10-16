@@ -126,21 +126,34 @@ class StreamingRandomSampler(Sampler[int]):
     ``[0, dataset_len)``. This avoids allocating ``randperm(N)`` for large N.
     """
 
-    def __init__(self, dataset_len: int, total_samples: int, seed: int = 42) -> None:
+    def __init__(self, dataset_len: int, total_samples: int, seed: int = 42, skip: int = 0) -> None:
         if dataset_len <= 0 or total_samples <= 0:
             raise ValueError("dataset_len and total_samples must be > 0")
         self.dataset_len = int(dataset_len)
         self.total_samples = int(total_samples)
         self.seed = int(seed)
+        self.skip = max(0, int(skip))
+        if self.skip > self.total_samples:
+            self.skip = self.skip % self.total_samples if self.total_samples > 0 else 0
+        self._skip_consumed = False
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed)
+        skip_remaining = 0 if self._skip_consumed else self.skip
+        self._skip_consumed = True
         # Use int64 for indexing; DataLoader will cast as needed
-        for _ in range(self.total_samples):
-            yield int(rng.integers(0, self.dataset_len))
+        emitted = 0
+        while emitted < self.total_samples:
+            sample = int(rng.integers(0, self.dataset_len))
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                emitted += 1
+                continue
+            yield sample
+            emitted += 1
 
     def __len__(self) -> int:
-        return self.total_samples
+        return max(0, self.total_samples - min(self.skip, self.total_samples))
 
 
 class BufferedShuffleSampler(Sampler[int]):

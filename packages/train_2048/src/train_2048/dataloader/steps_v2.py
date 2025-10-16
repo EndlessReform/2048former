@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from math import ceil
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from torch.utils.data import DataLoader
@@ -36,6 +36,7 @@ def build_steps_dataloaders(
     ev_tokenizer: Optional[object] = None,
     train_num_steps: Optional[int] = None,
     num_epochs: Optional[int] = None,
+    resume_skip_samples: int = 0,
     seed: int = 42,
     shuffle: bool = False,
     shuffle_buffer_size: int = 1_000_000,
@@ -56,7 +57,7 @@ def build_steps_dataloaders(
     shard_locality_block_size: Optional[int] = None,
     shard_cache_in_memory: bool = True,
     shard_cache_keep_shards: int = 1,
-) -> Tuple[DataLoader, Optional[DataLoader], int]:
+) -> Tuple[DataLoader, Optional[DataLoader], int, Dict[str, Any]]:
     """Build train/val dataloaders using efficient shard-based loading.
 
     Returns (dl_train, dl_val_or_None, per_epoch_steps).
@@ -114,6 +115,12 @@ def build_steps_dataloaders(
     # Build training dataloader
     effective_batch_size = int(batch_size)
     loader_batch_size = int(physical_batch_size or batch_size)
+    skip_samples = max(0, int(resume_skip_samples or 0))
+    if skip_samples > 0:
+        skipped_steps = skip_samples / max(1, loader_batch_size)
+        print(
+            f"[data] Resume skip: dropping the first {skip_samples:,} samples (~{skipped_steps:,.0f} micro-batches)"
+        )
 
     # TODO: Handle step_index_min/max filtering if needed
     # For now, ignoring these filters in the new implementation
@@ -125,6 +132,9 @@ def build_steps_dataloaders(
 
     # For legacy samplers that don't use ShardDataset
     total_dataset_len = shard_loader.total_steps
+    samples_per_epoch = max(1, int(meta_train_steps))
+
+    sampler_info: Dict[str, Any] = {}
 
     # SAFETY CHECK: NEVER ALLOW SEQUENTIAL TRAINING
     # Sequential training on large datasets is catastrophically bad:
@@ -155,48 +165,90 @@ def build_steps_dataloaders(
         # New shard-based sampling: load shard, iterate through all steps randomly, move to next
         # Support both num_epochs and num_steps
         if num_epochs is not None and num_epochs > 0:
-            print(f"[data] Using ShardPoolSampler: {num_epochs} epoch(s), shard-by-shard iteration")
+            base_epochs = max(1, int(num_epochs))
+            extra_epochs = ceil(skip_samples / samples_per_epoch) if skip_samples > 0 else 0
+            effective_epochs = base_epochs + extra_epochs
+            if extra_epochs > 0:
+                print(
+                    f"[data] Using ShardPoolSampler: {effective_epochs} epoch(s) "
+                    f"(requested={base_epochs}, +{extra_epochs} to cover resume skip)"
+                )
+            else:
+                print(f"[data] Using ShardPoolSampler: {effective_epochs} epoch(s), shard-by-shard iteration")
             train_sampler = ShardPoolSampler(
                 shard_loader,
-                num_epochs=num_epochs,
+                num_epochs=effective_epochs,
                 seed=seed,
                 run_ids=train_run_ids,
                 total_steps=meta_train_steps,  # Trust metadata!
+                skip=skip_samples,
             )
             # Dataset length is determined by sampler
             train_dataset = ShardDataset(shard_loader, len(train_sampler))
+            sampler_info.update({
+                "kind": "ShardPoolSampler",
+                "epochs": effective_epochs,
+                "requested_epochs": base_epochs,
+            })
         elif train_num_steps is not None:
             # If num_steps specified, we need to calculate how many epochs that is
             # and potentially stop mid-epoch
-            total_samples = train_num_steps * effective_batch_size
+            requested_steps = int(train_num_steps)
+            requested_samples = requested_steps * effective_batch_size
             # For now, use a simple approach: create enough epochs, dataloader will stop
             estimated_steps_per_epoch = ceil(meta_train_steps / effective_batch_size)
             estimated_epochs = max(1, ceil(train_num_steps / estimated_steps_per_epoch))
+            min_epochs_for_plan = max(1, ceil((skip_samples + requested_samples) / samples_per_epoch))
+            effective_epochs = max(estimated_epochs, min_epochs_for_plan)
 
-            print(f"[data] Using ShardPoolSampler: ~{estimated_epochs} epoch(s) for {train_num_steps} steps")
+            print(
+                f"[data] Using ShardPoolSampler: ~{effective_epochs} epoch(s) for {train_num_steps} steps"
+            )
             train_sampler = ShardPoolSampler(
                 shard_loader,
-                num_epochs=estimated_epochs,
+                num_epochs=effective_epochs,
                 seed=seed,
                 run_ids=train_run_ids,
                 total_steps=meta_train_steps,  # Trust metadata!
+                skip=skip_samples,
             )
             train_dataset = ShardDataset(shard_loader, len(train_sampler))
+            sampler_info.update({
+                "kind": "ShardPoolSampler",
+                "epochs": effective_epochs,
+                "requested_steps": requested_steps,
+            })
         else:
             # Default: 1 epoch
-            print(f"[data] Using ShardPoolSampler: 1 epoch (default)")
+            base_epochs = 1
+            extra_epochs = ceil(skip_samples / samples_per_epoch) if skip_samples > 0 else 0
+            effective_epochs = base_epochs + extra_epochs
+            if extra_epochs > 0:
+                print(
+                    f"[data] Using ShardPoolSampler: {effective_epochs} epoch(s) "
+                    f"(default 1 +{extra_epochs} for resume)"
+                )
+            else:
+                print(f"[data] Using ShardPoolSampler: {effective_epochs} epoch(s) (default)")
             train_sampler = ShardPoolSampler(
                 shard_loader,
-                num_epochs=1,
+                num_epochs=effective_epochs,
                 seed=seed,
                 run_ids=train_run_ids,
                 total_steps=meta_train_steps,  # Trust metadata!
+                skip=skip_samples,
             )
             train_dataset = ShardDataset(shard_loader, len(train_sampler))
+            sampler_info.update({
+                "kind": "ShardPoolSampler",
+                "epochs": effective_epochs,
+            })
     elif train_num_steps is not None:
         # Legacy streaming sampler (still useful for some cases)
-        total_samples = train_num_steps * effective_batch_size
-        print(f"[data] Using streaming sampler: {total_samples:,} samples")
+        requested_steps = int(train_num_steps)
+        requested_samples = requested_steps * effective_batch_size
+        total_samples = skip_samples + requested_samples
+        print(f"[data] Using streaming sampler: {requested_samples:,} samples (+{skip_samples:,} skip)")
 
         # Create a sampler that just yields indices
         from .steps import StreamingRandomSampler
@@ -204,8 +256,13 @@ def build_steps_dataloaders(
             dataset_len=total_dataset_len,
             total_samples=total_samples,
             seed=seed,
+            skip=skip_samples,
         )
         train_dataset = ShardDataset(shard_loader, total_samples)
+        sampler_info.update({
+            "kind": "StreamingRandomSampler",
+            "requested_steps": requested_steps,
+        })
     elif shuffle:
         # Buffered shuffle for full dataset iteration
         print(f"[data] Using buffered shuffle: buffer_size={shuffle_buffer_size:,}")
@@ -213,8 +270,12 @@ def build_steps_dataloaders(
             dataset_len=total_dataset_len,
             buffer_size=shuffle_buffer_size,
             seed=seed,
+            skip=skip_samples,
         )
         train_dataset = ShardDataset(shard_loader, total_dataset_len)
+        sampler_info.update({
+            "kind": "BufferedShuffleSampler",
+        })
     else:
         # This should never be reached due to safety check above
         raise RuntimeError("Unreachable: sequential training path should be blocked by safety check")
@@ -236,6 +297,22 @@ def build_steps_dataloaders(
         f"[data] Train DataLoader: batch_size={loader_batch_size} "
         f"(effective={effective_batch_size}), workers={num_workers_train}"
     )
+
+    skip_applied = int(getattr(train_sampler, "skip", skip_samples)) if hasattr(train_sampler, "skip") else skip_samples
+    sampler_info.setdefault("kind", type(train_sampler).__name__)
+    sampler_info.update(
+        {
+            "skip_samples": skip_applied,
+            "output_samples": len(train_sampler),
+            "stream_samples": len(train_sampler) + skip_applied,
+            "seed": int(seed),
+            "shard_locality": bool(shard_locality),
+        }
+    )
+    if train_num_steps is not None:
+        sampler_info.setdefault("target_steps", int(train_num_steps))
+    if num_epochs is not None:
+        sampler_info.setdefault("requested_epochs", int(num_epochs))
 
     # Validation dataloader
     dl_val: Optional[DataLoader] = None
@@ -283,10 +360,26 @@ def build_steps_dataloaders(
 
     # Calculate per-epoch steps
     if train_num_steps is not None:
-        per_epoch_steps = train_num_steps
+        per_epoch_steps = int(train_num_steps)
     else:
         per_epoch_steps = ceil(meta_train_steps / effective_batch_size)
 
     print(f"[data] Per-epoch steps: {per_epoch_steps:,}")
 
-    return dl_train, dl_val, per_epoch_steps
+    metadata: Dict[str, Any] = {
+        "dataset_dir": str(Path(dataset_dir).resolve()),
+        "train_run_ids": train_run_ids,
+        "val_run_ids": val_run_ids,
+        "meta_train_steps": int(meta_train_steps),
+        "meta_val_steps": int(meta_val_steps),
+        "sampler": sampler_info,
+        "effective_batch_size": effective_batch_size,
+        "loader_batch_size": loader_batch_size,
+        "train_dataset_len": len(train_sampler),
+        "total_dataset_len": int(total_dataset_len),
+        "resume_skip_samples": int(skip_applied),
+        "train_num_steps": int(train_num_steps) if train_num_steps is not None else None,
+        "num_epochs": int(num_epochs) if num_epochs is not None else None,
+    }
+
+    return dl_train, dl_val, per_epoch_steps, metadata

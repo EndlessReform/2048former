@@ -33,6 +33,7 @@ class ShardPoolSampler(Sampler[int]):
         seed: int = 42,
         run_ids: Optional[np.ndarray] = None,
         total_steps: Optional[int] = None,
+        skip: int = 0,
     ):
         """
         Args:
@@ -48,10 +49,19 @@ class ShardPoolSampler(Sampler[int]):
         self.seed = seed
         self.run_ids = run_ids
         self.pool = InMemoryShardPool(shard_loader)
-        self._total_length = total_steps
+        per_epoch = int(total_steps) if total_steps is not None else int(self.loader.total_steps)
+        self._total_per_epoch = max(per_epoch, 0)
+        self.num_epochs = max(1, int(num_epochs))
+        self._total_length = self._total_per_epoch * self.num_epochs
+        self.skip = max(0, int(skip))
+        if self.skip > self._total_length:
+            self.skip = self.skip % self._total_length if self._total_length > 0 else 0
+        self._skip_remaining = self.skip
 
     def __iter__(self) -> Iterator[int]:
         rng = np.random.default_rng(self.seed)
+        skip_remaining = self._skip_remaining
+        self._skip_remaining = 0
 
         for epoch in range(self.num_epochs):
             # Iterate through all shards sequentially
@@ -75,13 +85,16 @@ class ShardPoolSampler(Sampler[int]):
 
                 # Yield all shuffled indices from this shard
                 for local_idx in eligible_indices:
+                    if skip_remaining > 0:
+                        skip_remaining -= 1
+                        continue
                     yield int(local_idx + shard_offset)
 
     def __len__(self) -> int:
-        if self._total_length is None:
-            # Fallback: use total from loader (all shards)
-            return self.loader.total_steps * self.num_epochs
-        return self._total_length * self.num_epochs
+        if self._total_length == 0:
+            return 0
+        effective = self._total_length - min(self.skip, self._total_length)
+        return max(0, effective)
 
 
 class BufferedShuffleSampler(Sampler[int]):
@@ -96,30 +109,43 @@ class BufferedShuffleSampler(Sampler[int]):
         dataset_len: int,
         buffer_size: int = 1_000_000,
         seed: int = 42,
+        skip: int = 0,
     ):
-        self.dataset_len = dataset_len
-        self.buffer_size = min(buffer_size, dataset_len)
+        self.dataset_len = int(dataset_len)
+        self.buffer_size = min(buffer_size, self.dataset_len)
         self.seed = seed
+        self.skip = max(0, int(skip))
+        if self.skip > self.dataset_len:
+            self.skip = self.skip % self.dataset_len if self.dataset_len > 0 else 0
+        self._skip_consumed = False
 
     def __iter__(self) -> Iterator[int]:
         rng = np.random.default_rng(self.seed)
         buffer = np.arange(self.buffer_size, dtype=np.int64)
         next_idx = self.buffer_size
+        skip_remaining = 0 if self._skip_consumed else self.skip
+        self._skip_consumed = True
 
         # Reservoir sampling with immediate yield
         while next_idx < self.dataset_len:
             j = rng.integers(0, self.buffer_size)
-            yield int(buffer[j])
+            if skip_remaining > 0:
+                skip_remaining -= 1
+            else:
+                yield int(buffer[j])
             buffer[j] = next_idx
             next_idx += 1
 
         # Drain buffer
         rng.shuffle(buffer)
         for idx in buffer:
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
             yield int(idx)
 
     def __len__(self) -> int:
-        return self.dataset_len
+        return max(0, self.dataset_len - min(self.skip, self.dataset_len))
 
 
 class SequentialSampler(Sampler[int]):
