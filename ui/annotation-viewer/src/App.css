@@ -55,6 +55,22 @@
   color: rgba(63, 56, 47, 0.6);
 }
 
+.runs-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.run-list-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  flex: 1;
+  min-height: 0;
+}
+
 .run-list {
   display: flex;
   flex-direction: column;
@@ -103,6 +119,95 @@
 
 .meta-label {
   font-weight: 500;
+  color: rgba(63, 56, 47, 0.55);
+}
+
+.run-pagination {
+  border-top: 1px solid rgba(95, 87, 78, 0.12);
+  padding-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.run-pagination-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.run-pagination-size {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.run-pagination-label {
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: rgba(63, 56, 47, 0.55);
+}
+
+.run-pagination-select {
+  padding: 0.32rem 0.55rem;
+  border-radius: 0.55rem;
+  border: 1px solid rgba(95, 87, 78, 0.18);
+  background: rgba(255, 253, 249, 0.92);
+  color: #3f382f;
+  font-size: 0.82rem;
+  font-weight: 500;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.run-pagination-select:focus {
+  outline: none;
+  border-color: rgba(233, 147, 74, 0.5);
+  box-shadow: 0 0 0 2px rgba(233, 147, 74, 0.18);
+}
+
+.run-pagination-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.run-pagination-button {
+  width: 2.1rem;
+  height: 2.1rem;
+  display: grid;
+  place-items: center;
+  border-radius: 0.55rem;
+  border: 1px solid rgba(95, 87, 78, 0.18);
+  background: rgba(255, 255, 255, 0.86);
+  color: #3f382f;
+  font-size: 1.05rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease;
+}
+
+.run-pagination-button:hover:not(:disabled) {
+  border-color: rgba(233, 147, 74, 0.45);
+  background: rgba(252, 232, 206, 0.92);
+  box-shadow: 0 4px 12px rgba(233, 147, 74, 0.12);
+}
+
+.run-pagination-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.run-pagination-page {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: rgba(63, 56, 47, 0.68);
+}
+
+.run-pagination-status {
+  font-size: 0.78rem;
+  font-style: italic;
   color: rgba(63, 56, 47, 0.55);
 }
 

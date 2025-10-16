@@ -10,7 +10,8 @@ import './App.css'
 
 const MOVE_LABELS = ['Up', 'Down', 'Left', 'Right']
 const MOVE_ICONS = ['↑', '↓', '←', '→']
-const RUNS_PAGE_SIZE = 25
+const DEFAULT_RUNS_PAGE_SIZE = 25
+const RUNS_PAGE_SIZE_OPTIONS = [25, 50, 100, 250] as const
 const WINDOW_RADIUS = 128
 const WINDOW_SIZE = WINDOW_RADIUS * 2 + 1
 const SAFETY_BUFFER = 8
@@ -316,12 +317,102 @@ function App() {
   const [selectedStep, setSelectedStep] = useState(0)
   const [windowOffset, setWindowOffset] = useState(0)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [runsPage, setRunsPageState] = useState<number>(() => {
+    if (typeof window === 'undefined') return 1
+    const params = new URLSearchParams(window.location.search)
+    const raw = Number.parseInt(params.get('runs_page') ?? '', 10)
+    return Number.isFinite(raw) && raw > 0 ? raw : 1
+  })
+  const [runsPageSize, setRunsPageSizeState] = useState<number>(() => {
+    if (typeof window === 'undefined') return DEFAULT_RUNS_PAGE_SIZE
+    const params = new URLSearchParams(window.location.search)
+    const raw = Number.parseInt(params.get('runs_page_size') ?? '', 10)
+    if (Number.isFinite(raw) && raw > 0) {
+      return Math.min(raw, 1000)
+    }
+    return DEFAULT_RUNS_PAGE_SIZE
+  })
   const tokenizationMode = useViewerPreferences((state) => state.tokenizationMode)
   const tokenizerInfo = useViewerPreferences((state) => state.tokenizerInfo)
   const tokenizationEnabled = tokenizationMode === 'preview' && tokenizerInfo !== null
-  const tokenizerType = tokenizerInfo?.tokenizer_type ?? null
+  const tokenizerType = tokenizerInfo?.tokenizerType ?? null
 
-  const runsQuery = useRunsQuery({ pageSize: RUNS_PAGE_SIZE })
+  const updateQueryParams = useCallback((updates: Record<string, string | null>) => {
+    if (typeof window === 'undefined') return
+    const url = new URL(window.location.href)
+    let changed = false
+    Object.entries(updates).forEach(([key, value]) => {
+      const existing = url.searchParams.get(key)
+      if (value === null) {
+        if (existing !== null) {
+          url.searchParams.delete(key)
+          changed = true
+        }
+      } else if (existing !== value) {
+        url.searchParams.set(key, value)
+        changed = true
+      }
+    })
+    if (changed) {
+      const query = url.searchParams.toString()
+      const next = `${url.pathname}${query ? `?${query}` : ''}${url.hash}`
+      window.history.replaceState(null, '', next)
+    }
+  }, [])
+
+  const setRunsPage = useCallback(
+    (page: number) => {
+      const sanitized = Number.isFinite(page) ? Math.max(1, Math.trunc(page)) : 1
+      setRunsPageState(sanitized)
+      updateQueryParams({ runs_page: sanitized > 1 ? String(sanitized) : null })
+    },
+    [updateQueryParams],
+  )
+
+  const setRunsPageSize = useCallback(
+    (size: number) => {
+      const sanitized = Number.isFinite(size)
+        ? Math.max(1, Math.trunc(size))
+        : DEFAULT_RUNS_PAGE_SIZE
+      setRunsPageSizeState(sanitized)
+      updateQueryParams({
+        runs_page_size: sanitized !== DEFAULT_RUNS_PAGE_SIZE ? String(sanitized) : null,
+      })
+      setRunsPage(1)
+    },
+    [setRunsPage, updateQueryParams],
+  )
+
+  const runsQuery = useRunsQuery(
+    { page: runsPage, pageSize: runsPageSize },
+    { placeholderData: (previous) => previous },
+  )
+
+  useEffect(() => {
+    if (!runsQuery.data) return
+    const { total, page_size } = runsQuery.data
+    if (total === 0) {
+      if (runsPage !== 1) {
+        setRunsPage(1)
+      }
+      return
+    }
+    const totalPages = Math.max(1, Math.ceil(total / Math.max(page_size, 1)))
+    if (runsPage > totalPages) {
+      setRunsPage(totalPages)
+    }
+  }, [runsQuery.data, runsPage, setRunsPage])
+
+  const currentRunsPage = runsQuery.data?.page ?? runsPage
+  const totalRuns = runsQuery.data?.total ?? 0
+  const currentPageSize = runsQuery.data?.page_size ?? runsPageSize
+  const isFetchingRunsPage = runsQuery.isFetching && runsQuery.isSuccess
+  const runsPageSizeOptions = useMemo(() => {
+    const unique = new Set<number>(RUNS_PAGE_SIZE_OPTIONS)
+    unique.add(runsPageSize)
+    unique.add(currentPageSize)
+    return Array.from(unique).sort((a, b) => a - b)
+  }, [runsPageSize, currentPageSize])
 
   useEffect(() => {
     if (!runsQuery.isSuccess) return
@@ -602,6 +693,13 @@ function App() {
         onRunSelect={handleRunSelect}
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed(c => !c)}
+        page={currentRunsPage}
+        pageSize={currentPageSize}
+        totalRuns={totalRuns}
+        pageSizeOptions={runsPageSizeOptions}
+        onPageChange={setRunsPage}
+        onPageSizeChange={setRunsPageSize}
+        isFetchingPage={isFetchingRunsPage}
       />
       <main className="main-content">
         {selectedRunId === null ? (

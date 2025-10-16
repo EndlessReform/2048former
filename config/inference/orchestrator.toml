@@ -20,11 +20,11 @@ concurrency = 4
 [orchestrator.batch]
 # Maximum number of batches to have in-flight to the inference server.
 # This, along with max_batch, controls backpressure.
-target_batch = 32
-inflight_batches = 4
+target_batch = 256
+inflight_batches = 2
 
 # Maximum number of game states to send in a single batch.
-max_batch = 256
+max_batch = 512
 
 # Seed for the random number generator, if needed.
 # For annotation, this is less critical as we are reading existing datasets.
