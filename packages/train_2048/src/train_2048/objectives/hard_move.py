@@ -21,6 +21,11 @@ class HardMove(Objective):
         batch: Dict[str, torch.Tensor],
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        *,
+        cfg: object,
+        zero_grad: bool = True,
+        optimizer_step: bool = True,
+        loss_scale: float = 1.0,
     ) -> Dict[str, float | list[float] | None]:
         tokens = batch["tokens"].to(device, non_blocking=True)
         move_targets = batch["move_targets"].to(device, non_blocking=True)
@@ -28,7 +33,8 @@ class HardMove(Objective):
         if branch_mask is not None:
             branch_mask = branch_mask.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
+        if zero_grad:
+            optimizer.zero_grad(set_to_none=True)
 
         if device.type == "cuda":
             autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -57,8 +63,12 @@ class HardMove(Objective):
             else:
                 loss = loss_per_sample.mean()
 
-        loss.backward()
-        optimizer.step()
+        scaled_loss = loss * float(loss_scale)
+        scaled_loss.backward()
+        if optimizer_step:
+            if cfg.hyperparameters.grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.hyperparameters.grad_clip_norm)
+            optimizer.step()
 
         preds = logits.argmax(dim=1)
         if branch_mask is not None and branch_mask.numel() == move_targets.numel() * 4:

@@ -1,57 +1,47 @@
-"""CLI helpers for fitting Macroxue tokenizers."""
+"""CLI entrypoint for fitting the Macroxue v2 tokenizer on packed datasets."""
 
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, Optional
 
-from .macroxue import fit_macroxue_tokenizer
-
-
-def _expand_globs(patterns: Sequence[str]) -> List[Path]:
-    paths: List[Path] = []
-    for pattern in patterns:
-        matches = glob.glob(pattern, recursive=True)
-        paths.extend(Path(match) for match in matches)
-    # Deduplicate while preserving order
-    seen = set()
-    unique: List[Path] = []
-    for path in sorted(paths):
-        if path in seen:
-            continue
-        seen.add(path)
-        unique.append(path)
-    return unique
+from .macroxue import fit_macroxue_tokenizer_v2
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fit a Macroxue percentile tokenizer from raw rollouts")
-    parser.add_argument(
-        "globs",
-        nargs="*",
-        default=["datasets/raws/macroxue_d6_240g_tokenization/*.jsonl.gz"],
-        help="Glob(s) for gzipped JSONL files (default: %(default)s)",
+    parser = argparse.ArgumentParser(
+        description="Fit the Macroxue advantage tokenizer (v2) from a packed dataset"
     )
     parser.add_argument(
-        "--quantiles",
-        type=int,
-        default=2049,
-        help="Number of ECDF knots per valuation type (default: %(default)s)",
+        "dataset",
+        type=Path,
+        help="Path to the packed dataset directory (expects steps.npy / valuation_types.json)",
     )
     parser.add_argument(
-        "--margin-bins",
+        "--output",
+        type=Path,
+        default=Path("tokenizer.json"),
+        help="Where to write the tokenizer spec (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--num-bins",
         type=int,
         default=32,
-        help="Number of loser-margin bins (default: %(default)s)",
+        help="Number of disadvantage bins shared across all valuation types (default: %(default)s)",
     )
     parser.add_argument(
-        "--out",
-        type=Path,
-        default=Path("datasets/raws/macroxue_d6_240g_tokenization/tokenizer_v1.json"),
-        help="Where to write the tokenizer spec (default: %(default)s)",
+        "--search-failure-cutoff",
+        type=int,
+        default=-1500,
+        help="Cutoff (in heuristic score units) for marking search branches as FAILURE (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--zero-tolerance",
+        type=float,
+        default=1e-9,
+        help="Tolerance for treating tuple disadvantages as zero (default: %(default)s)",
     )
     parser.add_argument(
         "--summary-out",
@@ -60,50 +50,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional path to dump metadata summary as JSON",
     )
     parser.add_argument(
+        "--indent",
+        type=int,
+        default=2,
+        help="Indentation width for the saved JSON (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow overwriting the output file if it already exists",
+    )
+    parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="Disable progress bars",
+        help="Disable the tqdm progress bar during fitting",
     )
     return parser
 
 
-def main(argv: Iterable[str] | None = None) -> None:
+def main(argv: Optional[Iterable[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    paths = _expand_globs(args.globs)
-    if not paths:
-        parser.error("No input files matched the provided globs")
-
-    spec = fit_macroxue_tokenizer(
-        paths,
-        quantile_count=args.quantiles,
-        margin_bins=args.margin_bins,
+    spec = fit_macroxue_tokenizer_v2(
+        args.dataset,
+        num_bins=args.num_bins,
+        search_failure_cutoff=args.search_failure_cutoff,
+        zero_tolerance=args.zero_tolerance,
         show_progress=not args.no_progress,
     )
 
-    spec.to_json(args.out)
-    print(f"Tokenizer spec written to {args.out}")
-    margin_counts = spec.metadata.get("margin_bin_counts")
-    margin_preview: str
-    if isinstance(margin_counts, list) and margin_counts:
-        margin_preview = ", ".join(str(x) for x in margin_counts[:5])
-    else:
-        margin_preview = "n/a"
+    spec.to_json(args.output, indent=args.indent, overwrite=args.overwrite)
+    print(f"[tokenizer] wrote spec to {args.output}")
 
-    print(
-        f"States: {spec.metadata.get('total_states', 'n/a')}, "
-        f"valuation types: {', '.join(spec.valuation_types)}"
-    )
-    print(
-        f"Loser bins: {spec.metadata.get('margin_bins')}, "
-        f"bin counts (first 5): {margin_preview}"
-    )
+    meta_summary = spec.metadata.copy()
+    meta_summary["tokenizer_type"] = spec.tokenizer_type
+    meta_summary["version"] = spec.version
+    meta_summary["num_bins"] = spec.num_bins
+    meta_summary["search_failure_cutoff"] = spec.search.failure_cutoff
+
+    def _fmt_stats(name: str, stats: dict) -> str:
+        return (
+            f"{name}: rows={stats.get('rows', 'n/a')}, legal={stats.get('legal_branches', 'n/a')}, "
+            f"failure={stats.get('failure_branches', 'n/a')}, zero={stats.get('zero_disadvantage', 'n/a')}"
+        )
+
+    for key in ("search", "tuple10", "tuple11"):
+        stats = meta_summary.get(key)
+        if isinstance(stats, dict):
+            print(f"[tokenizer] {_fmt_stats(key, stats)}")
 
     if args.summary_out:
         args.summary_out.parent.mkdir(parents=True, exist_ok=True)
-        args.summary_out.write_text(json.dumps(spec.metadata, indent=2))
-        print(f"Summary metadata written to {args.summary_out}")
+        args.summary_out.write_text(json.dumps(meta_summary, indent=args.indent))
+        print(f"[tokenizer] wrote summary to {args.summary_out}")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -126,21 +126,34 @@ class StreamingRandomSampler(Sampler[int]):
     ``[0, dataset_len)``. This avoids allocating ``randperm(N)`` for large N.
     """
 
-    def __init__(self, dataset_len: int, total_samples: int, seed: int = 42) -> None:
+    def __init__(self, dataset_len: int, total_samples: int, seed: int = 42, skip: int = 0) -> None:
         if dataset_len <= 0 or total_samples <= 0:
             raise ValueError("dataset_len and total_samples must be > 0")
         self.dataset_len = int(dataset_len)
         self.total_samples = int(total_samples)
         self.seed = int(seed)
+        self.skip = max(0, int(skip))
+        if self.skip > self.total_samples:
+            self.skip = self.skip % self.total_samples if self.total_samples > 0 else 0
+        self._skip_consumed = False
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed)
+        skip_remaining = 0 if self._skip_consumed else self.skip
+        self._skip_consumed = True
         # Use int64 for indexing; DataLoader will cast as needed
-        for _ in range(self.total_samples):
-            yield int(rng.integers(0, self.dataset_len))
+        emitted = 0
+        while emitted < self.total_samples:
+            sample = int(rng.integers(0, self.dataset_len))
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                emitted += 1
+                continue
+            yield sample
+            emitted += 1
 
     def __len__(self) -> int:
-        return self.total_samples
+        return max(0, self.total_samples - min(self.skip, self.total_samples))
 
 
 class BufferedShuffleSampler(Sampler[int]):
@@ -496,6 +509,7 @@ def build_steps_dataloaders(
     target_mode: str,
     batch_size: int,
     *,
+    physical_batch_size: Optional[int] = None,
     tokenizer_path: Optional[str] = None,
     ev_tokenizer: Optional[object] = None,
     train_num_steps: Optional[int] = None,
@@ -591,13 +605,21 @@ def build_steps_dataloaders(
     else:
         collate = make_collate_steps(target_mode, ds_train, binner, ev_tokenizer=ev_tokenizer)
 
-    print(f"[data] Building DataLoader(train): workers={num_workers_train} batch_size={batch_size}")
+    effective_batch_size = int(batch_size)
+    loader_batch_size = int(physical_batch_size or batch_size)
+    if effective_batch_size <= 0 or loader_batch_size <= 0:
+        raise ValueError("batch sizes must be > 0")
+
+    print(
+        f"[data] Building DataLoader(train): workers={num_workers_train} batch_size={loader_batch_size}"
+        f" (effective={effective_batch_size})"
+    )
     prefetch_train = 8 if num_workers_train > 0 else None
     train_sampler = None
     is_streaming = False
     if train_num_steps is not None and int(train_num_steps) > 0:
         total_len = len(ds_train)
-        total_samples = int(train_num_steps) * int(batch_size)
+        total_samples = int(train_num_steps) * effective_batch_size
         if step_index_min is not None or step_index_max is not None:
             print(
                 f"[data] Using filtered streaming sampler: samples={total_samples} buffer={shuffle_buffer_size} step_index in [{step_index_min},{step_index_max}]"
@@ -634,7 +656,7 @@ def build_steps_dataloaders(
             train_sampler = None
     dl_train = DataLoader(
         ds_train,
-        batch_size=batch_size,
+        batch_size=loader_batch_size,
         shuffle=False,
         sampler=train_sampler,
         num_workers=num_workers_train,
@@ -647,7 +669,9 @@ def build_steps_dataloaders(
     dl_val: Optional[DataLoader] = None
     if val_indices is not None and val_indices.size > 0:
         num_workers_val = max(2, num_workers_train // 3)
-        print(f"[data] Building DataLoader(val): workers={num_workers_val} batch_size={batch_size}")
+        print(
+            f"[data] Building DataLoader(val): workers={num_workers_val} batch_size={loader_batch_size}"
+        )
         prefetch_val = 4 if num_workers_val > 0 else None
         ds_val = StepsDataset(dataset_dir, indices=val_indices, mmap_mode=mmap_mode)
         if target_mode == "macroxue_tokens":
@@ -667,12 +691,12 @@ def build_steps_dataloaders(
             max_val_steps = int(max(1, round(float(planned_train_steps) * float(val_steps_pct))))
         if max_val_steps is not None:
             total_val = len(ds_val)
-            total_samples = int(max_val_steps) * int(batch_size)
+            total_samples = int(max_val_steps) * loader_batch_size
             print(f"[data] Capping validation: steps={max_val_steps} samples={total_samples} (of {total_val})")
             val_sampler = StreamingRandomSampler(total_val, total_samples, seed=seed + 1)
         dl_val = DataLoader(
             ds_val,
-            batch_size=batch_size,
+            batch_size=loader_batch_size,
             shuffle=(val_sampler is None),
             sampler=val_sampler,
             num_workers=num_workers_val,
@@ -686,7 +710,7 @@ def build_steps_dataloaders(
         per_epoch_steps = int(train_num_steps)
     else:
         # Prefer metadata count to avoid scanning steps.npy
-        per_epoch_steps = ceil(int(meta_train_steps) / max(1, int(batch_size)))
+        per_epoch_steps = ceil(int(meta_train_steps) / max(1, effective_batch_size))
     print(
         f"[data] Epoch steps (train/val): {per_epoch_steps} (meta rows: train={meta_train_steps} val={meta_val_steps})"
     )

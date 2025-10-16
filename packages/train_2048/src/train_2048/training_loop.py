@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Callable
+from typing import Any, Dict, Optional, Tuple, Callable
 from pathlib import Path
 import math
 import time
+import hashlib
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+import numpy as np
+
 from .config import DropoutConfig, TrainingConfig, load_encoder_from_init
 from .dataloader import build_steps_dataloaders
+from .dataloader.metadata import MetadataDB
 from .tokenization.ev_binning import EVBinnerTokenizer
 from .binning import BinningConfig
 from .objectives import make_objective
@@ -26,13 +30,23 @@ from .checkpointing import (
 )
 
 
-def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, target_mode: str, dt_data_ms: float | None = None, dt_comp_ms: float | None = None) -> str:
+def _format_postfix(
+    metrics: Dict[str, float | list[float] | None],
+    lr: float,
+    target_mode: str,
+    *,
+    global_step: Optional[int] = None,
+    accum_steps: Optional[int] = None,
+    micro_batch_size: Optional[int] = None,
+    dt_data_ms: float | None = None,
+    dt_comp_ms: float | None = None,
+) -> str:
     loss = float(metrics.get("loss", 0.0))
+    parts: list[str] = []
+    if global_step is not None:
+        parts.append(f"step={global_step}")
     base = f"loss={loss:.4f}"
     if target_mode in ("binned_ev", "macroxue_tokens"):
-        head_losses = metrics.get("head_losses") or [0.0, 0.0, 0.0, 0.0]
-        u, d, l, r = [float(x) for x in head_losses]
-        base += f"  u/d/l/r={u:.3f}/{d:.3f}/{l:.3f}/{r:.3f}"
         if target_mode == "macroxue_tokens":
             pa = metrics.get("policy_agreement")
             if pa is None:
@@ -46,12 +60,137 @@ def _format_postfix(metrics: Dict[str, float | list[float] | None], lr: float, t
         if acc is not None:
             base += f"  policy_acc={float(acc):.3f}"
     base += f"  lr={lr:.2e}"
+    if accum_steps is not None and micro_batch_size is not None:
+        effective = int(accum_steps) * int(micro_batch_size)
+        parts.append(f"mb={int(micro_batch_size)} eff={effective}")
     if dt_data_ms is not None and dt_comp_ms is not None:
         base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
+    if parts:
+        return f"{' '.join(parts)}  {base}"
     return base
 
 
-def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Optional[DataLoader], int]:
+def _extract_batch_dim(value: Any) -> Optional[int]:
+    if isinstance(value, torch.Tensor):
+        return int(value.shape[0])
+    if hasattr(value, "shape") and getattr(value, "shape", None) is not None:
+        shape = value.shape
+        if isinstance(shape, (tuple, list)) and len(shape) > 0:
+            return int(shape[0])
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    return None
+
+
+def _infer_batch_size(batch: Any) -> int:
+    if isinstance(batch, dict):
+        for val in batch.values():
+            size = _extract_batch_dim(val)
+            if size is not None:
+                return size
+    elif isinstance(batch, (list, tuple)):
+        for val in batch:
+            size = _extract_batch_dim(val)
+            if size is not None:
+                return size
+    else:
+        size = _extract_batch_dim(batch)
+        if size is not None:
+            return size
+    raise ValueError("Unable to infer batch size from training batch payload")
+
+
+def _hash_run_ids(run_ids: Optional[np.ndarray]) -> str:
+    if run_ids is None:
+        return "none"
+    arr = np.asarray(run_ids, dtype=np.int64)
+    return hashlib.sha1(arr.tobytes()).hexdigest()
+
+
+def _collect_dataset_signature(cfg: TrainingConfig) -> dict:
+    ds_cfg = cfg.dataset
+    metadata = MetadataDB(ds_cfg.resolved_dataset_dir())
+    train_run_ids, val_run_ids = metadata.split_runs_train_val(
+        run_sql=ds_cfg.run_sql,
+        sql_params=ds_cfg.sql_params,
+        val_run_sql=ds_cfg.val_run_sql,
+        val_sql_params=ds_cfg.val_sql_params,
+        val_run_pct=ds_cfg.val_run_pct,
+        val_split_seed=ds_cfg.val_split_seed,
+    )
+    meta_train_steps = metadata.get_total_steps_for_runs(train_run_ids)
+    meta_val_steps = metadata.get_total_steps_for_runs(val_run_ids) if val_run_ids is not None else 0
+    return {
+        "dataset_dir": str(Path(ds_cfg.resolved_dataset_dir()).resolve()),
+        "train_run_ids": train_run_ids,
+        "val_run_ids": val_run_ids,
+        "meta_train_steps": int(meta_train_steps),
+        "meta_val_steps": int(meta_val_steps),
+    }
+
+
+def _compute_dataset_fingerprint(signature: dict) -> str:
+    digest = hashlib.sha1()
+    digest.update(signature["dataset_dir"].encode("utf-8"))
+    digest.update(str(signature["meta_train_steps"]).encode("utf-8"))
+    digest.update(str(signature["meta_val_steps"]).encode("utf-8"))
+    digest.update(_hash_run_ids(signature.get("train_run_ids")).encode("utf-8"))
+    digest.update(_hash_run_ids(signature.get("val_run_ids")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _to_serializable(obj: Any) -> Any:
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(v) for v in obj]
+    return obj
+
+
+def _build_dataset_checkpoint_metadata(signature: dict, dataloader_meta: dict, fingerprint: str) -> dict:
+    sampler_info = _to_serializable(dataloader_meta.get("sampler", {}))
+    return {
+        "version": 1,
+        "fingerprint": fingerprint,
+        "dataset_dir": signature["dataset_dir"],
+        "meta_train_steps": int(signature["meta_train_steps"]),
+        "meta_val_steps": int(signature["meta_val_steps"]),
+        "train_run_count": int(len(signature["train_run_ids"])),
+        "train_runs_hash": _hash_run_ids(signature["train_run_ids"]),
+        "val_run_count": int(len(signature["val_run_ids"])) if signature.get("val_run_ids") is not None else 0,
+        "val_runs_hash": _hash_run_ids(signature.get("val_run_ids")),
+        "sampler": sampler_info,
+        "train_num_steps": dataloader_meta.get("train_num_steps"),
+        "num_epochs": dataloader_meta.get("num_epochs"),
+        "total_dataset_len": int(dataloader_meta.get("total_dataset_len", 0) or 0),
+        "train_dataset_len": int(dataloader_meta.get("train_dataset_len", 0) or 0),
+        "resume_skip_samples": int(dataloader_meta.get("resume_skip_samples", 0) or 0),
+    }
+
+
+def _build_resume_state(global_step: int, samples_consumed: int, skip_samples: int, cfg: TrainingConfig) -> dict:
+    return {
+        "version": 1,
+        "global_step": int(global_step),
+        "samples_consumed": int(samples_consumed),
+        "skip_samples": int(skip_samples),
+        "effective_batch_size": int(cfg.batch.batch_size),
+        "micro_batch_size": int(cfg.batch.physical_batch_size()),
+        "grad_accum_steps": int(cfg.batch.grad_accum_steps()),
+    }
+
+
+def init_datasets(
+    cfg: TrainingConfig,
+    target_mode: str,
+    *,
+    train_num_steps_override: Optional[int] = None,
+    resume_skip_samples: int = 0,
+) -> tuple[DataLoader, Optional[DataLoader], int, dict]:
     ev_tok = None
     if target_mode == "binned_ev":
         # Standardize EV tokenization via EVTokenizer wrapper
@@ -61,9 +200,15 @@ def init_datasets(cfg: TrainingConfig, target_mode: str) -> tuple[DataLoader, Op
         binner=None,
         target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
-        train_num_steps=cfg.dataset.num_steps,
+        physical_batch_size=cfg.batch.physical_batch_size(),
+        train_num_steps=(cfg.dataset.num_steps if train_num_steps_override is None else train_num_steps_override),
+        resume_skip_samples=resume_skip_samples,
         seed=cfg.seed,
         shuffle_buffer_size=getattr(cfg.dataset, "shuffle_buffer_size", 1_000_000),
+        shard_locality=getattr(cfg.dataset, "shard_locality", False),
+        shard_locality_block_size=getattr(cfg.dataset, "shard_locality_block_size", None),
+        shard_cache_in_memory=getattr(cfg.dataset, "shard_cache_in_memory", False),
+        shard_cache_keep_shards=getattr(cfg.dataset, "shard_cache_keep_shards", 1),
         val_num_steps=getattr(cfg.dataset, "val_num_steps", None),
         val_steps_pct=getattr(cfg.dataset, "val_steps_pct", 0.0),
         tokenizer_path=cfg.dataset.resolved_tokenizer_path(),
@@ -229,8 +374,23 @@ def _wandb_log(data: Dict[str, float | int], step: int) -> None:
         pass
 
 
-def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: float, target_mode: str, *, epoch: Optional[int], dt_data_ms: float, dt_comp_ms: float) -> Dict[str, float | int]:
-    payload: Dict[str, float | int] = {"train/loss": float(metrics["loss"]), "train/lr": float(lr), "train/data_time_ms": float(dt_data_ms), "train/compute_time_ms": float(dt_comp_ms)}
+def _build_train_payload(
+    metrics: Dict[str, float | list[float] | None],
+    lr: float,
+    target_mode: str,
+    *,
+    epoch: Optional[int],
+    dt_data_ms: float,
+    dt_comp_ms: float,
+    effective_batch_size: Optional[int],
+    accum_steps: Optional[int],
+) -> Dict[str, float | int]:
+    payload: Dict[str, float | int] = {
+        "train/loss": float(metrics["loss"]),
+        "train/lr": float(lr),
+        "train/data_time_ms": float(dt_data_ms),
+        "train/compute_time_ms": float(dt_comp_ms),
+    }
     if epoch is not None:
         payload["train/epoch"] = int(epoch)
     if target_mode in ("binned_ev", "macroxue_tokens"):
@@ -243,6 +403,10 @@ def _build_train_payload(metrics: Dict[str, float | list[float] | None], lr: flo
             acc = metrics.get("policy_acc")
         if acc is not None:
             payload["train/policy_accuracy"] = float(acc)
+    if effective_batch_size is not None:
+        payload["train/effective_batch_size"] = int(effective_batch_size)
+    if accum_steps is not None:
+        payload["train/accum_steps"] = int(accum_steps)
     return payload
 
 
@@ -276,34 +440,185 @@ def _maybe_log_val(objective, model, dl_val, device, *, cfg: TrainingConfig, tar
     return val_metrics
 
 
+def _accumulate_metric_sums(
+    sums: Dict[str, list[float] | float],
+    counts: Dict[str, int],
+    metrics: Dict[str, float | list[float] | None],
+) -> None:
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        if isinstance(value, list):
+            arr = [float(x) for x in value]
+            prev = sums.get(key)
+            if prev is None or not isinstance(prev, list):
+                sums[key] = arr
+            else:
+                if len(prev) != len(arr):
+                    raise ValueError(f"Metric list length mismatch for '{key}'")
+                sums[key] = [p + a for p, a in zip(prev, arr)]
+            counts[key] = counts.get(key, 0) + 1
+        else:
+            sums[key] = float(sums.get(key, 0.0)) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+
+
+def _finalize_metric_sums(
+    sums: Dict[str, list[float] | float],
+    counts: Dict[str, int],
+    last_metrics: Dict[str, float | list[float] | None],
+) -> Dict[str, float | list[float] | None]:
+    result: Dict[str, float | list[float] | None] = {}
+    keys = set(last_metrics.keys()) | set(sums.keys())
+    for key in keys:
+        count = counts.get(key, 0)
+        if key in sums and count > 0:
+            total = sums[key]
+            if isinstance(total, list):
+                result[key] = [v / count for v in total]
+            else:
+                result[key] = total / count
+        else:
+            result[key] = last_metrics.get(key)
+    return result
+
+
 def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
     device = torch.device(device_str)
     target_mode = getattr(cfg.target, "mode", "binned_ev")
 
-    dl_train, dl_val, per_epoch_steps = init_datasets(cfg, target_mode)
-    model, objective = init_model(cfg, device, target_mode=target_mode, dl_train=dl_train)
-    # Log model parameter count (pretty-printed)
+    dataset_signature = _collect_dataset_signature(cfg)
+    dataset_fingerprint = _compute_dataset_fingerprint(dataset_signature)
+
+    model = load_encoder_from_init(cfg.init_dir)
+    _apply_dropout_from_config(model, cfg.dropout)
+    init_info = getattr(model, "_init_load_info", {})
+    weight_type = init_info.get("weights_type", "unknown")
+    bundle_meta = init_info.get("bundle_metadata") if weight_type == "pt" else {}
+    available_pt = init_info.get("available_pt", [])
+    bundle_path_from_weights = init_info.get("weights_path") if weight_type == "pt" else None
+
+    resume_payload_meta = bundle_meta.get("resume") if isinstance(bundle_meta, dict) else {}
+    resume_dataset_meta = bundle_meta.get("dataset") if isinstance(bundle_meta, dict) else {}
+    resume_global_step_meta = bundle_meta.get("global_step") if isinstance(bundle_meta, dict) else None
+
+    effective_batch_size_cfg = int(cfg.batch.batch_size)
+    resume_samples_consumed = None
+    if isinstance(resume_payload_meta, dict) and "samples_consumed" in resume_payload_meta:
+        try:
+            resume_samples_consumed = int(resume_payload_meta["samples_consumed"])
+        except Exception:
+            resume_samples_consumed = None
+    if resume_samples_consumed is None and resume_global_step_meta is not None:
+        try:
+            resume_samples_consumed = int(resume_global_step_meta) * effective_batch_size_cfg
+        except Exception:
+            resume_samples_consumed = None
+
+    fingerprint_loaded = resume_dataset_meta.get("fingerprint") if isinstance(resume_dataset_meta, dict) else None
+    dataset_dirs_match = (
+        isinstance(resume_dataset_meta, dict)
+        and resume_dataset_meta.get("dataset_dir")
+        and resume_dataset_meta.get("dataset_dir") == dataset_signature["dataset_dir"]
+    )
+    dataset_match = bool(fingerprint_loaded) and fingerprint_loaded == dataset_fingerprint
+    if not dataset_match and fingerprint_loaded is None:
+        dataset_match = dataset_dirs_match
+
+    resume_skip_samples = int(resume_samples_consumed or 0) if dataset_match else 0
+    if resume_skip_samples > 0 and dataset_match:
+        approx_steps = resume_skip_samples / max(1, effective_batch_size_cfg)
+        print(f"[resume] Resuming data stream after {resume_skip_samples:,} samples (~{approx_steps:,.0f} steps)")
+    elif (resume_samples_consumed or 0) > 0 and not dataset_match:
+        print(
+            "[resume] Dataset metadata mismatch between checkpoint and current configuration; "
+            "training data will restart from the beginning."
+        )
+
+    dl_train, dl_val, per_epoch_steps, dataloader_meta = init_datasets(
+        cfg,
+        target_mode,
+        train_num_steps_override=cfg.dataset.num_steps,
+        resume_skip_samples=resume_skip_samples,
+    )
+
+    model = model.to(
+        device=(device if device.type != "cuda" else device),
+        dtype=(torch.bfloat16 if device.type == "cuda" else None),
+    )
+    objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
+    model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
+    _apply_dropout_from_config(model, cfg.dropout)
+    if getattr(cfg, "compile_enabled", True):
+        model = torch.compile(model, mode="reduce-overhead")
+
     try:
         n_params = sum(int(p.numel()) for p in model.parameters())
         print(f"Model parameters: {n_params:,}")
     except Exception:
         pass
+
     optimizer = init_optimizer(model, cfg)
-    # Try to resume optimizer state from init_dir (.pt bundle), if present
+
     resumed_step: Optional[int] = None
+    resume_state = None
+    bundle_path_for_resume = None
+    init_dir_path = Path(cfg.init_dir)
+    if bundle_path_from_weights:
+        bundle_path_for_resume = Path(bundle_path_from_weights)
+    elif init_dir_path.is_file() and init_dir_path.suffix.lower() in {".pt", ".pth"}:
+        bundle_path_for_resume = init_dir_path
+    else:
+        if available_pt:
+            print(
+                "[resume] WARNING: PT bundle(s) found alongside safetensors "
+                f"{available_pt}, but weights were loaded from safetensors. "
+                "Optimizer state will NOT be resumed to avoid desync."
+            )
+
     try:
-        resumed_step = maybe_resume_optimizer_from_init(cfg.init_dir, optimizer)
-        if resumed_step is not None:
-            print(f"[resume] Optimizer resumed; starting from global_step={resumed_step}")
-    except Exception:
-        pass
+        if bundle_path_for_resume is not None:
+            resume_state = maybe_resume_optimizer_from_init(cfg.init_dir, optimizer, bundle_path=str(bundle_path_for_resume))
+            if resume_state is not None:
+                resumed_step = resume_state.global_step
+        else:
+            resume_state = None
+    except Exception as exc:
+        print(f"[resume] Optimizer resume attempt failed: {exc}")
+        resume_state = None
+
+    if resume_state and resume_state.global_step is not None:
+        print(f"[resume] Optimizer resumed; starting from global_step={resume_state.global_step}")
+    elif resume_state is None and bundle_path_for_resume is not None:
+        print("[resume] No optimizer state found in checkpoint; continuing with fresh optimizer.")
 
     model.train()
 
-    fixed_steps = cfg.dataset.num_steps or 0
-    epochs = (cfg.dataset.num_epochs or 1) if fixed_steps == 0 else 1
-    steps_this_epoch = fixed_steps if fixed_steps > 0 else per_epoch_steps
-    total_steps = fixed_steps if fixed_steps > 0 else (per_epoch_steps * max(epochs, 1))
+    global_step = 0
+    if resume_state and resume_state.global_step is not None:
+        global_step = int(resume_state.global_step)
+    elif resume_global_step_meta is not None:
+        try:
+            global_step = int(resume_global_step_meta)
+        except Exception:
+            global_step = 0
+
+    samples_consumed = int(resume_skip_samples)
+
+    fixed_steps = int(cfg.dataset.num_steps or 0)
+    if fixed_steps > 0:
+        total_steps = fixed_steps
+        remaining_steps = max(0, fixed_steps - global_step)
+        steps_this_epoch = remaining_steps
+        epochs = 1
+    else:
+        epochs = int(cfg.dataset.num_epochs or 1)
+        steps_this_epoch = per_epoch_steps
+        total_steps = per_epoch_steps * max(epochs, 1)
+        remaining_steps = steps_this_epoch
+
+    if remaining_steps <= 0 and fixed_steps > 0:
+        print(f"[resume] Target steps ({fixed_steps}) already reached at global_step={global_step}; no training steps remain.")
 
     scale_for_step, apply_lr, sched_meta = make_scheduler(cfg, optimizer, total_steps)
 
@@ -311,42 +626,159 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     print(f"Checkpoint directory: {run_ckpt_dir}")
     dump_training_and_model_config(run_ckpt_dir, cfg, model)
 
-    global_step = int(resumed_step) if (resumed_step is not None) else 0
+    dataset_checkpoint_meta = _build_dataset_checkpoint_metadata(dataset_signature, dataloader_meta, dataset_fingerprint)
+
+    print(f"[resume] Starting training loop from global_step={global_step} with {samples_consumed:,} samples consumed.")
+
     pre_decay_flag = {"saved": False}
     best_tracker: Dict[str, float] = {}
     wandb_report_every = max(1, int(getattr(getattr(cfg, "wandb", None), "report_every", 1)))
+    base_grad_accum_steps = max(1, cfg.batch.grad_accum_steps())
+    adaptive_cfg = getattr(cfg.batch, "adaptive", None)
+    lr_schedule_name = getattr(cfg.hyperparameters.lr_schedule, "name", "constant")
+    peak_lr = 0.0
+    micro_batch_size = cfg.batch.physical_batch_size()
+
+    total_planned_epoch_steps = steps_this_epoch if fixed_steps > 0 else per_epoch_steps
 
     for epoch in range(epochs):
         it = iter(dl_train)
-        pbar = tqdm(range(steps_this_epoch), desc=("Train" if fixed_steps > 0 else f"Epoch {epoch + 1}/{epochs}"), dynamic_ncols=True, total=steps_this_epoch)
+        current_epoch_steps = total_planned_epoch_steps
+        if fixed_steps > 0:
+            current_epoch_steps = steps_this_epoch
+        pbar = tqdm(
+            range(current_epoch_steps),
+            desc=("Train" if fixed_steps > 0 else f"Epoch {epoch + 1}/{epochs}"),
+            dynamic_ncols=True,
+            total=current_epoch_steps,
+        )
         for _ in pbar:
-            maybe_save_stable(model, run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, global_step=global_step, decay_steps=sched_meta["decay_steps"], decay_start=sched_meta["decay_start_step"], preflag=pre_decay_flag)
-            lr_now = apply_lr(scale_for_step(global_step))
-            t0 = time.perf_counter()
-            try:
-                batch = next(it)
-            except StopIteration:
-                it = iter(dl_train)
-                batch = next(it)
-            t1 = time.perf_counter()
-            metrics = objective.train_step(model, batch, optimizer, device)
-            agreement = metrics.get("policy_agreement")
+            maybe_save_stable(
+                model,
+                run_ckpt_dir,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                global_step=global_step,
+                decay_steps=sched_meta["decay_steps"],
+                decay_start=sched_meta["decay_start_step"],
+                preflag=pre_decay_flag,
+                resume_state=_build_resume_state(global_step, samples_consumed, resume_skip_samples, cfg),
+                dataset_metadata=dataset_checkpoint_meta,
+            )
+            lr_scale = scale_for_step(global_step)
+            lr_now = apply_lr(lr_scale)
+            peak_lr = max(peak_lr, lr_now)
+            accum_multiplier = 1
+            if adaptive_cfg and adaptive_cfg.enabled and lr_schedule_name == "cosine" and peak_lr > 0.0:
+                lr_ratio = lr_now / peak_lr if peak_lr > 0.0 else 1.0
+                accum_multiplier = adaptive_cfg.multiplier_for_ratio(lr_ratio)
+            accum_steps = max(1, base_grad_accum_steps * accum_multiplier)
+            loss_scale = 1.0 / float(accum_steps)
+
+            metric_sums: Dict[str, list[float] | float] = {}
+            metric_counts: Dict[str, int] = {}
+            last_metrics: Dict[str, float | list[float] | None] = {}
+            total_data_time = 0.0
+            total_comp_time = 0.0
+
+            for accum_idx in range(accum_steps):
+                zero_grad = accum_idx == 0
+                optimizer_step = accum_idx == (accum_steps - 1)
+                t0 = time.perf_counter()
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    it = iter(dl_train)
+                    batch = next(it)
+                t1 = time.perf_counter()
+                metrics = objective.train_step(
+                    model,
+                    batch,
+                    optimizer,
+                    device,
+                    cfg=cfg,
+                    zero_grad=zero_grad,
+                    optimizer_step=optimizer_step,
+                    loss_scale=loss_scale,
+                )
+                try:
+                    samples_consumed += _infer_batch_size(batch)
+                except Exception:
+                    samples_consumed += cfg.batch.physical_batch_size()
+                last_metrics = metrics
+                _accumulate_metric_sums(metric_sums, metric_counts, metrics)
+                t2 = time.perf_counter()
+                total_data_time += (t1 - t0)
+                total_comp_time += (t2 - t1)
+
+            aggregated_metrics = _finalize_metric_sums(metric_sums, metric_counts, last_metrics)
+            agreement = aggregated_metrics.get("policy_agreement")
             if agreement is None:
-                agreement = metrics.get("policy_agree")
+                agreement = aggregated_metrics.get("policy_agree")
             if agreement is not None:
                 if not hasattr(run_training, "_pa_ema"):
                     run_training._pa_ema = float(agreement)  # type: ignore[attr-defined]
                 decay = 0.95
                 run_training._pa_ema = float(decay * run_training._pa_ema + (1 - decay) * float(agreement))  # type: ignore[attr-defined]
-                metrics["policy_agreement"] = run_training._pa_ema  # type: ignore[attr-defined]
-            t2 = time.perf_counter()
-            pbar.set_postfix_str(_format_postfix(metrics, lr_now, target_mode, (t1 - t0) * 1e3, (t2 - t1) * 1e3))
+                aggregated_metrics["policy_agreement"] = run_training._pa_ema  # type: ignore[attr-defined]
+            dt_data_ms = total_data_time * 1e3
+            dt_comp_ms = total_comp_time * 1e3
+            effective_batch_now = int(micro_batch_size) * int(accum_steps)
+            pbar.set_postfix_str(
+                _format_postfix(
+                    aggregated_metrics,
+                    lr_now,
+                    target_mode,
+                    global_step=global_step,
+                    accum_steps=accum_steps,
+                    micro_batch_size=micro_batch_size,
+                    dt_data_ms=dt_data_ms,
+                    dt_comp_ms=dt_comp_ms,
+                )
+            )
             if wandb_run is not None and (global_step % wandb_report_every == 0):
-                _wandb_log(_build_train_payload(metrics, lr_now, target_mode, epoch=(None if fixed_steps > 0 else epoch), dt_data_ms=(t1 - t0) * 1e3, dt_comp_ms=(t2 - t1) * 1e3), step=global_step)
+                _wandb_log(
+                    _build_train_payload(
+                        aggregated_metrics,
+                        lr_now,
+                        target_mode,
+                        epoch=(None if fixed_steps > 0 else epoch),
+                        dt_data_ms=dt_data_ms,
+                        dt_comp_ms=dt_comp_ms,
+                        effective_batch_size=effective_batch_now,
+                        accum_steps=accum_steps,
+                    ),
+                    step=global_step,
+                )
             _maybe_log_val(objective, model, dl_val, device, cfg=cfg, target_mode=target_mode, step=global_step, wandb_run=wandb_run, epoch=(None if fixed_steps > 0 else epoch))
             global_step += 1
-            maybe_save_pt_interval(model=model, run_dir=run_ckpt_dir, optimizer=optimizer, training_cfg=cfg, step=global_step, interval=getattr(cfg.checkpoint, "save_pt_every_steps", None))
-            maybe_save_best(model=model, run_dir=run_ckpt_dir, evaluate_fn=objective.evaluate, dl_val=dl_val, device=device, cfg_checkpoint=cfg.checkpoint, step=global_step, epoch=(None if fixed_steps > 0 else epoch), best_tracker=best_tracker, optimizer=optimizer, training_cfg=cfg, wandb_run=wandb_run)
+            resume_state_dict = _build_resume_state(global_step, samples_consumed, resume_skip_samples, cfg)
+            maybe_save_pt_interval(
+                model=model,
+                run_dir=run_ckpt_dir,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                step=global_step,
+                interval=getattr(cfg.checkpoint, "save_pt_every_steps", None),
+                resume_state=resume_state_dict,
+                dataset_metadata=dataset_checkpoint_meta,
+            )
+            maybe_save_best(
+                model=model,
+                run_dir=run_ckpt_dir,
+                evaluate_fn=objective.evaluate,
+                dl_val=dl_val,
+                device=device,
+                cfg_checkpoint=cfg.checkpoint,
+                step=global_step,
+                epoch=(None if fixed_steps > 0 else epoch),
+                best_tracker=best_tracker,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                wandb_run=wandb_run,
+                resume_state=resume_state_dict,
+                dataset_metadata=dataset_checkpoint_meta,
+            )
             if fixed_steps == 0:
                 dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step)
         if fixed_steps == 0 and getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):

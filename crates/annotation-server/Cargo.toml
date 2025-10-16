@@ -1,0 +1,20 @@
+[package]
+name = "annotation-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+axum = { version = "0.7.4", features = ["macros"] }
+clap = { version = "4.5.47", features = ["derive"] }
+http = "1.1.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.132"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.5.2", features = ["cors", "fs"] }
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+dataset-packer = { path = "../dataset-packer" }
+npyz = "0.8.4"
+thiserror = "1.0.64"
+rayon = "1.11.0"

@@ -1,5 +1,6 @@
 use crate::config;
 use crate::grpc::{self, pb};
+use log::{debug, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -117,13 +118,23 @@ impl Feeder {
                         biased;
                         _ = tok.cancelled() => { return; }
                         maybe = self.req_rx.recv() => {
-                            match maybe { Some(item) => buf.push(item), None => return }
+                            match maybe {
+                                Some(item) => buf.push(item),
+                                None if buf.is_empty() => {
+                                    self.drain_inflight().await;
+                                    return;
+                                }
+                                None => break,
+                            }
                         }
                     }
                 } else {
                     match self.req_rx.recv().await {
                         Some(item) => buf.push(item),
-                        None => return,
+                        None => {
+                            self.drain_inflight().await;
+                            return;
+                        }
                     }
                 }
 
@@ -139,13 +150,25 @@ impl Feeder {
                             biased;
                             _ = tok.cancelled() => break, // stop batching immediately
                             r = tokio::time::timeout(remaining, self.req_rx.recv()) => {
-                                match r { Ok(Some(item)) => buf.push(item), Ok(None) => return, Err(_elapsed) => break }
+                                match r {
+                                    Ok(Some(item)) => buf.push(item),
+                                    Ok(None) if buf.is_empty() => {
+                                        self.drain_inflight().await;
+                                        return;
+                                    }
+                                    Ok(None) => break,
+                                    Err(_elapsed) => break,
+                                }
                             }
                         }
                     } else {
                         match tokio::time::timeout(remaining, self.req_rx.recv()).await {
                             Ok(Some(item)) => buf.push(item),
-                            Ok(None) => return,
+                            Ok(None) if buf.is_empty() => {
+                                self.drain_inflight().await;
+                                return;
+                            }
+                            Ok(None) => break,
                             Err(_elapsed) => break, // flush window expired
                         }
                     }
@@ -161,6 +184,14 @@ impl Feeder {
                 self.inflight_items += batch_len;
 
                 let ids: Vec<u64> = buf.iter().map(|it| it.id).collect();
+                if let (Some(first), Some(last)) = (ids.first(), ids.last()) {
+                    debug!(
+                        "dispatching batch: {} items (first id {}, last id {})",
+                        batch_len, first, last
+                    );
+                } else {
+                    debug!("dispatching batch with {} items", batch_len);
+                }
                 let items_pb: Vec<pb::Item> = buf
                     .into_iter()
                     .map(|it| pb::Item {
@@ -184,9 +215,18 @@ impl Feeder {
 
                 tokio::spawn(async move {
                     let res = client_clone.infer(req).await;
+                    debug!(
+                        "inference RPC completed for batch: status={:?}",
+                        res.as_ref().map(|_| ()).map_err(|e| e.code())
+                    );
                     match res {
                         Ok(resp) => {
                             let resp = resp.into_inner();
+                            debug!(
+                                "inference response: {} item_ids, {} outputs",
+                                resp.item_ids.len(),
+                                resp.outputs.len()
+                            );
                             let embed_dim = resp.embed_dim as usize;
                             // Route per item
                             let mut map = pending.lock().await;
@@ -251,6 +291,11 @@ impl Feeder {
                                             })
                                     };
                                     let _ = tx.send(payload);
+                                } else {
+                                    warn!(
+                                        "inference response missing pending entry for item {}",
+                                        item_id
+                                    );
                                 }
                                 if !self.argmax_only && !emitted_from_concat {
                                     if let (Some(ch), Some(out)) =
@@ -280,6 +325,12 @@ impl Feeder {
                             for id in ids {
                                 if let Some(tx) = map.remove(&id) {
                                     let _ = tx.send(Err(status.clone()));
+                                } else {
+                                    warn!(
+                                        "failed to resolve pending sender for item {} after status {}",
+                                        id,
+                                        status.code()
+                                    );
                                 }
                             }
                         }
@@ -291,6 +342,19 @@ impl Feeder {
                 });
             }
         })
+    }
+}
+
+impl Feeder {
+    async fn drain_inflight(&mut self) {
+        while self.inflight_items > 0 {
+            match self.completion_rx.recv().await {
+                Some(done) => {
+                    self.inflight_items = self.inflight_items.saturating_sub(done);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -315,7 +379,14 @@ impl FeederHandle {
             let mut map = self.pending.lock().await;
             map.insert(id, tx_once);
         }
-        let _ = self.tx.send(InferenceItem { id, game_id, board }).await;
+        match self.tx.send(InferenceItem { id, game_id, board }).await {
+            Ok(()) => {
+                debug!("queued inference item {}", id);
+            }
+            Err(e) => {
+                debug!("failed to enqueue inference item {}: {}", id, e);
+            }
+        }
         rx
     }
 }

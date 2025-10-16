@@ -62,6 +62,14 @@ class DatasetConfig(BaseModel):
     # - If True, use buffered shuffle to avoid materializing a full permutation
     shuffle: bool = False
     shuffle_buffer_size: int = 1_000_000
+    # Optional shard-aware locality controls
+    shard_locality: bool = False
+    # When >0, sample at most this many rows from a shard before advancing.
+    shard_locality_block_size: Optional[int] = None
+    # When true, keep the active shard as an in-memory copy to reduce OS page faults.
+    shard_cache_in_memory: bool = False
+    # Number of fully materialised shards to retain simultaneously (>=1).
+    shard_cache_keep_shards: int = 1
     # Validation limits
     # Cap validation to a fixed number of steps (batches). When >0, overrides val_steps_pct.
     val_num_steps: Optional[int] = None
@@ -102,6 +110,20 @@ class DatasetConfig(BaseModel):
         if v < 0.0 or v > 1.0:
             if v != 0.0:
                 raise ValueError("dataset.val_steps_pct must be in [0,1] (0 disables)")
+        return v
+
+    @field_validator("shard_locality_block_size")
+    @classmethod
+    def _block_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("dataset.shard_locality_block_size must be > 0 when provided")
+        return v
+
+    @field_validator("shard_cache_keep_shards")
+    @classmethod
+    def _keep_shards_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("dataset.shard_cache_keep_shards must be >= 1")
         return v
 
     def resolved_dataset_dir(self) -> str:
@@ -192,13 +214,46 @@ class OptimizerConfig(BaseModel):
 class HyperParams(BaseModel):
     learning_rate: float = 3e-4
     muon_lr: Optional[float] = None  # only used if optimizer=muon
+    # Clip global gradient norm each step (None to disable)
+    grad_clip_norm: Optional[float] = None
     lr_schedule: LRScheduleConfig = Field(default_factory=LRScheduleConfig)
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
+
+
+class AdaptiveBatchConfig(BaseModel):
+    enabled: bool = False
+    double_at_lr_ratio: float = 0.5
+    quadruple_at_lr_ratio: float = 0.25
+
+    @field_validator("double_at_lr_ratio", "quadruple_at_lr_ratio")
+    @classmethod
+    def _ratio_bounds(cls, v: float) -> float:
+        if not (0.0 < v <= 1.0):
+            raise ValueError("adaptive batch ratios must be in (0, 1]")
+        return v
+
+    @field_validator("quadruple_at_lr_ratio")
+    @classmethod
+    def _quad_not_exceed_double(cls, quad: float, info) -> float:
+        double = info.data.get("double_at_lr_ratio", 0.5)
+        if quad > double:
+            raise ValueError("quadruple_at_lr_ratio must be <= double_at_lr_ratio")
+        return quad
+
+    def multiplier_for_ratio(self, lr_ratio: float) -> int:
+        if not self.enabled:
+            return 1
+        if lr_ratio <= self.quadruple_at_lr_ratio:
+            return 4
+        if lr_ratio <= self.double_at_lr_ratio:
+            return 2
+        return 1
 
 
 class BatchConfig(BaseModel):
     batch_size: int = 1024
     micro_batch_size: Optional[int] = None
+    adaptive: AdaptiveBatchConfig = Field(default_factory=AdaptiveBatchConfig)
 
     @field_validator("batch_size")
     @classmethod
@@ -209,16 +264,28 @@ class BatchConfig(BaseModel):
 
     @field_validator("micro_batch_size")
     @classmethod
-    def _micro_positive(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None and v <= 0:
-            raise ValueError("micro_batch_size must be > 0 when provided")
+    def _micro_positive(cls, v: Optional[int], info) -> Optional[int]:
+        if v is not None:
+            if v <= 0:
+                raise ValueError("micro_batch_size must be > 0 when provided")
+            parent = info.data or {}
+            batch_size = parent.get("batch_size")
+            if batch_size is not None and v > batch_size:
+                raise ValueError("micro_batch_size cannot exceed batch_size")
         return v
 
+    def effective_batch_size(self) -> int:
+        return int(self.batch_size)
+
+    def physical_batch_size(self) -> int:
+        return int(self.micro_batch_size or self.batch_size)
+
     def grad_accum_steps(self) -> int:
-        if not self.micro_batch_size:
+        phys = self.physical_batch_size()
+        eff = self.effective_batch_size()
+        if phys >= eff:
             return 1
-        # Ceil division; training loop may handle last partial microbatch
-        return (self.batch_size + self.micro_batch_size - 1) // self.micro_batch_size
+        return (eff + phys - 1) // phys
 
 
 class DropoutConfig(BaseModel):
@@ -307,6 +374,7 @@ __all__ = [
     "LRScheduleConfig",
     "OptimizerConfig",
     "HyperParams",
+    "AdaptiveBatchConfig",
     "BatchConfig",
     "DropoutConfig",
     "TargetConfig",

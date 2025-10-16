@@ -89,7 +89,7 @@ NOTE: earlier runs might have extra fields on the `.jsonl.gz`. Only assume the f
 
 ## Pretraining-ready format
 
-Similar to the earlier MattKennedy pure expectimax, we keep two files: a `metadata.db` and a `steps.npy` file as a pool. The intent is to keep data in-RAM, for highly efficient random read access over rows at bsz 1024-4096.
+Similar to the earlier MattKennedy pure expectimax, we keep two files: a `metadata.db` and a `steps.npy` (or sharded `steps-00000.npy`, …) pool. The intent is to keep data in-RAM, for highly efficient random read access over rows at bsz 1024-4096.
 
 TODO: add sharding
 
@@ -105,10 +105,11 @@ STEP_ROW_DTYPE = np.dtype(
         ("run_id", np.uint32),           # sequential game id
         ("step_index", np.uint32),       # index within the run
         ("board", np.uint64),            # 16 packed 4-bit tiles (MSB nibble = cell 0)
-        ("tile_65536_mask", np.uint16),  # bit i set when tile i stores 2**16
+        ("board_eval", np.int32),        # macroxue heuristic score for the current board
+        ("tile_65536_mask", np.uint16),  # bit i set when tile exponent >= 16 (>= 2**16)
         ("move_dir", np.uint8),          # UDLR: 0=up, 1=down, 2=left, 3=right
         ("valuation_type", np.uint8),    # enum (see valuation_types.json)
-        ("ev_legal", np.uint8),          # UDLR bitfield
+        ("ev_legal", np.uint8),          # UDLR bitfield (bit0=up, bit1=down, bit2=left, bit3=right)
         ("max_rank", np.uint8),          # denormalised for filtering
         ("seed", np.uint32),             # PRNG seed that generated the run
         ("branch_evs", np.float32, (4,)),# EVs [up, down, left, right]
@@ -117,6 +118,10 @@ STEP_ROW_DTYPE = np.dtype(
 )
 
 assert STEP_ROW_DTYPE.itemsize == 48
+
+Dataset pack shards preserve this layout. `crates/dataset-packer` walks `.meta.json` files lexicographically, assigns sequential `run_id`s (matching `runs.id`), and appends each run's rows in the order they appear in the source JSONL. Readers should rely on `run_id` + `step_index` when reconstructing trajectories rather than assuming global contiguity beyond per-run grouping.
+
+`board_eval` is re-computed during packing using the Rust port of the original Macroxue heuristic (see `crates/dataset-packer/src/macroxue/board_eval.rs`). Values match `packages/train_2048/tokenization/macroxue/board_eval.py` and remain within 32-bit signed range. Downstream tokenization code can use this field directly when constructing advantage bins without re-running the heuristic in Python.
 ```
 
 ### Runs metadata
@@ -141,6 +146,27 @@ Outputs:
 - `steps.npy` (or sharded `steps-00000.npy`, …) with the dtype above.
 - `metadata.db` populated from the sidecars (`runs` + `session` tables).
 - `valuation_types.json`: index → valuation-name lookup used by `valuation_type`.
+
+### Dataset comparison
+
+| Aspect | Macroxue pack (`steps-*.npy`) | Self-play v1 (`steps-*.npy`) | Legacy expectimax (`steps.npy`) | Footguns / Incompatibilities |
+| --- | --- | --- | --- | --- |
+| Step dtype | 48-byte struct with packed board, valuation metadata, branch EVs, legal mask | Minimal struct: `run_id<u64>`, `step_idx<u32>`, `exps<(16,)u8>` | Packed board only (`board<u64>` + sparse extras depending on drop) | Mixing loaders: self-play reader expects `exps`, Macroxue loader needs `board` + masks; selecting wrong collate path will KeyError.
+| Board encoding | Packed MSB-first 4-bit nibbles in `board`, with `tile_65536_mask` overflow bits | Plain exponents array `[16]` | Packed MSB-first (no overflow mask) | Converting between pools requires `BoardCodec` conversions; forgetting to apply `tile_65536_mask` loses 65536+ tiles.
+| Move/legality info | `move_dir<u8>` + `ev_legal` bitmask + `branch_evs[f32;4]` | No move or EV fields (pure board snapshots) | Sometimes includes `move` string but no legality mask | Downstream tasks that assume EVs will break on self-play v1/legacy; guard on dtype fields before indexing.
+| Valuation metadata | `valuation_type<u8>`; lookup in `valuation_types.json` | None (engine logits only) | None | Readers must ignore `valuation_type` if lookup file missing; ensure merge scripts keep enums consistent.
+| Run id width | `run_id<u32>` (packer remaps into contiguous range) | `run_id<u64>` (matches engine game id) | Varies; often `u32` | Treat as upcastable when stitching pools; do not assume 32-bit to avoid overflow when merging.
+| Sharding | Optional `steps-00000.npy` shards (size via `--shard-rows`) | Always shards when buffer hits `report.shard_max_steps` (default 1M) | Usually single `steps.npy` | Older tooling that hardcodes single-file paths must glob for `steps-*.npy` before loading.
+| Metadata db | `runs` + `session` tables | Same schema | `runs` table only in some drops | Consumers should fallback gracefully if `session` missing for legacy pools.
+| Embeddings alignment | No inline embeddings; offline jobs produce separate features | Optional inline `embeddings-*.npy` per shard (float32) | None | Training code must handle embeddings absent (Macroxue/legacy) vs present (self-play) without assuming shapes.
+
+#### Reader footguns
+
+- Pick the dataset-specific collate path (`make_collate_macroxue` vs `make_collate_steps`). Each validates for expected fields; use the wrong one and you will either crash or silently drop columns.
+- When stitching Macroxue with self-play v1, normalise board representations early (e.g., decode `board` into exponents) before batching; mixed representations inside one batch lead to incorrect tokenisation.
+- `run_id` ordering differs (packer lexicographic vs engine game IDs). Always join on `(run_id, step_index)` rather than relying on contiguous global indices.
+- Legacy expectimax pools lack the `tile_65536_mask`; if you need to detect >65536 tiles, recompute from the raw JSON source or discard that signal for those runs.
+- `valuation_type` ids are per-pack. Keep the accompanying `valuation_types.json` alongside `steps-*.npy` or regenerate enums before training.
 
 `--shard-rows` is optional today but provides the extension point for splitting the dataset without rewriting the packer. Progress is reported via `indicatif`, logging is standard `env_logger`, and the heavy lifting (JSON parsing, board packing) runs under `rayon`.
 

@@ -1,15 +1,15 @@
 # Self-Play v1 (Lean): Single NPY + Embeddings + Index
 
-Goal: a minimal, non-baroque design that reuses our existing NPY+SQLite rails, produces exactly one steps file, one embeddings file, and one index per session, and avoids extra fields/features until we need them.
+Goal: a minimal, non-baroque design that reuses our existing NPY+SQLite rails, produces a single logical steps pool (sharded on disk as needed), an optional embeddings pool, and one index per session, and avoids extra fields/features until we need them.
 
 What we will not do in v1: no rewards/done/legal, no q/int8 quant, no column-splitting into many NPYs, no time-based frequent flushes.
 
 ----------------------------------------
 
 Principles
-- Reuse rails: mirror the existing “steps.npy + metadata.db” pattern already used by training and examples.
+- Reuse rails: mirror the existing “steps-*.npy + metadata.db” pattern already used by training and examples.
 - Minimal schema: only what critic training needs (tokens and run mapping). Labels derive from run-level highest_tile.
-- Simple files: exactly one `steps.npy` (structured dtype), one `embeddings.bf16.npy` (optional), one `metadata.db` per recording session.
+- Simple files: structured step shards `steps-000001.npy`, optional `embeddings-000001.npy` shards, and one `metadata.db` per recording session.
 - High-throughput friendly: accumulate in memory and write in big chunks; rotate by step-count, not by aggressive timers.
 
 ----------------------------------------
@@ -23,27 +23,25 @@ Recording (engine)
   - Per-game buffer holds its steps until terminal. On game end, append to the session buffer.
   - Session buffer is a single growable vec of step records (contiguous, row order = write order).
 - Flush/rotation policy (40k steps/s):
-  - Default: rotate when `session_steps >= 10_000_000` (≈250 s at 40k/s) or when `max_ram_mb` is near the cap.
+  - Default: rotate when `session_steps >= 1_000_000` (≈25 s at 40k/s) or when `max_ram_mb` is near the cap. Tune via `report.shard_max_steps`.
   - No 500 ms timer. Optional safety timer (e.g., 30–60 s) only to bound RAM if step-rate dips; off by default.
   - On rotation or shutdown, write files once.
 - Files written (per session):
-  - `steps.npy` (structured array)
+  - `steps-000001.npy`, `steps-000002.npy`, … (structured arrays; single shard if below the threshold)
   - `metadata.db` (SQLite index with runs and minimal session meta)
-  - `embeddings.bf16.npy` is produced later by a Python job; not written by the engine.
+  - `embeddings-000001.npy`, … (float32 shards) when inline embeddings are enabled; offline jobs can add shards later.
 
 ----------------------------------------
 
-steps.npy (structured dtype)
+Step shards (`steps-*.npy`, structured dtype)
 - Schema (exact fields; fixed-width, no extras):
-  - `run_id: <u64 or i64>` — stable per-game ID
-  - `step_idx: <u32>` — 0-based index within run
-  - `exps: (16,)u1` — board exponents (0..15), row-major
-  - Optional (off by default): `action: u1` — 0..3 if we choose to keep it
-  - Optional (off by default): `reach_mask: u1` — bit0=8192, bit1=16384, bit2=32768
+  - `run_id: np.uint64` (dtype `'<u8'`) — stable per-game ID matching `runs.id` in SQLite
+  - `step_idx: np.uint32` (dtype `'<u4'`) — 0-based index within run
+  - `exps: (16,) np.uint8` (dtype `'|u1'`) — board exponents (0..15), canonical MSB-first order
 - Notes:
-  - This mirrors the spirit of the existing dataset rails but strips to the minimum. No `reward`, `done`, or `legal` fields.
+  - Rows are appended as steps become ready (after optional embedding pairing). Use `run_id` + `step_idx` when reconstructing trajectories instead of assuming contiguous order.
+  - This mirrors the existing dataset rails but strips to the minimum. No `reward`, `done`, or `legal` fields.
   - Keeping exps in-place avoids recomputing tokens later and is compatible with our tokenizer.
-  - Row order is the canonical index for alignment with `embeddings.bf16.npy`.
 
 metadata.db (SQLite)
 - Tables:
@@ -54,7 +52,7 @@ metadata.db (SQLite)
   - Provides the single “index” the loader needs and keeps the step file clean.
 
 Embeddings storage (fp32, offline)
-- Simplicity first: store embeddings as float32 `.npy` shards, row-aligned to `steps.npy`.
+- Simplicity first: store embeddings as float32 `.npy` shards, row-aligned to the `steps-*.npy` rows.
 - Files per session: `embeddings-000001.npy`, `embeddings-000002.npy`, ... each shaped `[N, D]` with `dtype=float32`.
 - Writer: offline embedding job runs model in bf16 for speed, mean-pools, then casts to fp32 before writing shards atomically.
 - Shard size default: 10M rows per shard at D=512 ≈ ~20 GB/shard. Adjust if needed, but this keeps shard count small and files manageable.
@@ -80,9 +78,9 @@ Critic dataloader (Python)
 - Path: `src/train_2048/dataloader_critic.py`.
 - Inputs: `root_dir` (session), `batch_size`, `num_workers`, optional `use_embeddings` flag.
 - Loader behavior:
-  - Load `steps.npy` (mmap) and `metadata.db`.
+  - Load `steps.npy` (mmap) or `steps-*.npy` shards and `metadata.db`.
   - Build an in-memory map `run_id -> highest_tile` from SQLite (small).
-  - If `use_embeddings` and `embeddings.bf16.npy` exists: mmap it and yield `(embedding, labels)`.
+  - If `use_embeddings` and `embeddings-*.npy` shards exist: mmap them and yield `(embedding, labels)`.
   - Else: yield `(tokens_from_exps, labels)` (slow path, but fine for sanity/development).
 - Labels: vectorized thresholding of `highest_tile` to produce a 3-bit boolean per sample; optional class weights computed once per epoch.
 
@@ -99,18 +97,18 @@ Training the critic head
 Engine implementation notes (v1)
 - One recorder thread per process that receives per-game step vectors and appends into a single session buffer (Vec<Step>).
 - On rotation/end:
-  - Write `steps.npy` once (structured dtype with the three fields).
+  - Write `steps-xxxxx.npy` shard(s) (structured dtype with the three fields).
   - Write `metadata.db` with `runs` (id, seed, steps, max_score, highest_tile) and `session` meta.
   - Atomically rename temp files into place.
 - Defaults tuned for 40k steps/s:
-  - `rotate_steps = 10_000_000` (≈250 s)
+  - `rotate_steps = 1_000_000` (≈25 s)
   - `sample_rate = 1` (keep all) — downsample if disk becomes a concern
   - No periodic time flush by default; optional `rotate_secs` can be set (e.g., 300 s) if desired.
 
 ----------------------------------------
 
 Why this is simpler
-- Exactly three artifacts per session: `steps.npy`, `embeddings-*.npy` (optional), `metadata.db`.
+- Exactly three artifact families per session: `steps-*.npy`, `embeddings-*.npy` (optional), `metadata.db`.
 - No derived step fields (rewards/done/legal) and no quantization.
 - No large matrix of tiny `.npy` columns, no new loader complexity.
 - Reuses our existing SQLite filtering story and aligns with current config patterns.
@@ -119,7 +117,7 @@ Why this is simpler
 
 Open edges (kept small on purpose)
 - If a single session grows too large, start a new session directory (session rotation) rather than introducing intra-session shard files.
-- If later we need actions or legality for auxiliary tasks, we can add an optional `action: u1` field to `steps.npy` without disturbing existing readers.
+- If later we need actions or legality for auxiliary tasks, we can add an optional `action: u1` field to `steps-*.npy` without disturbing existing readers.
 
 ----------------------------------------
 
@@ -142,9 +140,9 @@ Notes:
 Checklist
 - Engine
   - [ ] Add minimal recorder (per-game buffer → session buffer).
-  - [ ] Session rotation by step-count; final single-write `steps.npy` + `metadata.db`.
+  - [ ] Session rotation by step-count; final write `steps-*.npy` shard(s) + `metadata.db`.
   - [ ] Store `highest_tile` per run only in SQLite.
 - Python
-  - [ ] `dataloader_critic.py` (mmap `steps.npy`, derive labels via SQLite, optional embeddings path).
-  - [ ] Offline embedder that writes `embeddings.bf16.npy` row-aligned + `embeddings.json`.
+  - [ ] `dataloader_critic.py` (mmap `steps-*.npy`, derive labels via SQLite, optional embeddings path).
+  - [ ] Offline embedder that writes `embeddings-*.npy` (float32) row-aligned + `embeddings.json`.
   - [ ] `CriticHead` and training entry (config in `config/critic.example.toml`).

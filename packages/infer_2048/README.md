@@ -1,4 +1,4 @@
-## Inference server for the 2048 EV model (Torch)
+# Inference server for 2048 EV model (Torch)
 
 Thin gRPC wrapper around a single forward pass.
 
@@ -26,13 +26,25 @@ proto/train_2048/inference/v1/inference.proto
 
 Run server (module mode; works without installing console script):
 
-- UDS: uv run --project packages/infer_2048 python -m infer_2048.main --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
-- TCP: uv run --project packages/infer_2048 python -m infer_2048.main --init inits/v1_50m --tcp 127.0.0.1:50051 --device cpu
+UDS: 
+```bash
+uv run --project packages/infer_2048 python -m infer_2048.main --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
+```
+
+TCP: 
+```bash
+uv run --project packages/infer_2048 python -m infer_2048.main --init inits/v1_50m --tcp 127.0.0.1:50051
+```
 
 Or install console script for this subproject, then run the CLI name:
 
-- uv sync --project packages/infer_2048
-- uv run --project packages/infer_2048 infer-2048 --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
+```
+uv sync --project packages/infer_2048
+```
+
+```
+uv run --project packages/infer_2048 infer-2048 --init inits/v1_50m --uds unix:/tmp/2048_infer.sock --device cuda
+```
 
 ## Notes
 

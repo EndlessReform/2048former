@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Optional, List
 import os
+from pathlib import Path
 
 import grpc
 
@@ -57,8 +59,43 @@ def vlog(msg: str) -> None:
         print(msg, flush=True)
 
 
+def build_model_metadata(model: torch.nn.Module, init_dir: str) -> inference_pb2.ModelMetadata:
+    metadata = inference_pb2.ModelMetadata()
+    policy_meta = inference_pb2.PolicyMetadata()
+
+    config = getattr(model, "config", None)
+    if config is not None:
+        head_type = getattr(config, "head_type", None)
+        if head_type:
+            policy_meta.head_type = str(head_type)
+        bin_count = getattr(config, "output_n_bins", None)
+        if bin_count is not None:
+            try:
+                policy_meta.bin_count = int(bin_count)
+            except (TypeError, ValueError):
+                pass
+
+    spec_path = Path(init_dir) / "tokenizer.json"
+    if spec_path.is_file():
+        try:
+            with spec_path.open("r", encoding="utf-8") as f:
+                spec = json.load(f)
+            tokenizer_type = spec.get("tokenizer_type") or spec.get("tokenizerType")
+            if tokenizer_type:
+                policy_meta.tokenizer_type = str(tokenizer_type)
+            vocab_order = spec.get("vocab_order") or spec.get("vocabOrder")
+            if isinstance(vocab_order, list):
+                policy_meta.vocab_labels.extend([str(label) for label in vocab_order])
+        except Exception:
+            pass
+
+    if policy_meta.head_type or policy_meta.bin_count or policy_meta.tokenizer_type or len(policy_meta.vocab_labels):
+        metadata.policy.CopyFrom(policy_meta)
+    return metadata
+
+
 class InferenceService(inference_pb2_grpc.InferenceServicer):
-    def __init__(self, model: torch.nn.Module) -> None:
+    def __init__(self, model: torch.nn.Module, metadata: Optional[inference_pb2.ModelMetadata] = None) -> None:
         self.model = model
         # Reusable pinned host buffer for tokens to enable async H2D copies.
         # Allocated lazily and grown geometrically to avoid realloc thrash.
@@ -68,6 +105,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         self._dump_logits_path = os.environ.get("INFER_2048_DUMP_LOGITS_PATH")
         self._dump_done = False
         # Canonical branch/head order is UDLR everywhere. No per-model reordering.
+        self._model_metadata = metadata
 
     def _ensure_pinned_tokens(self, batch: int) -> torch.Tensor:
         cap = 0 if self._tokens_cpu is None else int(self._tokens_cpu.shape[0])
@@ -92,7 +130,12 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         B = len(items)
         vlog(f"[server] Infer start: B={B}")
         if B == 0:
-            return inference_pb2.InferResponse(batch_id=request.batch_id, item_ids=[], outputs=[], latency_ms=0)
+            resp = inference_pb2.InferResponse(
+                batch_id=request.batch_id, item_ids=[], outputs=[], latency_ms=0
+            )
+            if self._model_metadata is not None:
+                resp.model_metadata.CopyFrom(self._model_metadata)
+            return resp
 
         try:
             argmax_only: bool = bool(getattr(request, "argmax_only", False))
@@ -316,6 +359,8 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                 outputs=outputs,
                 latency_ms=latency_ms,
             )
+        if self._model_metadata is not None:
+            resp.model_metadata.CopyFrom(self._model_metadata)
         vlog(f"[server] Infer end: B={B} latency_ms={latency_ms}")
         return resp
 
@@ -370,7 +415,8 @@ async def serve_async(
             _ = forward_distributions(model, ex, set_eval=True)
         vlog("[server] warmup complete")
 
-    svc = InferenceService(model)
+    model_metadata = build_model_metadata(model, init_dir)
+    svc = InferenceService(model, metadata=model_metadata)
 
     vlog("[server] creating grpc server...")
     # Allow large batch payloads by increasing gRPC message limits (both directions).

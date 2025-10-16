@@ -53,6 +53,23 @@ message Output {
   bytes embedding = 2;
 }
 
+// Metadata describing model/tokenizer semantics for policy heads.
+message PolicyMetadata {
+  // Logical head type (e.g., "binned_ev", "action_policy").
+  string head_type = 1;
+  // Number of bins emitted per head (shared across heads).
+  uint32 bin_count = 2;
+  // Optional tokenizer identifier (e.g., "macroxue_ev_advantage_v2").
+  string tokenizer_type = 3;
+  // Optional human-readable labels for each bin (ILLEGAL, FAILURE, ... WINNER).
+  repeated string vocab_labels = 4;
+}
+
+message ModelMetadata {
+  // Policy/tokenizer metadata; future fields may cover embeddings/value heads.
+  PolicyMetadata policy = 1;
+}
+
 // Batched inference response.
 message InferResponse {
   // Echoed from request if provided.
@@ -91,6 +108,9 @@ message InferResponse {
   // len(item_ids). When empty, fall back to `outputs`.
   repeated uint32 argmax_heads = 8;
   repeated float argmax_p1 = 9;
+
+  // Optional metadata describing model/tokenizer semantics.
+  ModelMetadata model_metadata = 10;
 }
 
 service Inference {

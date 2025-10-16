@@ -9,8 +9,8 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 from threading import Thread
+from typing import Optional
 
 try:
     import tomllib  # py3.11+
@@ -99,54 +99,6 @@ def write_toml(d: dict, path: Path) -> None:
                 emit_table(fp, "orchestrator.batch", orch["batch"])  # flush_us, target_batch, ...
             if "report" in orch:
                 emit_table(fp, "orchestrator.report", orch["report"])  # results_file
-
-
-def _detect_head_type(init_dir: str) -> str:
-    """Detect model head type by inspecting weights first, then config.json.
-
-    Returns one of: 'action_policy' or 'binned_ev'. Defaults to 'binned_ev'.
-    """
-    # Prefer inspecting weights to avoid stale config.json
-    try:
-        w = Path(init_dir) / "model.safetensors"
-        if w.exists():
-            from safetensors.torch import load_file as safe_load_file  # type: ignore
-
-            state = safe_load_file(str(w))
-            keys = list(state.keys())
-            if any(k.startswith("policy_head.") for k in keys):
-                return "action_policy"
-            if any(k.startswith("ev_heads.0.") for k in keys):
-                return "binned_ev"
-    except Exception:
-        pass
-    # Fallback: config.json
-    try:
-        p = Path(init_dir) / "config.json"
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            return str(cfg.get("head_type", "binned_ev"))
-    except Exception:
-        pass
-    return "binned_ev"
-
-
-def _adjust_client_cfg_for_model(cfg: dict, head_type: str) -> dict:
-    """Return a copy of cfg adjusted for the model's head_type.
-
-    - For action_policy: prefer head_order=UDLR; allow non-argmax sampling (server returns per-move probs as 4 single-bin heads).
-    - For binned_ev: prefer head_order=UDLR if missing (matches training pipeline).
-    """
-    c = json.loads(json.dumps(cfg))  # deep copy
-    orch = c.setdefault("orchestrator", {})
-    if head_type == "action_policy":
-        # Our policy head is trained in UDLR order; do not force argmax_only
-        orch.setdefault("head_order", "UDLR")
-    else:
-        # Training dataloader standardizes to UDLR order
-        orch.setdefault("head_order", "UDLR")
-    return c
 
 
 def _sampling_grid_variants(base_cfg: dict) -> list[tuple[str, dict]]:
@@ -276,11 +228,8 @@ def _write_grid_csv_summary(outdir: Path, rows: list[dict]) -> None:
             fp.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
 
 
-def make_client_cfg(base_cfg_path: Path, rp: RunPaths, uds: Optional[str], tcp: Optional[str], *, init_dir: Optional[str] = None) -> Path:
+def make_client_cfg(base_cfg_path: Path, rp: RunPaths, uds: Optional[str], tcp: Optional[str]) -> Path:
     cfg = read_toml(base_cfg_path)
-    if init_dir:
-        head_type = _detect_head_type(init_dir)
-        cfg = _adjust_client_cfg_for_model(cfg, head_type)
     # Ensure nested tables exist
     orch = cfg.setdefault("orchestrator", {})
     conn = orch.setdefault("connection", {})
@@ -481,6 +430,8 @@ def start_client(client_cfg: Path, release: bool) -> int:
         "run",
         "-p",
         "game-engine",
+        "--bin",
+        "game-engine",
     ]
     if release:
         cmd.append("--release")
@@ -552,7 +503,12 @@ def main() -> None:
     # If no grid present, behave like before with a single config.
     single_cfg = None
     if len(variants) == 1 and variants[0][0] == "base":
-        client_cfg = make_client_cfg(Path(args.config), rp, uds=uds_norm[5:] if uds_norm else None, tcp=tcp_norm, init_dir=args.init)
+        client_cfg = make_client_cfg(
+            Path(args.config),
+            rp,
+            uds=uds_norm[5:] if uds_norm else None,
+            tcp=tcp_norm,
+        )
         single_cfg = client_cfg
         print(f"[bench] output dir: {rp.outdir}")
         print(f"[bench] server: device={server_device} compile={args.compile_mode} bind={bind}")
@@ -583,7 +539,6 @@ def main() -> None:
 
     # Start server (once for all variants)
     # Propagate client's intended head order to server so outputs are normalized consistently.
-    head_order = "UDLR"
     srv = start_server(
         args.init,
         uds_norm or tcp_norm,

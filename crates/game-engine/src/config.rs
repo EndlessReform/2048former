@@ -159,7 +159,7 @@ impl SamplingStrategy {
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
-pub struct Config {
+pub struct AnnotationConfig {
     /// Optional: number of games to run. If omitted, the orchestrator will run until `max_steps` is reached.
     #[serde(default)]
     pub num_seeds: Option<u32>,
@@ -167,15 +167,22 @@ pub struct Config {
     #[serde(default)]
     pub max_steps: Option<u64>,
     /// Max per-actor games scheduled concurrently.
-    pub max_concurrent_games: u32,
+    #[serde(default)]
+    pub max_concurrent_games: Option<u32>,
     /// Transient RPC retry attempts (batch-level).
-    pub max_retries: u32,
-
-    pub sampling: SamplingStrategy,
+    #[serde(default)]
+    pub max_retries: Option<u32>,
 
     // Group orchestrator-specific settings under one nested key.
     #[serde(default)]
     pub orchestrator: Orchestrator,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct Config {
+    #[serde(flatten)]
+    pub base: AnnotationConfig,
+    pub sampling: SamplingStrategy,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -262,6 +269,18 @@ impl Default for Batch {
             metrics_file: None,
             metrics_interval_s: defaults::metrics_interval_s(),
         }
+    }
+}
+
+impl AnnotationConfig {
+    pub fn from_toml<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut file = std::fs::File::open(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let cfg: Self = toml::from_str(&contents)?;
+        Ok(cfg)
     }
 }
 

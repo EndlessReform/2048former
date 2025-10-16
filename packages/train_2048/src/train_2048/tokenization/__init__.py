@@ -4,8 +4,11 @@ from .macroxue import (
     ACTIONS,
     MacroxueTokenizer,
     MacroxueTokenizerSpec,
+    MacroxueTokenizerV2,
+    MacroxueTokenizerV2Spec,
     TokenizedState,
     fit_macroxue_tokenizer,
+    fit_macroxue_tokenizer_v2,
 )
 
 __all__ = [
@@ -14,4 +17,7 @@ __all__ = [
     "MacroxueTokenizerSpec",
     "TokenizedState",
     "fit_macroxue_tokenizer",
+    "MacroxueTokenizerV2",
+    "MacroxueTokenizerV2Spec",
+    "fit_macroxue_tokenizer_v2",
 ]

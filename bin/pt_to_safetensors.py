@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> None:
         raise FileNotFoundError(f"No .pt file found at {args.pt_path}")
 
     bundle = _load_bundle(args.pt_path)
+    for meta_key in ("resume", "dataset"):
+        if meta_key in bundle:
+            print(f"[convert] Stripping '{meta_key}' metadata from {args.pt_path}")
     model_state = bundle.get("model")
     if not isinstance(model_state, dict):
         raise ValueError("Bundle 'model' entry is not a state_dict")

@@ -10,12 +10,12 @@ import torch
 from .model import Encoder, EncoderConfig
 
 
-def _load_pt_bundle(path: Path) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict[str, Any]]:
-    """Return (state_dict, encoder_config) extracted from a saved .pt bundle."""
+def _load_pt_bundle(path: Path) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict[str, Any], Dict[str, Any]]:
+    """Return (state_dict, encoder_config, bundle_meta) extracted from a saved .pt bundle."""
 
     bundle = torch.load(str(path), map_location="cpu")
     if not isinstance(bundle, dict):
-        return None, {}
+        return None, {}, {}
 
     state = bundle.get("model")
     state_dict: Optional[Dict[str, torch.Tensor]] = None
@@ -37,7 +37,9 @@ def _load_pt_bundle(path: Path) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict
             if isinstance(maybe_encoder, dict):
                 enc_cfg_dict = dict(maybe_encoder)
 
-    return state_dict, enc_cfg_dict
+    bundle_meta = {k: v for k, v in bundle.items() if k not in ("model", "optimizer")}
+
+    return state_dict, enc_cfg_dict, bundle_meta
 
 
 def load_encoder_from_init(init_dir: str) -> Encoder:
@@ -52,6 +54,8 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     """
     init_path = Path(init_dir)
     enc_cfg_dict: Optional[Dict[str, Any]] = None
+    bundle_meta: Optional[Dict[str, Any]] = None
+    init_info: Dict[str, Any] = {"init_path": str(init_path)}
 
     # Load encoder config either from config.json (directory case) or from the
     # checkpoint payload (file case / fallback).
@@ -65,45 +69,59 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
         # from the file. This mirrors the directory flow and allows users to
         # pass a single .pt checkpoint as the init.
         if init_path.suffix.lower() in {".pt", ".pth"} and init_path.is_file():
-            _, enc_cfg_payload = _load_pt_bundle(init_path)
+            _, enc_cfg_payload, bundle_meta = _load_pt_bundle(init_path)
             if enc_cfg_payload:
                 enc_cfg_dict = enc_cfg_payload
+            init_info["weights_type"] = "pt"
+            init_info["weights_path"] = str(init_path)
+            init_info["available_pt"] = [str(init_path)]
 
     # Discover weights (prefer safetensors when available).
     weight_candidates = []
     pt_candidates = []
     if init_path.is_dir():
+        # Prefer final or best checkpoints by default. "model-stable" is a
+        # pre-decay snapshot saved early in training for some schedules; keep it
+        # as a fallback so inference does not accidentally load an undertrained
+        # model when a final checkpoint is available.
         weight_candidates = [
             init_path / "model-best.safetensors",
-            init_path / "model-stable.safetensors",
             init_path / "model.safetensors",
             init_path / "model-final.safetensors",
+            init_path / "model-stable.safetensors",
         ]
         pt_candidates = [
-            init_path / "model-stable.pt",
+            init_path / "model-best.pt",
             init_path / "model.pt",
+            init_path / "model-stable.pt",
         ]
+        init_info["available_pt"] = [str(p) for p in pt_candidates if p.is_file()]
     else:
         if init_path.suffix.lower() in {".safetensors", ".bin"}:
             weight_candidates = [init_path]
         elif init_path.suffix.lower() in {".pt", ".pth"}:
             pt_candidates = [init_path]
+            init_info.setdefault("available_pt", []).append(str(init_path))
 
     weights_path = next((p for p in weight_candidates if p.is_file()), None)
     state: Optional[Dict[str, torch.Tensor]] = None
     if weights_path is not None:
         s = safe_load_file(str(weights_path))
         state = normalize_state_dict_keys(s)
+        init_info["weights_path"] = str(weights_path)
+        init_info["weights_type"] = "safetensors"
     else:
         pt_path = next((p for p in pt_candidates if p.is_file()), None)
         if pt_path is not None:
             try:
-                state, enc_cfg_payload = _load_pt_bundle(pt_path)
+                state, enc_cfg_payload, bundle_meta = _load_pt_bundle(pt_path)
                 if enc_cfg_payload:
                     if enc_cfg_dict is None:
                         enc_cfg_dict = enc_cfg_payload
                     else:
                         enc_cfg_dict.update(enc_cfg_payload)
+                init_info["weights_path"] = str(pt_path)
+                init_info["weights_type"] = "pt"
             except Exception:
                 state = None
 
@@ -144,6 +162,12 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
         except Exception:
             # Fallback to non-strict if keys still mismatch after normalization
             model.load_state_dict(state, strict=False)
+
+    if bundle_meta is not None:
+        init_info["bundle_metadata"] = bundle_meta
+    if "weights_type" not in init_info:
+        init_info["weights_type"] = "random"
+    setattr(model, "_init_load_info", init_info)
 
     return model
 

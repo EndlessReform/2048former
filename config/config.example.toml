@@ -34,7 +34,12 @@ eps = 1e-8
 
 [batch]
 batch_size = 1024
-# micro_batch_size = 256
+# micro_batch_size = 256         # optional per-device micro batch; enables grad accumulation
+
+[batch.adaptive]
+enabled = false
+double_at_lr_ratio = 0.5
+quadruple_at_lr_ratio = 0.25
 
 [dropout]
 dropout_prob = 0.1
@@ -72,6 +77,12 @@ val_split_seed = 42
 
 # Validate every N training steps (0 disables)
 val_every = 1000
+
+# Shard locality controls (optional). Enable to keep one shard in RAM and shuffle locally.
+# shard_locality = true
+# shard_locality_block_size = 500000    # Draw at most this many rows per shard before rotating
+# shard_cache_in_memory = true          # Materialise the active shard into RAM
+# shard_cache_keep_shards = 1           # Number of cached shards to retain simultaneously
 
 [checkpoint]
 # every_epochs = 1
