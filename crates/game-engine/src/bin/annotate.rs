@@ -21,6 +21,9 @@ struct Args {
     /// Optional: limit number of steps to annotate (for smoke tests)
     #[arg(long, value_name = "N")]
     limit: Option<usize>,
+    /// Opt-in: only persist top-1 summary (skip student bin sidecar)
+    #[arg(long)]
+    p1_only: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -34,6 +37,7 @@ async fn main() -> Result<()> {
         output_dir: args.output,
         overwrite: args.overwrite,
         limit: args.limit,
+        p1_only: args.p1_only,
         config: cfg,
     })
     .await

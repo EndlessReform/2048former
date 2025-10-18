@@ -184,6 +184,6 @@ Config changes
 - Checkpoints are still written into the `checkpoint_dir` from the active config, so update it if you want the resumed run to land in a new folder.
 - `[checkpoint].save_pt_every_steps` dumps numbered `model-step-XXXXXXXX.pt` bundles that include optimizer state for straight resumes.
 - Validation best checkpoints now write `model-best.pt` bundles; convert to safetensors for inference with `uv run python bin/pt_to_safetensors.py <path/to/model-best.pt> --write-config`.
-- Learning rate schedulers support `constant`, `warmup-stable-decay`, or `cosine` (with optional warmup).
+- Learning rate schedulers support `constant`, `warmup-stable-decay`, `cosine`, or `linear` (with optional warmup).
 - Gradient accumulation is managed through `batch.micro_batch_size`; the loader emits the micro batch while the trainer accumulates updates until it reaches `batch.batch_size`.
 - With `batch.adaptive` enabled (cosine LR only), the harness doubles the effective batch once the learning rate falls to 50% of its peak and quadruples it at 25%, keeping the physical micro batch unchanged.

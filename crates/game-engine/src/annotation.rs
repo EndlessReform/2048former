@@ -7,12 +7,15 @@ use dataset_packer::schema::{
 };
 use dataset_packer::writer::StepsWriter;
 use futures::stream::{FuturesUnordered, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use log::info;
-use npyz::WriterBuilder;
+use npyz::{NpyFile, WriterBuilder};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::feeder::{self, InferenceOutput};
@@ -34,6 +37,8 @@ pub struct JobConfig {
     pub output_dir: PathBuf,
     pub overwrite: bool,
     pub limit: Option<usize>,
+    /// When true, skip writing student bin sidecar; persist only top-1 summary
+    pub p1_only: bool,
     pub config: config::AnnotationConfig,
 }
 
@@ -74,8 +79,15 @@ pub async fn run(job: JobConfig) -> Result<()> {
         Some(shard_max),
         job.overwrite,
     )?;
-    let mut student_writer =
-        StudentBinsWriter::new(&job.output_dir, Some(shard_max), job.overwrite)?;
+    let mut student_writer = if job.p1_only {
+        None
+    } else {
+        Some(StudentBinsWriter::new(
+            &job.output_dir,
+            Some(shard_max),
+            job.overwrite,
+        )?)
+    };
 
     let mut run_masks: HashMap<u32, u8> = HashMap::new();
 
@@ -95,6 +107,29 @@ pub async fn run(job: JobConfig) -> Result<()> {
     );
 
     copy_metadata(&job.dataset_dir, &job.output_dir, &kind, job.overwrite)?;
+
+    let total_steps = count_total_steps(&step_files)?;
+    let target_steps = job
+        .limit
+        .map(|limit| limit.min(total_steps))
+        .unwrap_or(total_steps);
+    let progress = if target_steps > 0 {
+        let pb = ProgressBar::new(target_steps as u64);
+        let style = ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} steps ({per_sec} steps/s, ETA {eta})",
+        )
+        .expect("progress bar template should be valid");
+        pb.set_style(style);
+        pb.set_message("annotating");
+        pb.enable_steady_tick(Duration::from_secs(5));
+        Some(pb)
+    } else {
+        None
+    };
+    info!(
+        "Annotation target: {} steps (limit {:?}, dataset total {})",
+        target_steps, job.limit, total_steps
+    );
 
     let max_inflight = pipeline::max_inflight_items(&job.config.orchestrator.batch).max(1);
     let mut inflight: FuturesUnordered<_> = FuturesUnordered::new();
@@ -131,6 +166,7 @@ pub async fn run(job: JobConfig) -> Result<()> {
                                 &mut writer,
                                 &mut student_writer,
                                 &mut run_masks,
+                                progress.as_ref(),
                             )?;
                         }
                     }
@@ -162,6 +198,7 @@ pub async fn run(job: JobConfig) -> Result<()> {
                                 &mut writer,
                                 &mut student_writer,
                                 &mut run_masks,
+                                progress.as_ref(),
                             )?;
                         }
                     }
@@ -184,6 +221,7 @@ pub async fn run(job: JobConfig) -> Result<()> {
             &mut writer,
             &mut student_writer,
             &mut run_masks,
+            progress.as_ref(),
         )?;
     }
 
@@ -193,11 +231,17 @@ pub async fn run(job: JobConfig) -> Result<()> {
         &mut writer,
         &mut student_writer,
         &mut run_masks,
+        progress.as_ref(),
     )?;
 
     writer.finish()?;
-    student_writer.finish()?;
-    let student_bin_count = student_writer.bin_count().unwrap_or(0);
+    if let Some(w) = student_writer.as_mut() {
+        w.finish()?;
+    }
+    let student_bin_count = student_writer
+        .as_ref()
+        .and_then(|w| w.bin_count())
+        .unwrap_or(0);
 
     write_manifest(
         &job.output_dir,
@@ -205,6 +249,10 @@ pub async fn run(job: JobConfig) -> Result<()> {
         student_bin_count,
         job.overwrite,
     )?;
+
+    if let Some(progress) = &progress {
+        progress.finish_with_message("annotation complete");
+    }
 
     info!(
         "Annotation finished: wrote {} steps across {} runs into {}",
@@ -218,6 +266,23 @@ pub async fn run(job: JobConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn count_total_steps(step_files: &[PathBuf]) -> Result<usize> {
+    let mut total: usize = 0;
+    for path in step_files {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open shard {}", path.display()))?;
+        let mut reader = std::io::BufReader::new(file);
+        let npy = NpyFile::new(&mut reader)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        let shard_len = usize::try_from(npy.len())
+            .map_err(|_| anyhow!("shard {} exceeds usize::MAX entries", path.display()))?;
+        total = total
+            .checked_add(shard_len)
+            .ok_or_else(|| anyhow!("total step count exceeds usize::MAX"))?;
+    }
+    Ok(total)
 }
 
 async fn consume_result(
@@ -326,7 +391,7 @@ async fn consume_result(
 fn write_result(
     output: AnnotatedOutput,
     writer: &mut StepsWriter<AnnotationRow>,
-    bins_writer: &mut StudentBinsWriter,
+    bins_writer: &mut Option<StudentBinsWriter>,
     run_masks: &mut HashMap<u32, u8>,
 ) -> Result<()> {
     let AnnotatedOutput {
@@ -339,8 +404,8 @@ fn write_result(
         .entry(annotation.run_id)
         .and_modify(|mask| *mask |= annotation.policy_kind_mask)
         .or_insert(annotation.policy_kind_mask);
-    if let Some(payload) = bins {
-        bins_writer.write(payload.bin_count, &payload.probs)?;
+    if let (Some(writer), Some(payload)) = (bins_writer.as_mut(), bins) {
+        writer.write(payload.bin_count, &payload.probs)?;
         *entry |= annotation_kinds::POLICY_STUDENT_BINS;
     }
     Ok(())
@@ -350,11 +415,15 @@ fn flush_ready_outputs(
     buffer: &mut BTreeMap<u64, AnnotatedOutput>,
     next_seq: &mut u64,
     writer: &mut StepsWriter<AnnotationRow>,
-    bins_writer: &mut StudentBinsWriter,
+    bins_writer: &mut Option<StudentBinsWriter>,
     run_masks: &mut HashMap<u32, u8>,
+    progress: Option<&ProgressBar>,
 ) -> Result<()> {
     while let Some(output) = buffer.remove(&*next_seq) {
         write_result(output, writer, bins_writer, run_masks)?;
+        if let Some(pb) = progress {
+            pb.inc(1);
+        }
         *next_seq += 1;
     }
     Ok(())

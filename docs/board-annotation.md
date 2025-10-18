@@ -181,3 +181,384 @@ The `--tokenizer` flag is optional and enables tokenization features for the UI.
 
 - Persist inline embeddings (opt-in) so later tools can join similarity search with the existing annotation flow.
 - Add streaming pagination to `/runs/:id` plus list virtualization in the viewer so multi-million-step packs stay responsive.
+
+## Rejection Sampling (proposal)
+
+Offline rejection sampling will piggyback on the annotation sidecars and produce training-ready indices without rewriting the dataset shards. The immediate target is teacher-supervised training; we only need the summary rows and `policy_p1`, but we leave enough structure to support richer disagreement heuristics later.
+
+### Filter surface
+
+We will introduce a small `FilterSpec` abstraction in Python (`train_2048.annotation.filters`) that converts a named filter plus optional parameters into a boolean mask over annotation rows. Initial support covers `student_wrong_p1`, defined as `teacher_move` being legal and not matching the `argmax_head` inferred from `policy_p1`. The dispatcher accepts a dataclass payload (`FilterSpec(name: str, params: dict[str, Any] | None = None)`) so future filters can reuse thresholds or combine features without changing the call-site shape. Filters return an `np.ndarray` of indices compatible with `StepsDataset`, and we cache results under `annotations/<run>/filters/<filter_id>.npy` to avoid repeated scans.
+
+### Mixing and annealing
+
+Data mixes are described in TOML under a new `[rejection]` section consumed by the training CLI. Each entry names the dataset, the paired annotation directory, the filter spec, and a target fraction. Optional `phase.until_epoch` keys allow annealing: when the current epoch exceeds the boundary we advance to the next mix definition. Fractions are normalized per phase, then converted into target sample counts by multiplying against the desired batch budget.
+
+```toml
+[rejection]
+cache_dir = "datasets/rejection_cache"
+
+[[rejection.phases]]
+until_epoch = 10
+[[rejection.phases.mix]]
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "student_wrong_p1" }
+weight = 0.85
+[[rejection.phases.mix]]
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "all" }
+weight = 0.10
+[[rejection.phases.mix]]
+dataset = "datasets/teacher_depth6"
+annotation = "annotations/teacher_depth6"
+filter = { name = "all" }
+weight = 0.05
+
+[[rejection.phases]]
+# Falls back to the last phase when `until_epoch` is omitted.
+[[rejection.phases.mix]]
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "student_wrong_p1" }
+weight = 0.25
+[[rejection.phases.mix]]
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "all" }
+weight = 0.50
+[[rejection.phases.mix]]
+dataset = "datasets/teacher_depth6"
+annotation = "annotations/teacher_depth6"
+filter = { name = "all" }
+weight = 0.25
+```
+
+At runtime we materialise per-mix index arrays (sampling with replacement when the filter set is smaller than the requested draw) and wrap them in a lightweight `WeightedBatchSampler`. Annealing phases swap the active sampler at epoch boundaries, so schedulers only need to reinitialise once per phase.
+
+### Runtime workflow
+
+1. Resolve the mix phase from the training epoch; lazily load (or reuse) cached filter indices.
+2. Join the step indices back to `StepsDataset` through `run_id`/`step_index` pairs pulled from the annotation summary rows.
+3. Materialise a concatenated index buffer per mix weight, shuffling in place before every epoch to preserve randomness.
+4. Deliver balanced batches by chunking the mixed buffer in training order while keeping a record of the originating mix for logging and metrics.
+
+### Open questions
+
+- How should we expose per-source sampling stats to the trainer logs so we can monitor annealing drift without adding W&B?
+- Do we need a guardrail when the requested fraction exceeds the number of disagreement steps, or is sampling with replacement acceptable for early experiments?
+- Should we extend the `annotation_manifest.json` to advertise available filter inputs (e.g., `policy_logp`, `argmax_prob`) before the Python side assumes they exist?
+- Are depth-specific mixes better referenced by a short alias in the config (e.g., `source = "depth8.recent"`) instead of raw paths for long-term maintainability?
+
+## Counter-Proposal: Rejection Sampling Design
+
+After reviewing the original proposal, the codebase, and the existing training pipeline, here's my counter-proposal for rejection sampling implementation. I largely agree with the original direction but suggest some refinements for cleaner integration and better extensibility.
+
+### What the Original Got Right
+
+1. **Filters as cached index arrays**: Precomputing filter results and caching them as `.npy` files is smart—avoids repeated scans and integrates naturally with the existing shard/mmap infrastructure.
+
+2. **TOML-based mix specification**: Using `[[rejection.phases]]` to describe data mixes aligns perfectly with the existing config patterns in `config.py` and keeps experiment definitions declarative.
+
+3. **Annealing via phases**: Epoch-based phase transitions are simple and fit naturally into the existing training loop structure.
+
+4. **FilterSpec abstraction**: A dataclass-based filter spec (`FilterSpec(name: str, params: dict[str, Any])`) provides the right balance of simplicity and extensibility.
+
+### Suggested Changes
+
+#### 1. **Simpler mix identity and caching**
+
+Instead of computing a filter ID from hashing the filter spec, use a **user-provided mix ID** in the TOML. This makes debugging easier and gives operators explicit control over cache invalidation:
+
+```toml
+[[rejection.phases.mix]]
+id = "d8_wrong_p1"  # explicit cache key
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "student_wrong_p1" }
+weight = 0.85
+```
+
+Cache path becomes: `{cache_dir}/{mix_id}.npy` instead of `{annotation_dir}/filters/{filter_hash}.npy`. This also centralizes all rejection artifacts under one `cache_dir` rather than scattering them across annotation directories.
+
+#### 2. **Decouple filter implementation from data loading**
+
+The original proposes `train_2048.annotation.filters` as a Python module. I suggest a slightly different structure:
+
+- **`train_2048/dataloader/filters.py`**: Core filter registry and dispatcher
+- **`train_2048/dataloader/rejection.py`**: Mix resolution, phase management, and sampler construction
+- **CLI tool: `build-rejection-cache`**: Standalone script to precompute and cache filter indices before training
+
+This separation keeps the dataloader module cohesive and makes it trivial to dry-run filter logic without launching a full training job.
+
+**Example CLI usage:**
+```bash
+uv run build-rejection-cache \
+  --config config/rejection/depth8-mix.toml \
+  --validate  # Check all filters work, report stats, but don't cache
+```
+
+#### 3. **Filter return value: structured metadata**
+
+Instead of returning just an index array, filters should return a small dataclass:
+
+```python
+@dataclass
+class FilterResult:
+    indices: np.ndarray      # global step indices
+    metadata: dict[str, Any] # optional stats (count, coverage, etc.)
+```
+
+This lets us log per-filter statistics (e.g., "student_wrong_p1 matched 12.3% of steps") directly into the training logs or W&B without re-scanning data. The metadata can include:
+- Match count
+- Coverage percentage
+- Min/max step indices (for sanity checks)
+
+#### 4. **Join annotations to steps via a lightweight index, not run_id/step_index pairs**
+
+The original proposes joining back to `StepsDataset` through `(run_id, step_index)` pairs. This requires either:
+- Loading metadata.db to build a lookup map, or
+- Assuming annotations and steps are perfectly aligned (which they are!)
+
+Since the annotation engine already guarantees alignment (see `annotation.rs:106-370`—the ordered buffer ensures deterministic write order), we can **directly use annotation shard indices as global step indices**. No joins needed.
+
+**Concretely:**
+1. Filter scans `annotations-*.npy` shards and collects matching row indices
+2. Returns global annotation indices (0-based across all annotation shards)
+3. Training dataloader treats annotation indices == step indices (since they're 1:1 aligned)
+
+This assumes we're only filtering annotated datasets, which is correct for rejection sampling (you need student predictions to determine disagreements).
+
+#### 5. **Explicit "passthrough" filter instead of special-casing `all`**
+
+The original uses `filter = { name = "all" }` to sample randomly from an entire dataset. I suggest being more explicit:
+
+```toml
+[[rejection.phases.mix]]
+id = "d8_random"
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "passthrough" }  # or "random_all"
+weight = 0.10
+```
+
+This makes it clear that you're not applying a disagreement filter. Under the hood, `passthrough` just returns `np.arange(dataset_length)`.
+
+#### 6. **Sampling with replacement: make it configurable per mix**
+
+When a filter matches fewer steps than the requested draw size, the original proposal mentions "sampling with replacement." I suggest making this **opt-in per mix**:
+
+```toml
+[[rejection.phases.mix]]
+id = "d8_wrong_p1_upsampled"
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "student_wrong_p1" }
+weight = 0.25
+upsample = true  # sample with replacement if filter size < requested draw
+```
+
+Default behavior (`upsample = false`) should **warn and clip** instead of silently duplicating data. This catches config errors early.
+
+#### 7. **Config validation and dry-run mode**
+
+Add a `--validate-config` flag to the training CLI that:
+1. Resolves all phases and mixes
+2. Runs all filters and reports match counts
+3. Computes expected samples per epoch per mix
+4. Prints warnings about upsampling or empty filters
+5. Exits without starting training
+
+This helps catch TOML typos and filter logic bugs before burning GPU hours.
+
+#### 8. **Per-source batch logging**
+
+To monitor annealing and data balance, emit per-mix sample counts as part of the standard training logs (not just W&B). For example:
+
+```
+[Epoch 1, Step 500] loss=0.234 acc=0.821 mix_samples={d8_wrong_p1: 425, d8_random: 50, d6_anneal: 25}
+```
+
+This can be done cheaply by maintaining a counter dict in the sampler and flushing it every `report_every` steps.
+
+### Proposed TOML Schema (Refined)
+
+```toml
+[rejection]
+# Centralized cache for all filter indices
+cache_dir = "datasets/rejection_cache"
+# Validation mode: compute stats but don't create mix samplers
+validate_only = false
+
+[[rejection.phases]]
+# Optional: specify until which epoch this phase runs (omit for final phase)
+until_epoch = 10
+
+[[rejection.phases.mix]]
+# Unique identifier for caching and logging
+id = "d8_errors"
+# Source dataset and annotation directory
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+# Filter specification
+filter = { name = "student_wrong_p1" }
+# Mix weight (normalized within phase)
+weight = 0.85
+# Optional: allow sampling with replacement if filter size < draw size
+upsample = false
+
+[[rejection.phases.mix]]
+id = "d8_baseline"
+dataset = "datasets/teacher_depth8"
+annotation = "annotations/teacher_depth8"
+filter = { name = "passthrough" }
+weight = 0.10
+
+[[rejection.phases.mix]]
+id = "d6_anneal"
+dataset = "datasets/teacher_depth6"
+annotation = "annotations/teacher_depth6"
+filter = { name = "passthrough" }
+weight = 0.05
+
+[[rejection.phases]]
+# Second phase (runs from epoch 11 onward)
+[[rejection.phases.mix]]
+id = "d8_errors"  # reuse cached filter
+weight = 0.25
+upsample = true
+
+[[rejection.phases.mix]]
+id = "d8_baseline"
+weight = 0.50
+
+[[rejection.phases.mix]]
+id = "d6_anneal"
+weight = 0.25
+```
+
+### Implementation Sketch
+
+**`train_2048/dataloader/filters.py`:**
+```python
+from dataclasses import dataclass
+import numpy as np
+
+@dataclass
+class FilterResult:
+    indices: np.ndarray
+    metadata: dict[str, Any]
+
+class FilterRegistry:
+    _filters = {}
+
+    @classmethod
+    def register(cls, name: str):
+        def decorator(fn):
+            cls._filters[name] = fn
+            return fn
+        return decorator
+
+    @classmethod
+    def apply(cls, name: str, annotation_rows: np.ndarray, params: dict) -> FilterResult:
+        if name not in cls._filters:
+            raise ValueError(f"Unknown filter: {name}")
+        return cls._filters[name](annotation_rows, params)
+
+@FilterRegistry.register("student_wrong_p1")
+def filter_student_wrong_p1(rows: np.ndarray, params: dict) -> FilterResult:
+    """Select steps where teacher move is legal but student argmax disagrees."""
+    teacher_move = rows["teacher_move"]
+    legal_mask = rows["legal_mask"]
+    argmax_head = rows["argmax_head"]
+
+    # Teacher move must be valid (<4) and legal
+    valid = teacher_move < 4
+    legal = ((legal_mask >> teacher_move) & 1) == 1
+    # Student argmax differs from teacher
+    disagrees = argmax_head != teacher_move
+
+    mask = valid & legal & disagrees
+    indices = np.where(mask)[0]
+
+    return FilterResult(
+        indices=indices,
+        metadata={
+            "count": len(indices),
+            "coverage": len(indices) / len(rows) if len(rows) > 0 else 0.0,
+        }
+    )
+
+@FilterRegistry.register("passthrough")
+def filter_passthrough(rows: np.ndarray, params: dict) -> FilterResult:
+    """Return all indices (no filtering)."""
+    indices = np.arange(len(rows))
+    return FilterResult(
+        indices=indices,
+        metadata={"count": len(indices), "coverage": 1.0}
+    )
+```
+
+**`train_2048/dataloader/rejection.py`:**
+```python
+from pathlib import Path
+import numpy as np
+from .filters import FilterRegistry, FilterResult
+
+def load_or_build_filter_cache(
+    cache_dir: Path,
+    mix_id: str,
+    annotation_dir: Path,
+    filter_name: str,
+    filter_params: dict,
+) -> FilterResult:
+    """Load cached filter indices or compute and cache them."""
+    cache_path = cache_dir / f"{mix_id}.npy"
+    meta_path = cache_dir / f"{mix_id}.json"
+
+    if cache_path.exists() and meta_path.exists():
+        # Load from cache
+        indices = np.load(cache_path)
+        with open(meta_path) as f:
+            metadata = json.load(f)
+        return FilterResult(indices=indices, metadata=metadata)
+
+    # Load annotation shards and apply filter
+    annotation_rows = load_annotation_shards(annotation_dir)
+    result = FilterRegistry.apply(filter_name, annotation_rows, filter_params)
+
+    # Cache results
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, result.indices)
+    with open(meta_path, "w") as f:
+        json.dump(result.metadata, f)
+
+    return result
+```
+
+### Summary of Changes from Original Proposal
+
+| Aspect | Original | Counter-Proposal |
+|--------|----------|------------------|
+| Cache location | `annotations/<run>/filters/` | `{cache_dir}/{mix_id}.npy` |
+| Mix identification | Implicit filter hash | Explicit `id` field |
+| Filter return type | `np.ndarray` | `FilterResult(indices, metadata)` |
+| "All" filter | `filter = { name = "all" }` | `filter = { name = "passthrough" }` |
+| Upsampling | Implicit when needed | Explicit `upsample` flag per mix |
+| Join strategy | `(run_id, step_index)` lookup | Direct index alignment (annotations == steps) |
+| Validation | Runtime errors | CLI `--validate-config` mode |
+| Logging | W&B-only (question) | Per-mix counters in standard logs |
+| CLI tooling | None | `build-rejection-cache` for pre-caching |
+
+### Open Questions (Updated)
+
+1. **Should we allow filtering on non-annotated datasets?** Current design assumes rejection sampling only makes sense with annotations. If we want to support "random sample from depth-6 without annotations," we'd need to adjust the filter to work directly on step shards.
+
+2. **How to handle annotation/step length mismatches?** Should we validate that `len(annotations) == len(steps)` at cache build time and error loudly if they don't match?
+
+3. **Per-mix shuffle behavior?** Should each mix's indices be shuffled before sampling, or should we shuffle the concatenated mix buffer? Original proposal mentions "shuffling in place before every epoch"—where exactly?
+
+4. **Should filter params support templating?** For example, `filter = { name = "top_k_disagreements", params = { k = 10000 } }` could be useful for selecting only the N worst mistakes. Worth including now or defer?
+
+5. **Backwards compatibility**: If `[rejection]` section is absent, training should fall back to existing `[dataset]` behavior. Should we warn if both are present, or allow `rejection` to override `dataset`?

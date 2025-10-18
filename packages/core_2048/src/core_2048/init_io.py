@@ -58,7 +58,9 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     init_info: Dict[str, Any] = {"init_path": str(init_path)}
 
     # Load encoder config either from config.json (directory case) or from the
-    # checkpoint payload (file case / fallback).
+    # checkpoint payload (file case / fallback). If pointed at a specific file,
+    # also check its parent directory for config.json to support safetensors-only
+    # resumes.
     if init_path.is_dir():
         cfg_path = init_path / "config.json"
         if cfg_path.is_file():
@@ -75,6 +77,11 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
             init_info["weights_type"] = "pt"
             init_info["weights_path"] = str(init_path)
             init_info["available_pt"] = [str(init_path)]
+        if enc_cfg_dict is None:
+            cfg_path = init_path.parent / "config.json"
+            if cfg_path.is_file():
+                with cfg_path.open("r", encoding="utf-8") as f:
+                    enc_cfg_dict = json.load(f)
 
     # Discover weights (prefer safetensors when available).
     weight_candidates = []
@@ -127,6 +134,8 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
 
     # If we loaded any state, infer additional config from it
     if isinstance(state, dict):
+        if enc_cfg_dict is None:
+            enc_cfg_dict = {}
         # Infer head type and dimensions
         head_type = enc_cfg_dict.get("head_type", "binned_ev")
         if any(k.startswith("policy_head.") for k in state.keys()):

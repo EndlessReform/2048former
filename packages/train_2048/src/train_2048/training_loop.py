@@ -332,6 +332,19 @@ def make_scheduler(cfg: TrainingConfig, optimizer: torch.optim.Optimizer, total_
     elif lr_cfg.name == "cosine":
         decay_steps = max(0, total_steps - warmup_steps)
         decay_start_step = warmup_steps  # cosine begins immediately after warmup
+    elif lr_cfg.name == "linear":
+        cooldown_pct = getattr(lr_cfg, "cooldown_pct", None)
+        if total_steps > 0 and cooldown_pct:
+            decay_steps = int(math.ceil(total_steps * float(cooldown_pct)))
+        else:
+            decay_steps = int(lr_cfg.decay_steps or 0)
+            if decay_steps <= 0 and total_steps > 0:
+                decay_steps = max(0, total_steps - warmup_steps)
+        if total_steps > 0:
+            decay_steps = max(0, min(decay_steps, max(total_steps - warmup_steps, 0)))
+        else:
+            decay_steps = max(0, decay_steps)
+        decay_start_step = warmup_steps
 
     def scale_for_step(step_idx: int) -> float:
         if lr_cfg.name == "constant" or total_steps <= 0:
@@ -347,6 +360,12 @@ def make_scheduler(cfg: TrainingConfig, optimizer: torch.optim.Optimizer, total_
             frac = float(progress) / float(decay_steps)
             cosine = 0.5 * (1.0 + math.cos(math.pi * frac))
             return lr_cfg.min_lr_ratio + (1.0 - lr_cfg.min_lr_ratio) * cosine
+        elif lr_cfg.name == "linear":
+            if decay_steps <= 0:
+                return 1.0
+            progress = max(0, min(step_idx - warmup_steps, decay_steps))
+            frac = float(progress) / float(decay_steps)
+            return 1.0 - (1.0 - lr_cfg.min_lr_ratio) * frac
         # warmup-stable-decay path
         if step_idx < (warmup_steps + stable_steps):
             return 1.0

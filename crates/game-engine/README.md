@@ -72,20 +72,20 @@ top_k = 2
      --config config/inference/orchestrator.toml \
      --dataset datasets/macroxue/d6_10g_v1 \
      --output annotations/d6_10g_v1/new-model \
-     --student-bins-dtype f16 \
+     --p1-only \
      --overwrite
    ```
 
-   - `--student-bins-dtype` selects the dtype for the log-probability sidecar (`f32` default, `f16` optional).
+   - `--p1-only` is an opt-in that skips writing the student per-bin sidecar (`annotations-student-*.npy`), saving only the summary rows (`annotations-*.npy`) with `argmax_head`, `argmax_prob`, `policy_p1`, `policy_logp`, and `policy_hard` when available.
+   - Omit `--p1-only` to persist the full per-bin distributions alongside the summary rows.
    - Use `--limit N` for smoke tests and `--overwrite` to replace previous shards.
-   - The inference server now advertises tokenizer metadata (`model_metadata.policy`), so the annotator sizes the log-probability sidecar automatically from the first response.
 
 ## Output Artifacts
 
 | Binary             | Artifacts                                                                                                      |
 |--------------------|---------------------------------------------------------------------------------------------------------------|
 | `game-engine`      | `steps-*.npy`, optional `embeddings-*.npy`, and `metadata.db` inside `session_dir`.                             |
-| `annotation-engine`| `annotations-*.npy` (summary row), `annotations-logp-<dtype>-*.npy` (per-bin log-probs), copied `metadata.db`, `valuation_types.json`, and `annotation_manifest.json` capturing bitmasks, dtype, and max bin count. |
+| `annotation-engine`| `annotations-*.npy` (summary rows), optional `annotations-student-*.npy` (per-bin probabilities, omitted with `--p1-only`), copied `metadata.db`, `valuation_types.json`, and `annotation_manifest.json` capturing bitmasks and bin count. |
 
 Manifest `policy_kind_mask` now exposes `POLICY_P1`, `POLICY_LOGPROBS`, `POLICY_HARD`, and `POLICY_STUDENT_BINS` bits so downstream tools can detect available annotations without scanning shards.
 

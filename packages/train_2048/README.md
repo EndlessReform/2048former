@@ -56,6 +56,17 @@ Notes and rationale:
 - During training, each head uses cross‑entropy against these per‑branch class targets. Winner bins typically concentrate probability mass near the last class.
 - During inference, selection logic reads the last class (`p1`) per head for argmax decisions and optional tail aggregation; this layout matches the server/client expectations.
 
+## Learning Rate Schedules
+
+Configure `hyperparameters.lr_schedule.name` in the training config to select a scheduler:
+
+- `constant` — optional warmup, then hold the base learning rate.
+- `warmup-stable-decay` — warmup, stay flat for `stable_steps`, then linearly decay through `decay_steps` to `min_lr_ratio`.
+- `cosine` — warmup followed by cosine annealing down to `min_lr_ratio` (enables adaptive batch logic).
+- `linear` — warmup, then linearly decay toward `min_lr_ratio` over the remaining steps or the configured `decay_steps`.
+
+Every scheduler honors `warmup_steps`; `cooldown_pct` or `decay_steps` refine the linear phases, and `min_lr_ratio` sets the final floor.
+
 Quick usage:
 
 - Train (example): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml`

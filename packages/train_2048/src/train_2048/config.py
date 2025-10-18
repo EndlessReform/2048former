@@ -169,8 +169,8 @@ class WandbConfig(BaseModel):
 
 
 class LRScheduleConfig(BaseModel):
-    name: Literal["constant", "warmup-stable-decay", "cosine"] = "constant"
-    # Only used for warmup-stable-decay
+    name: Literal["constant", "warmup-stable-decay", "cosine", "linear"] = "constant"
+    # Warmup steps apply to all schedulers; decay-specific knobs are ignored when unsupported.
     warmup_steps: int = 0
     decay_steps: int = 0
     # Optional: percent of total steps used for cooldown/decay (0..1).

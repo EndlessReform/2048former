@@ -771,6 +771,7 @@ dependencies = [
  "env_logger",
  "futures",
  "hyper-util",
+ "indicatif",
  "log",
  "npyz",
  "prost",

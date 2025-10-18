@@ -18,7 +18,7 @@ muon_lr = 2e-2
 grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
-name = "warmup-stable-decay" # constant | warmup-stable-decay | cosine
+name = "warmup-stable-decay" # constant | warmup-stable-decay | cosine | linear
 warmup_steps = 1000
 # decay_steps = 0
 # Alternatively, specify a percentage of total steps for cooldown/decay

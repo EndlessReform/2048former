@@ -38,6 +38,7 @@ env_logger = "0.11.8"
 tokio-util = "0.7.16"
 dataset-packer = { path = "../dataset-packer" }
 futures = "0.3.31"
+indicatif = "0.17.8"
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
