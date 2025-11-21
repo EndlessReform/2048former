@@ -82,6 +82,8 @@ class DatasetConfig(BaseModel):
     num_epochs: Optional[int] = None
     # Run validation every N training steps (when >0)
     val_every: int = 1000
+    # Optional rejection sampling mix.
+    rejection: Optional["RejectionConfig"] = None
 
     @field_validator("num_steps", "num_epochs")
     @classmethod
@@ -139,6 +141,57 @@ class DatasetConfig(BaseModel):
         if not p.is_absolute():
             p = _find_repo_root() / p
         return str(p)
+
+
+class RejectionFilterConfig(BaseModel):
+    """Describe a single rejection sampling filter entry."""
+
+    id: str
+    name: Literal["student_wrong_p1", "passthrough"]
+    weight: float
+    anneal_until_epoch: Optional[int] = None
+
+    @field_validator("id")
+    @classmethod
+    def _id_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("rejection filter id must be non-empty")
+        return value
+
+    @field_validator("weight")
+    @classmethod
+    def _weight_positive(cls, value: float) -> float:
+        if value <= 0.0:
+            raise ValueError("rejection filter weight must be > 0")
+        return float(value)
+
+    @field_validator("anneal_until_epoch")
+    @classmethod
+    def _anneal_positive(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("rejection filter anneal_until_epoch must be > 0 when provided")
+        return value
+
+
+class RejectionConfig(BaseModel):
+    """Top-level configuration for rejection sampling mixes."""
+
+    annotation_dir: str
+    filters: list[RejectionFilterConfig]
+    seed: int = 12345
+
+    @field_validator("filters")
+    @classmethod
+    def _require_filters(cls, value: list[RejectionFilterConfig]) -> list[RejectionFilterConfig]:
+        if not value:
+            raise ValueError("rejection configuration requires at least one filter")
+        return value
+
+    def resolved_annotation_dir(self) -> str:
+        path = Path(self.annotation_dir)
+        if not path.is_absolute():
+            path = _find_repo_root() / path
+        return str(path)
 
 
 class WandbConfig(BaseModel):

@@ -43,35 +43,6 @@ def main(argv: Optional[list[str]] = None):
             print("Use [wandb].mode=\"online\" (and run `wandb login`) to upload runs.")
             print("=" * 88 + "\n")
 
-    if getattr(cfg, "wandb", None) and cfg.wandb.enabled:
-        try:
-            import wandb  # type: ignore
-
-            wandb_run = wandb.init(
-                project=cfg.wandb.project,
-                entity=(cfg.wandb.entity or None),
-                name=(cfg.wandb.run_name or None),
-                tags=(cfg.wandb.tags or None),
-                mode=cfg.wandb.mode,
-                config={
-                    "config_path": args.config,
-                    "seed": cfg.seed,
-                    "wandb_report_every": getattr(cfg.wandb, "report_every", 1),
-                    "optimizer": cfg.hyperparameters.optimizer.model_dump(),
-                    "lr": cfg.hyperparameters.learning_rate,
-                    "lr_schedule": cfg.hyperparameters.lr_schedule.model_dump(),
-                    "batch": cfg.batch.model_dump(),
-                    "dropout": cfg.dropout.model_dump(),
-                    "target": cfg.target.model_dump(),
-                    "binning": cfg.binning.model_dump(),
-                    "dataset": cfg.dataset.model_dump(),
-                },
-            )
-            print(f"W&B run initialized: {wandb_run.name} ({wandb_run.id})")
-        except Exception as e:
-            print(f"W&B init failed ({e}); continuing without W&B logging.")
-            wandb_run = None
-
     device_str = (
         args.device
         if args.device is not None
@@ -79,7 +50,7 @@ def main(argv: Optional[list[str]] = None):
     )
     print(f"Config loaded from: {args.config}")
 
-    _ckpt_path, _global_step = run_training(cfg, device_str, wandb_run)
+    _ckpt_path, _global_step = run_training(cfg, device_str, config_path=args.config)
 
 
 if __name__ == "__main__":

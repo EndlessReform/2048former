@@ -184,6 +184,31 @@ The `--tokenizer` flag is optional and enables tokenization features for the UI.
 
 ## Rejection Sampling (proposal)
 
+### Current implementation snapshot
+
+The training pipeline now accepts a minimal rejection sampler defined directly in the training
+config. Enable it by adding a `[dataset.rejection]` stanza; no external cache building is required.
+
+```toml
+[dataset.rejection]
+annotation_dir = "annotations/d6_1440_v2_50m_20251015"
+seed = 20251015
+
+[[dataset.rejection.filters]]
+id = "student_errors"
+name = "student_wrong_p1"
+weight = 0.9
+
+[[dataset.rejection.filters]]
+id = "anneal_random"
+name = "passthrough"
+weight = 0.1
+anneal_until_epoch = 6
+```
+
+On every epoch the sampler logs how many samples were drawn per filter and whether duplication was
+necessary (e.g., when the requested proportion exceeds available student errors).
+
 Offline rejection sampling will piggyback on the annotation sidecars and produce training-ready indices without rewriting the dataset shards. The immediate target is teacher-supervised training; we only need the summary rows and `policy_p1`, but we leave enough structure to support richer disagreement heuristics later.
 
 ### Filter surface
@@ -293,6 +318,7 @@ The original proposes `train_2048.annotation.filters` as a Python module. I sugg
 This separation keeps the dataloader module cohesive and makes it trivial to dry-run filter logic without launching a full training job.
 
 **Example CLI usage:**
+
 ```bash
 uv run build-rejection-cache \
   --config config/rejection/depth8-mix.toml \
@@ -311,6 +337,7 @@ class FilterResult:
 ```
 
 This lets us log per-filter statistics (e.g., "student_wrong_p1 matched 12.3% of steps") directly into the training logs or W&B without re-scanning data. The metadata can include:
+
 - Match count
 - Coverage percentage
 - Min/max step indices (for sanity checks)
@@ -318,12 +345,14 @@ This lets us log per-filter statistics (e.g., "student_wrong_p1 matched 12.3% of
 #### 4. **Join annotations to steps via a lightweight index, not run_id/step_index pairs**
 
 The original proposes joining back to `StepsDataset` through `(run_id, step_index)` pairs. This requires either:
+
 - Loading metadata.db to build a lookup map, or
 - Assuming annotations and steps are perfectly aligned (which they are!)
 
 Since the annotation engine already guarantees alignment (see `annotation.rs:106-370`—the ordered buffer ensures deterministic write order), we can **directly use annotation shard indices as global step indices**. No joins needed.
 
 **Concretely:**
+
 1. Filter scans `annotations-*.npy` shards and collects matching row indices
 2. Returns global annotation indices (0-based across all annotation shards)
 3. Training dataloader treats annotation indices == step indices (since they're 1:1 aligned)
@@ -364,6 +393,7 @@ Default behavior (`upsample = false`) should **warn and clip** instead of silent
 #### 7. **Config validation and dry-run mode**
 
 Add a `--validate-config` flag to the training CLI that:
+
 1. Resolves all phases and mixes
 2. Runs all filters and reports match counts
 3. Computes expected samples per epoch per mix
@@ -441,6 +471,7 @@ weight = 0.25
 ### Implementation Sketch
 
 **`train_2048/dataloader/filters.py`:**
+
 ```python
 from dataclasses import dataclass
 import numpy as np
@@ -501,6 +532,7 @@ def filter_passthrough(rows: np.ndarray, params: dict) -> FilterResult:
 ```
 
 **`train_2048/dataloader/rejection.py`:**
+
 ```python
 from pathlib import Path
 import numpy as np
@@ -539,17 +571,17 @@ def load_or_build_filter_cache(
 
 ### Summary of Changes from Original Proposal
 
-| Aspect | Original | Counter-Proposal |
-|--------|----------|------------------|
-| Cache location | `annotations/<run>/filters/` | `{cache_dir}/{mix_id}.npy` |
-| Mix identification | Implicit filter hash | Explicit `id` field |
-| Filter return type | `np.ndarray` | `FilterResult(indices, metadata)` |
-| "All" filter | `filter = { name = "all" }` | `filter = { name = "passthrough" }` |
-| Upsampling | Implicit when needed | Explicit `upsample` flag per mix |
-| Join strategy | `(run_id, step_index)` lookup | Direct index alignment (annotations == steps) |
-| Validation | Runtime errors | CLI `--validate-config` mode |
-| Logging | W&B-only (question) | Per-mix counters in standard logs |
-| CLI tooling | None | `build-rejection-cache` for pre-caching |
+| Aspect             | Original                      | Counter-Proposal                              |
+| ------------------ | ----------------------------- | --------------------------------------------- |
+| Cache location     | `annotations/<run>/filters/`  | `{cache_dir}/{mix_id}.npy`                    |
+| Mix identification | Implicit filter hash          | Explicit `id` field                           |
+| Filter return type | `np.ndarray`                  | `FilterResult(indices, metadata)`             |
+| "All" filter       | `filter = { name = "all" }`   | `filter = { name = "passthrough" }`           |
+| Upsampling         | Implicit when needed          | Explicit `upsample` flag per mix              |
+| Join strategy      | `(run_id, step_index)` lookup | Direct index alignment (annotations == steps) |
+| Validation         | Runtime errors                | CLI `--validate-config` mode                  |
+| Logging            | W&B-only (question)           | Per-mix counters in standard logs             |
+| CLI tooling        | None                          | `build-rejection-cache` for pre-caching       |
 
 ### Open Questions (Updated)
 

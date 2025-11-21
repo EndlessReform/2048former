@@ -78,6 +78,22 @@ val_split_seed = 42
 # Validate every N training steps (0 disables)
 val_every = 1000
 
+# Optional: rejection sampling mix (uncomment to enable)
+# [dataset.rejection]
+# annotation_dir = "./annotations/d6_1440_v2_50m_20251015"
+# seed = 20251015
+#
+# [[dataset.rejection.filters]]
+# id = "student_errors"
+# name = "student_wrong_p1"
+# weight = 0.9
+#
+# [[dataset.rejection.filters]]
+# id = "anneal_random"
+# name = "passthrough"
+# weight = 0.1
+# anneal_until_epoch = 6
+
 # Shard locality controls (optional). Enable to keep one shard in RAM and shuffle locally.
 # shard_locality = true
 # shard_locality_block_size = 500000    # Draw at most this many rows per shard before rotating

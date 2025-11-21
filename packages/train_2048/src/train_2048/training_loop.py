@@ -221,6 +221,7 @@ def init_datasets(
         val_split_seed=cfg.dataset.val_split_seed,
         num_workers_train=12,
         mmap_mode=cfg.dataset.mmap_mode,
+        rejection=cfg.dataset.rejection,
     )
 
 
@@ -502,7 +503,46 @@ def _finalize_metric_sums(
     return result
 
 
-def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
+def _init_wandb_run(cfg: TrainingConfig, *, config_path: Optional[str]) -> Optional[object]:
+    if not getattr(cfg, "wandb", None) or not cfg.wandb.enabled:
+        return None
+    try:
+        import wandb  # type: ignore
+
+        wandb_run = wandb.init(
+            project=cfg.wandb.project,
+            entity=(cfg.wandb.entity or None),
+            name=(cfg.wandb.run_name or None),
+            tags=(cfg.wandb.tags or None),
+            mode=cfg.wandb.mode,
+            config={
+                "config_path": config_path,
+                "seed": cfg.seed,
+                "wandb_report_every": getattr(cfg.wandb, "report_every", 1),
+                "optimizer": cfg.hyperparameters.optimizer.model_dump(),
+                "lr": cfg.hyperparameters.learning_rate,
+                "lr_schedule": cfg.hyperparameters.lr_schedule.model_dump(),
+                "batch": cfg.batch.model_dump(),
+                "dropout": cfg.dropout.model_dump(),
+                "target": cfg.target.model_dump(),
+                "binning": cfg.binning.model_dump(),
+                "dataset": cfg.dataset.model_dump(),
+            },
+        )
+        print(f"W&B run initialized: {wandb_run.name} ({wandb_run.id})")
+        return wandb_run
+    except Exception as exc:
+        print(f"W&B init failed ({exc}); continuing without W&B logging.")
+        return None
+
+
+def run_training(
+    cfg: TrainingConfig,
+    device_str: str,
+    wandb_run: Optional[object] = None,
+    *,
+    config_path: Optional[str] = None,
+) -> Tuple[Path, int]:
     device = torch.device(device_str)
     target_mode = getattr(cfg.target, "mode", "binned_ev")
 
@@ -570,6 +610,9 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     _apply_dropout_from_config(model, cfg.dropout)
     if getattr(cfg, "compile_enabled", True):
         model = torch.compile(model, mode="reduce-overhead")
+
+    if wandb_run is None:
+        wandb_run = _init_wandb_run(cfg, config_path=config_path)
 
     try:
         n_params = sum(int(p.numel()) for p in model.parameters())

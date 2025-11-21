@@ -1,0 +1,72 @@
+init_dir = "inits/v2/pretrained/50m_balanced_20251015/model-stable.safetensors"
+checkpoint_dir = "checkpoints"
+seed = 42
+
+[wandb]
+enabled = true
+project = "train-2048-bin-annealing"
+entity = ""
+run_name = ""
+tags = ["v2", "macroxue-binned", "rejection_d6"]
+mode = "online"                               # online | offline | disabled
+report_every = 50                             # log to W&B every N steps (>=1)
+
+[target]
+mode = "macroxue_tokens"
+
+[hyperparameters]
+learning_rate = 5e-4 # peak
+grad_clip_norm = 1.0
+
+[hyperparameters.lr_schedule]
+name = "linear"
+warmup_steps = 3000
+min_lr_ratio = 0.1
+
+[hyperparameters.optimizer]
+name = "adamw"      # adamw | muon
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.99
+eps = 1e-8
+
+[batch]
+batch_size = 1024
+
+[dropout]
+dropout_prob = 0.03
+attention_dropout_prob = 0.0
+
+[dataset]
+dataset_dir = "datasets/raws/d6_14400_v2"
+tokenizer_path = "out/macroxue_v2/tokenizer.json"
+mmap_mode = true
+num_epochs = 4               # ~250k steps
+shard_locality = true
+shard_cache_in_memory = true
+shard_cache_keep_shards = 1
+
+val_run_pct = 0.005
+val_num_steps = 200
+val_split_seed = 42
+val_every = 5_000
+
+[dataset.rejection]
+annotation_dir = "annotations/d6_1440_v2_50m_20251015"
+seed = 20251015
+
+[[dataset.rejection.filters]]
+id = "student_errors"
+name = "student_wrong_p1"
+weight = 0.9
+
+[[dataset.rejection.filters]]
+id = "anneal_random"
+name = "passthrough"
+weight = 0.1
+anneal_until_epoch = 4
+
+[checkpoint]
+every_epochs = 1
+save_best_every_steps = 10000
+best_min_delta = 0.002
