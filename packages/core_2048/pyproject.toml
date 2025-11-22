@@ -5,6 +5,7 @@ description = "Shared core for 2048 model: model defs, init IO, thin inference h
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "huggingface-hub>=1.1.5",
     "pydantic>=2.11.7",
     "safetensors>=0.6.2",
     "torch>=2.8.0",
