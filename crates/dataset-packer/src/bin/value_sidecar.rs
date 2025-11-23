@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
     reward_scale: f64,
 
+    /// Epsilon for the MuZero-style invertible value transform
+    #[arg(long, default_value_t = 0.001, value_name = "FLOAT")]
+    epsilon: f64,
+
     /// Optional override for Rayon worker count
     #[arg(long, value_name = "N")]
     workers: Option<usize>,
@@ -47,14 +51,20 @@ fn main() -> Result<()> {
         output_dir,
         gamma: cli.gamma,
         reward_scale: cli.reward_scale,
+        epsilon: cli.epsilon,
         max_workers: Some(workers),
         overwrite: cli.overwrite,
     };
 
     let summary = add_value_sidecar(opts)?;
     info!(
-        "Value sidecar complete: {} runs, {} steps, {} shard(s), gamma={}, reward_scale={}",
-        summary.runs, summary.steps, summary.shards, summary.gamma, summary.reward_scale
+        "Value sidecar complete: {} runs, {} steps, {} shard(s), gamma={}, reward_scale={}, epsilon={}",
+        summary.runs,
+        summary.steps,
+        summary.shards,
+        summary.gamma,
+        summary.reward_scale,
+        summary.epsilon
     );
 
     Ok(())

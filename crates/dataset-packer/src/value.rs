@@ -77,6 +77,8 @@ pub struct ValueSidecarOptions {
     pub gamma: f64,
     /// Scale applied to rewards before computing the scaled return.
     pub reward_scale: f64,
+    /// Epsilon for the MuZero-style invertible value transform.
+    pub epsilon: f64,
     /// Optional override for Rayon worker count.
     pub max_workers: Option<usize>,
     /// Overwrite existing outputs when true.
@@ -91,6 +93,7 @@ pub struct ValueSidecarSummary {
     pub shards: usize,
     pub gamma: f64,
     pub reward_scale: f64,
+    pub epsilon: f64,
 }
 
 /// Generate `values-*.npy` aligned to the packed Macroxue dataset.
@@ -184,6 +187,7 @@ pub fn add_value_sidecar(opts: ValueSidecarOptions) -> Result<ValueSidecarSummar
                             &runs,
                             opts.gamma,
                             opts.reward_scale,
+                            opts.epsilon,
                             &mut writer,
                         )?;
                         expected_run_idx += 1;
@@ -253,6 +257,7 @@ pub fn add_value_sidecar(opts: ValueSidecarOptions) -> Result<ValueSidecarSummar
                 &runs,
                 opts.gamma,
                 opts.reward_scale,
+                opts.epsilon,
                 &mut writer,
             )?;
             expected_run_idx += 1;
@@ -287,6 +292,7 @@ pub fn add_value_sidecar(opts: ValueSidecarOptions) -> Result<ValueSidecarSummar
             shards,
             gamma: opts.gamma,
             reward_scale: opts.reward_scale,
+            epsilon: opts.epsilon,
         })
     };
 
@@ -350,6 +356,7 @@ fn flush_run(
     runs: &[crate::macroxue::RunSummary],
     gamma: f64,
     reward_scale: f64,
+    epsilon: f64,
     writer: &mut StepsWriter<ValueRow>,
 ) -> Result<usize> {
     let expected = runs.get(run_idx).ok_or_else(|| {
@@ -376,7 +383,7 @@ fn flush_run(
         );
     }
 
-    let values = compute_run(run_id, steps, gamma, reward_scale)?;
+    let values = compute_run(run_id, steps, gamma, reward_scale, epsilon)?;
     writer.write(&values)?;
     let written = values.len();
     steps.clear();
@@ -388,6 +395,7 @@ fn compute_run(
     steps: &[StepValueInput],
     gamma: f64,
     reward_scale: f64,
+    epsilon: f64,
 ) -> Result<Vec<ValueRow>> {
     // Compute per-step rewards in parallel to fully utilise cores even for a single long run.
     let rewards: Vec<f32> = steps
@@ -397,17 +405,13 @@ fn compute_run(
 
     let mut out = Vec::with_capacity(steps.len());
     let mut return_raw = 0f64;
-    let mut return_scaled = 0f64;
 
-    for ((step, &reward), reward_scaled) in steps
-        .iter()
-        .rev()
-        .zip(rewards.iter().rev())
-        .zip(rewards.iter().map(|r| *r as f64 * reward_scale).rev())
-    {
+    for (step, &reward) in steps.iter().rev().zip(rewards.iter().rev()) {
         let reward_f64 = reward as f64;
         return_raw = reward_f64 + gamma * return_raw;
-        return_scaled = reward_scaled + gamma * return_scaled;
+        let reward_scaled = reward_f64 * reward_scale;
+
+        let return_scaled = h_transform(return_raw, epsilon, run_id, step.step_index)?;
 
         out.push(ValueRow {
             run_id,
@@ -421,6 +425,22 @@ fn compute_run(
 
     out.reverse();
     Ok(out)
+}
+
+/// MuZero-style invertible transform for value/reward targets.
+/// h(x) = sign(x) * (sqrt(x + 1) - 1 + eps * x)
+fn h_transform(x: f64, epsilon: f64, run_id: u32, step_index: u32) -> Result<f64> {
+    if x < -1.0 {
+        bail!(
+            "MuZero transform failed for run {}, step {}: input value {} is less than -1",
+            run_id,
+            step_index,
+            x
+        );
+    }
+    // NB: The value inside the sqrt can be negative if x < -1.0, which is handled above.
+    let transformed = (x + 1.0).sqrt() - 1.0 + epsilon * x;
+    Ok(x.signum() * transformed)
 }
 
 fn compute_reward(board_raw: u64, tile_65536_mask: u16, move_dir: u8) -> Result<f32> {
@@ -672,6 +692,7 @@ mod tests {
             output_dir: dataset_dir.clone(),
             gamma: 0.5,
             reward_scale: 2.0,
+            epsilon: 0.1,
             max_workers: None,
             overwrite: true,
         };
@@ -694,7 +715,23 @@ mod tests {
         assert_eq!(rewards_scaled, vec![8.0, 16.0, 32.0, 0.0]);
 
         let returns_scaled: Vec<f32> = seen_rows.iter().map(|r| r.return_scaled).collect();
-        assert_eq!(returns_scaled, vec![24.0, 32.0, 32.0, 0.0]);
+        // Raw returns are [12.0, 16.0, 16.0, 0.0]
+        // h(12.0, 0.1) = 1.0 * (sqrt(13.0) - 1.0 + 0.1 * 12.0) = 3.60555 - 1.0 + 1.2 = 3.80555
+        // h(16.0, 0.1) = 1.0 * (sqrt(17.0) - 1.0 + 0.1 * 16.0) = 4.1231 - 1.0 + 1.6 = 4.7231
+        // h(0.0, 0.1) = 0
+        let expected = vec![3.8055512, 4.7231054, 4.7231054, 0.0];
+        returns_scaled
+            .iter()
+            .zip(expected.iter())
+            .for_each(|(a, e)| assert!((a - e).abs() < 1e-6));
+    }
+
+    #[test]
+    fn test_h_transform() {
+        assert!((h_transform(12.0, 0.1, 0, 0).unwrap() - 3.8055512).abs() < 1e-6);
+        assert!((h_transform(16.0, 0.1, 0, 0).unwrap() - 4.7231054).abs() < 1e-6);
+        assert_eq!(h_transform(0.0, 0.1, 0, 0).unwrap(), 0.0);
+        assert!(h_transform(-2.0, 0.1, 0, 0).is_err());
     }
 
     #[test]
@@ -728,6 +765,7 @@ mod tests {
             output_dir: dataset_dir.clone(),
             gamma: 1.0,
             reward_scale: 1.0,
+            epsilon: 0.001,
             max_workers: None,
             overwrite: true,
         };
