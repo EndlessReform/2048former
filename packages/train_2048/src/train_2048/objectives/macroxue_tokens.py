@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .base import Objective
+from .utils import unpack_model_outputs
 
 
 class MacroxueTokens(Objective):
@@ -83,7 +84,7 @@ class MacroxueTokens(Objective):
                 raise RuntimeError(f"Token id out of range: min={tmin} max={tmax} vocab={int(vocab)}")
 
         with autocast:
-            _hs, head_out = model(tokens)
+            _hs, head_out, _value_out = unpack_model_outputs(model(tokens))
             per_head_losses: list[torch.Tensor] = []
             agree_sum = torch.zeros((), device=device, dtype=torch.float32)
             agree_cnt = 0
@@ -154,7 +155,7 @@ class MacroxueTokens(Objective):
             tokens = batch["tokens"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
             with autocast:
-                _hs, head_out = model(tokens)
+                _hs, head_out, _value_out = unpack_model_outputs(model(tokens))
                 per_head_losses: list[torch.Tensor] = []
                 for h in range(4):
                     logits_h = head_out[h].float()

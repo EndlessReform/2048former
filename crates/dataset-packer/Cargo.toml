@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "dataset-packer"
 path = "src/bin/main.rs"
 
+[[bin]]
+name = "value-sidecar"
+path = "src/bin/value_sidecar.rs"
+
 [dependencies]
 anyhow = "1.0.99"
 clap = { version = "4.5.47", features = ["derive"] }
@@ -28,3 +32,4 @@ tempfile = "3.22.0"
 walkdir = "2.5.0"
 half = { version = "2.4.1", features = ["serde"] }
 twenty48-utils = { path = "../twenty48-utils" }
+num_cpus = "1.16.0"

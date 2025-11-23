@@ -41,7 +41,11 @@ def forward_distributions(
             model.eval()
 
         try:
-            _hs, ev_logits = model(tokens.to(model_device, dtype=torch.long))
+            forward_out = model(tokens.to(model_device, dtype=torch.long))
+            if isinstance(forward_out, tuple) and len(forward_out) == 3:
+                _hs, ev_logits, _value_out = forward_out
+            else:
+                _hs, ev_logits = forward_out
             # Softmax per head over bins
             head_probs = [F.softmax(logits.float(), dim=-1) for logits in ev_logits]
         finally:
@@ -92,4 +96,3 @@ def prepare_model_for_inference(
     except StopIteration:
         used_dtype = None
     return model, used_dtype
-

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .base import Objective
+from .utils import unpack_model_outputs
 
 
 class BinnedEV(Objective):
@@ -45,7 +46,7 @@ class BinnedEV(Objective):
             autocast = _Null()
 
         with autocast:
-            _hs, head_out = model(tokens)
+            _hs, head_out, _value_out = unpack_model_outputs(model(tokens))
             per_head_losses: list[torch.Tensor] = []
             for h in range(4):
                 logits_h = head_out[h].float()
@@ -91,7 +92,7 @@ class BinnedEV(Objective):
             targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
 
             with autocast:
-                _hs, head_out = model(tokens)
+                _hs, head_out, _value_out = unpack_model_outputs(model(tokens))
                 per_head_losses: list[torch.Tensor] = []
                 for h in range(4):
                     logits_h = head_out[h].float()

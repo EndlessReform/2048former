@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .base import Objective
+from .utils import unpack_model_outputs
 
 
 class HardMove(Objective):
@@ -47,7 +48,7 @@ class HardMove(Objective):
             autocast = _Null()
 
         with autocast:
-            _hs, head_out = model(tokens)
+            _hs, head_out, _value_out = unpack_model_outputs(model(tokens))
             if isinstance(head_out, (list, tuple)):
                 if not all(t.shape[-1] == 1 for t in head_out):
                     raise RuntimeError("hard_move expects single policy head or 4x1 logits list")
@@ -137,7 +138,7 @@ class HardMove(Objective):
                 branch_mask = branch_mask.to(device, non_blocking=True)
 
             with autocast:
-                _hs, head_out = model(tokens)
+                _hs, head_out, _value_out = unpack_model_outputs(model(tokens))
                 if isinstance(head_out, (list, tuple)):
                     if not all(t.shape[-1] == 1 for t in head_out):
                         raise RuntimeError("hard_move expects single policy head or 4x1 logits list")

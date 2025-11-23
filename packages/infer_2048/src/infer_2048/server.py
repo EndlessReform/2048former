@@ -200,7 +200,12 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             prev_mode = self.model.training
             self.model.eval()
             with torch.inference_mode():
-                hidden_states, head_out = self.model(tokens)
+                forward_out = self.model(tokens)
+                if isinstance(forward_out, tuple) and len(forward_out) == 3:
+                    hidden_states, head_out, value_out = forward_out
+                else:
+                    hidden_states, head_out = forward_out
+                    value_out = None
                 # Outputs are already in canonical UDLR order
                 if isinstance(head_out, (list, tuple)):
                     # Binned heads: list length 4

@@ -186,6 +186,21 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
                 out_dim = int(w0.shape[0])
                 enc_cfg_dict["output_n_bins"] = out_dim
 
+        # Infer value head config if present in weights
+        v_w = state.get("value_head.weight")
+        if v_w is not None and hasattr(v_w, "shape") and len(v_w.shape) == 2:
+            vh_cfg = dict(enc_cfg_dict.get("value_head", {}) or {})
+            vh_cfg.setdefault("enabled", True)
+            obj_cfg = dict(vh_cfg.get("objective", {}) or {})
+            # Choose objective based on output dimension if unspecified
+            if "type" not in obj_cfg:
+                obj_cfg["type"] = "cross_entropy" if int(v_w.shape[0]) > 1 else "mse"
+            if obj_cfg.get("type") == "cross_entropy":
+                obj_cfg.setdefault("vocab_size", int(v_w.shape[0]))
+                obj_cfg.setdefault("vocab_type", str(obj_cfg.get("vocab_type") or "unknown"))
+            vh_cfg["objective"] = obj_cfg
+            enc_cfg_dict["value_head"] = vh_cfg
+
         # Infer vocab size from embedding if present (ensure >= current)
         tok = state.get("tok_emb.weight")
         if tok is not None and hasattr(tok, "shape") and len(tok.shape) == 2:

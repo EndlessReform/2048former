@@ -1,7 +1,44 @@
+from typing import Literal
+
 from pydantic import BaseModel
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class ValueObjectiveConfig(BaseModel):
+    type: Literal["mse", "cross_entropy"] = "mse"
+    vocab_size: int | None = None
+    vocab_type: str | None = None
+
+    @classmethod
+    def model_validate(cls, obj):
+        cfg = super().model_validate(obj)
+        if cfg.type == "cross_entropy":
+            if cfg.vocab_size is None or int(cfg.vocab_size) <= 0:
+                raise ValueError("value objective 'cross_entropy' requires vocab_size > 0")
+            if not cfg.vocab_type:
+                raise ValueError("value objective 'cross_entropy' requires a vocab_type string label")
+        return cfg
+
+
+class ValueHeadConfig(BaseModel):
+    # Toggle value head; omit this block or set enabled=False to disable.
+    enabled: bool = True
+    # Pooling strategy for value readout. Only mean pooling is supported today.
+    pooling: Literal["mean"] = "mean"
+    objective: ValueObjectiveConfig = ValueObjectiveConfig()
+
+    @classmethod
+    def model_validate(cls, obj):
+        cfg = super().model_validate(obj)
+        if not cfg.enabled:
+            return cfg
+        if cfg.pooling != "mean":
+            raise ValueError("value_head.pooling currently supports only 'mean'")
+        # Defer objective validation to ValueObjectiveConfig.model_validate
+        _ = ValueObjectiveConfig.model_validate(cfg.objective)
+        return cfg
 
 
 class EncoderConfig(BaseModel):
@@ -21,6 +58,8 @@ class EncoderConfig(BaseModel):
     max_position_embeddings: int = 16
     # Output head type: default binned EV per direction; alternative single policy head over 4 moves
     head_type: str = "binned_ev"  # accepted: "binned_ev", "action_policy"
+    # Optional value head configuration (disabled when null)
+    value_head: ValueHeadConfig | None = None
 
     @classmethod
     def model_validate(cls, obj):
@@ -32,6 +71,9 @@ class EncoderConfig(BaseModel):
         else:
             # action_policy: output_n_bins is unused; allow None
             pass
+        if cfg.value_head is not None and not cfg.value_head.enabled:
+            # Treat disabled value_head the same as None
+            cfg.value_head = None
         return cfg
 
 
@@ -275,6 +317,16 @@ class Encoder(nn.Module):
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
 
+        # Optional value head (mean-pooled linear probe)
+        vh_cfg = getattr(config, "value_head", None)
+        self.value_head_cfg = vh_cfg if vh_cfg is not None and vh_cfg.enabled else None
+        if self.value_head_cfg is not None:
+            objective = self.value_head_cfg.objective
+            out_dim = 1 if objective.type == "mse" else int(objective.vocab_size)
+            self.value_head = nn.Linear(config.hidden_size, out_dim)
+        else:
+            self.value_head = None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -288,7 +340,8 @@ class Encoder(nn.Module):
 
         Returns:
             hidden_states: Tensor (batch, seq_len, hidden_size)
-            ev_logits: List[Tensor] of length 4, each (batch, output_n_bins)
+            policy_logits: List[Tensor] of length 4 (binned_ev) or Tensor (batch, 4) (action_policy)
+            value_out: Tensor (batch,) for mse or (batch, vocab_size) for cross_entropy; None when disabled
         """
         # input_ids: (B, S)
         B, S = input_ids.shape
@@ -308,9 +361,14 @@ class Encoder(nn.Module):
 
         # Final mean pooling
         board_repr = x.mean(dim=1)  # (B, H)
+        value_out: torch.Tensor | None = None
+        if self.value_head is not None:
+            value_out = self.value_head(board_repr)
+            if self.value_head_cfg and self.value_head_cfg.objective.type == "mse":
+                value_out = value_out.squeeze(-1)
         if self.head_type == "binned_ev":
             ev_logits = [head(board_repr) for head in self.ev_heads]  # List of (B, n_bins)
-            return x, ev_logits
+            return x, ev_logits, value_out
         else:  # action_policy
             policy_logits = self.policy_head(board_repr)  # (B, 4)
-            return x, policy_logits
+            return x, policy_logits, value_out
