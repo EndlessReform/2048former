@@ -16,7 +16,6 @@ name = "annotation-engine"
 path = "src/bin/annotate.rs"
 
 [dependencies]
-ai-2048 = { git = "https://github.com/EndlessReform/2048_bench.git", rev = "e517db6" }
 anyhow = "1.0.99"
 clap = { version = "4.5.47", features = ["derive"] }
 prost = "0.14.1"
@@ -38,6 +37,7 @@ env_logger = "0.11.8"
 tokio-util = "0.7.16"
 dataset-packer = { path = "../dataset-packer" }
 futures = "0.3.31"
+twenty48-utils = { path = "../twenty48-utils" }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

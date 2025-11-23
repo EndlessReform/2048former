@@ -1,3 +1,8 @@
 [workspace]
-members=["crates/game-engine", "crates/dataset-packer", "crates/annotation-server"]
+members=[
+    "crates/game-engine",
+    "crates/dataset-packer",
+    "crates/annotation-server",
+    "crates/twenty48-utils",
+]
 resolver = "3"

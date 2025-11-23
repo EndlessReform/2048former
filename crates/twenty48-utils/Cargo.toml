@@ -1,0 +1,15 @@
+[package]
+name = "twenty48-utils"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "twenty48_utils"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.99"
+rand = { version = "0.8.5", features = ["std_rng"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.132"
+rayon = "1.11.0"
