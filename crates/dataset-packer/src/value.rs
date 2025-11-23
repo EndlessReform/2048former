@@ -117,148 +117,222 @@ pub fn add_value_sidecar(opts: ValueSidecarOptions) -> Result<ValueSidecarSummar
         );
     }
 
-    let mut shard_row_counts = Vec::with_capacity(steps_files.len());
-    let mut per_run: Vec<Vec<StepValueInput>> = vec![Vec::new(); runs.len()];
-    let mut last_run_seen: Option<u32> = None;
-    let mut last_step_index: Vec<Option<u32>> = vec![None; runs.len()];
     let total_steps: usize = runs.iter().map(|r| r.steps).sum();
+    let shard_row_counts = step_shard_row_counts(&steps_files)?;
+    let shard_total: usize = shard_row_counts.iter().sum();
+    if shard_total != total_steps {
+        bail!(
+            "steps shards contain {} rows but metadata reports {} steps",
+            shard_total,
+            total_steps
+        );
+    }
 
-    let pb = crate::macroxue::default_progress_bar(total_steps as u64);
-    pb.set_message("loading steps");
+    let render_sidecar = || -> Result<ValueSidecarSummary> {
+        let mut writer = if should_number_values(&steps_files) {
+            StepsWriter::<ValueRow>::with_shard_plan(
+                &opts.output_dir,
+                "values",
+                &shard_row_counts,
+                opts.overwrite,
+            )?
+        } else {
+            StepsWriter::<ValueRow>::with_prefix(&opts.output_dir, "values", None, opts.overwrite)?
+        };
 
-    for path in &steps_files {
+        let pb = crate::macroxue::default_progress_bar(total_steps as u64);
+        pb.set_message("computing values");
+
+        let mut written = 0usize;
+        let mut expected_run_idx = 0usize;
+        let mut current_run_id: Option<u32> = None;
+        let mut last_step_index: Option<u32> = None;
+        let mut run_steps: Vec<StepValueInput> = Vec::new();
+
+        for (shard_idx, path) in steps_files.iter().enumerate() {
+            let file = fs::File::open(path)
+                .with_context(|| format!("failed to open steps shard {}", path.display()))?;
+            let mut reader = std::io::BufReader::new(file);
+            let npy = NpyFile::new(&mut reader)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+
+            let mut rows = npy
+                .data::<MacroxueStepRow>()
+                .map_err(|err| anyhow!("{}: {err}", path.display()))?;
+            let mut shard_rows = 0usize;
+
+            while let Some(row) = rows.next() {
+                let row =
+                    row.with_context(|| format!("failed to decode row in {}", path.display()))?;
+                shard_rows += 1;
+                pb.inc(1);
+
+                if let Some(current) = current_run_id {
+                    if row.run_id < current {
+                        bail!(
+                            "run_id {} encountered after {} while reading {}",
+                            row.run_id,
+                            current,
+                            path.display()
+                        );
+                    }
+                    if row.run_id != current {
+                        written += flush_run(
+                            current,
+                            expected_run_idx,
+                            &mut run_steps,
+                            &runs,
+                            opts.gamma,
+                            opts.reward_scale,
+                            &mut writer,
+                        )?;
+                        expected_run_idx += 1;
+                        run_steps.clear();
+                        last_step_index = None;
+                        current_run_id = Some(row.run_id);
+                    }
+                } else {
+                    current_run_id = Some(row.run_id);
+                }
+
+                let expected_run = runs.get(expected_run_idx).ok_or_else(|| {
+                    anyhow!(
+                        "run_id {} encountered but metadata only lists {} run(s)",
+                        row.run_id,
+                        runs.len()
+                    )
+                })?;
+                if row.run_id != expected_run.run_id {
+                    bail!(
+                        "run_id {} encountered at position {} but metadata run_id is {}",
+                        row.run_id,
+                        expected_run_idx,
+                        expected_run.run_id
+                    );
+                }
+
+                if let Some(prev_step) = last_step_index.replace(row.step_index) {
+                    if row.step_index < prev_step {
+                        bail!(
+                            "step_index regressed for run {} ({} after {}) in {}",
+                            row.run_id,
+                            row.step_index,
+                            prev_step,
+                            path.display()
+                        );
+                    }
+                }
+
+                run_steps.push(StepValueInput {
+                    step_index: row.step_index,
+                    board: row.board,
+                    tile_65536_mask: row.tile_65536_mask,
+                    move_dir: row.move_dir,
+                });
+            }
+
+            let expected_rows = shard_row_counts
+                .get(shard_idx)
+                .copied()
+                .ok_or_else(|| anyhow!("missing shard metadata for index {}", shard_idx))?;
+            if shard_rows != expected_rows {
+                bail!(
+                    "steps shard {} reported {} rows in header but {} rows were read",
+                    path.display(),
+                    expected_rows,
+                    shard_rows
+                );
+            }
+        }
+
+        if let Some(run_id) = current_run_id {
+            written += flush_run(
+                run_id,
+                expected_run_idx,
+                &mut run_steps,
+                &runs,
+                opts.gamma,
+                opts.reward_scale,
+                &mut writer,
+            )?;
+            expected_run_idx += 1;
+        }
+
+        pb.finish_with_message("value sidecar written");
+
+        if expected_run_idx != runs.len() {
+            bail!(
+                "metadata lists {} run(s) but {} were observed in steps",
+                runs.len(),
+                expected_run_idx
+            );
+        }
+        if written != total_steps {
+            bail!(
+                "wrote {} value rows but metadata reports {} steps",
+                written,
+                total_steps
+            );
+        }
+
+        let shards = writer.finish()?;
+        info!(
+            "Wrote value sidecar: {} runs, {} steps, {} shard(s)",
+            expected_run_idx, written, shards
+        );
+
+        Ok(ValueSidecarSummary {
+            runs: expected_run_idx,
+            steps: written,
+            shards,
+            gamma: opts.gamma,
+            reward_scale: opts.reward_scale,
+        })
+    };
+
+    if let Some(n) = opts.max_workers {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .context("failed to build rayon thread pool")?
+            .install(render_sidecar)
+    } else {
+        render_sidecar()
+    }
+}
+
+fn step_shard_row_counts(step_paths: &[PathBuf]) -> Result<Vec<usize>> {
+    let mut counts = Vec::with_capacity(step_paths.len());
+    for path in step_paths {
         let file = fs::File::open(path)
             .with_context(|| format!("failed to open steps shard {}", path.display()))?;
         let mut reader = std::io::BufReader::new(file);
         let npy = NpyFile::new(&mut reader)
             .with_context(|| format!("failed to read {}", path.display()))?;
-
-        let mut rows = npy
-            .data::<MacroxueStepRow>()
-            .map_err(|err| anyhow!("{}: {err}", path.display()))?;
-        let mut shard_rows = 0usize;
-        while let Some(row) = rows.next() {
-            let row = row.with_context(|| format!("failed to decode row in {}", path.display()))?;
-            shard_rows += 1;
-            pb.inc(1);
-            if let Some(prev) = last_run_seen {
-                if row.run_id < prev {
-                    bail!(
-                        "run_id {} encountered after {} while reading {}",
-                        row.run_id,
-                        prev,
-                        path.display()
-                    );
-                }
-            }
-            last_run_seen = Some(row.run_id);
-
-            let run_id = row.run_id as usize;
-            let run_buf = per_run
-                .get_mut(run_id)
-                .ok_or_else(|| anyhow!("run_id {} out of range", row.run_id))?;
-            if let Some(prev_step) = last_step_index
-                .get_mut(run_id)
-                .and_then(|slot| slot.replace(row.step_index))
-            {
-                if row.step_index < prev_step {
-                    bail!(
-                        "step_index regressed for run {} ({} after {}) in {}",
-                        row.run_id,
-                        row.step_index,
-                        prev_step,
-                        path.display()
-                    );
-                }
-            }
-            run_buf.push(StepValueInput {
-                step_index: row.step_index,
-                board: row.board,
-                tile_65536_mask: row.tile_65536_mask,
-                move_dir: row.move_dir,
-            });
+        let shape = npy.shape();
+        if shape.is_empty() {
+            bail!("{} has no dimensions", path.display());
         }
-        shard_row_counts.push(shard_rows);
-    }
-
-    pb.finish_with_message("steps loaded");
-
-    for (idx, run) in runs.iter().enumerate() {
-        let collected = per_run
-            .get(idx)
-            .ok_or_else(|| anyhow!("missing run buffer for id {}", idx))?;
-        if collected.len() != run.steps {
-            bail!(
-                "run {} reports {} steps in metadata but {} rows were read",
-                run.run_id,
-                run.steps,
-                collected.len()
-            );
+        let rows = usize::try_from(shape[0])
+            .map_err(|_| anyhow!("{} has too many rows for this platform", path.display()))?;
+        if rows == 0 {
+            bail!("{} has zero rows", path.display());
         }
+        counts.push(rows);
     }
-
-    let mut writer = StepsWriter::<ValueRow>::with_prefix(
-        &opts.output_dir,
-        "values",
-        shard_rows_per_output(&shard_row_counts),
-        opts.overwrite,
-    )?;
-
-    let process = || -> Result<Vec<Vec<ValueRow>>> {
-        per_run
-            .par_iter()
-            .enumerate()
-            .map(|(run_id, steps)| compute_run(run_id as u32, steps, opts.gamma, opts.reward_scale))
-            .collect()
-    };
-
-    let results: Vec<Vec<ValueRow>> = if let Some(n) = opts.max_workers {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build()
-            .context("failed to build rayon thread pool")?
-            .install(process)?
-    } else {
-        process()?
-    };
-
-    let mut written = 0usize;
-    for rows in &results {
-        writer.write(rows)?;
-        written += rows.len();
-    }
-    let shards = writer.finish()?;
-
-    info!(
-        "Wrote value sidecar: {} runs, {} steps, {} shard(s)",
-        results.len(),
-        written,
-        shards
-    );
-
-    if written != total_steps {
-        bail!(
-            "wrote {} value rows but metadata reports {} steps",
-            written,
-            total_steps
-        );
-    }
-
-    Ok(ValueSidecarSummary {
-        runs: results.len(),
-        steps: written,
-        shards,
-        gamma: opts.gamma,
-        reward_scale: opts.reward_scale,
-    })
+    Ok(counts)
 }
 
-fn shard_rows_per_output(input_shards: &[usize]) -> Option<usize> {
-    if input_shards.len() <= 1 {
-        None
-    } else {
-        input_shards.first().copied()
+fn should_number_values(step_files: &[PathBuf]) -> bool {
+    if step_files.len() > 1 {
+        return true;
     }
+    if let Some(first) = step_files.first() {
+        if let Some(name) = first.file_name().and_then(|n| n.to_str()) {
+            return name.starts_with("steps-");
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -267,6 +341,46 @@ struct StepValueInput {
     board: u64,
     tile_65536_mask: u16,
     move_dir: u8,
+}
+
+fn flush_run(
+    run_id: u32,
+    run_idx: usize,
+    steps: &mut Vec<StepValueInput>,
+    runs: &[crate::macroxue::RunSummary],
+    gamma: f64,
+    reward_scale: f64,
+    writer: &mut StepsWriter<ValueRow>,
+) -> Result<usize> {
+    let expected = runs.get(run_idx).ok_or_else(|| {
+        anyhow!(
+            "run_id {} out of range (metadata has {} run(s))",
+            run_id,
+            runs.len()
+        )
+    })?;
+    if expected.run_id != run_id {
+        bail!(
+            "run_id {} encountered at index {} but metadata lists run_id {}",
+            run_id,
+            run_idx,
+            expected.run_id
+        );
+    }
+    if steps.len() != expected.steps {
+        bail!(
+            "run {} reports {} steps in metadata but {} rows were read",
+            run_id,
+            expected.steps,
+            steps.len()
+        );
+    }
+
+    let values = compute_run(run_id, steps, gamma, reward_scale)?;
+    writer.write(&values)?;
+    let written = values.len();
+    steps.clear();
+    Ok(written)
 }
 
 fn compute_run(
@@ -429,7 +543,7 @@ fn collect_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
     use crate::macroxue::{RunSummary, write_metadata};
-    use crate::writer::StepsWriter;
+    use crate::writer::{StepsWriter, write_single_shard};
     use tempfile::tempdir;
 
     fn pack_board(exps: [u8; 16]) -> u64 {
@@ -581,6 +695,61 @@ mod tests {
 
         let returns_scaled: Vec<f32> = seen_rows.iter().map(|r| r.return_scaled).collect();
         assert_eq!(returns_scaled, vec![24.0, 32.0, 32.0, 0.0]);
+    }
+
+    #[test]
+    fn value_shards_match_step_shards_one_to_one() {
+        twenty48_utils::engine::new();
+
+        let tmp = tempdir().unwrap();
+        let dataset_dir = tmp.path().join("dataset");
+        fs::create_dir_all(&dataset_dir).unwrap();
+
+        let board = pack_board([0; 16]);
+        let mut rows = Vec::new();
+        for idx in 0..7u32 {
+            rows.push(make_row(0, idx, board, 2));
+        }
+
+        write_single_shard(&rows[..2], &dataset_dir.join("steps-00000.npy")).unwrap();
+        write_single_shard(&rows[2..], &dataset_dir.join("steps-00001.npy")).unwrap();
+
+        let runs = vec![RunSummary {
+            run_id: 0,
+            seed: 0,
+            steps: rows.len(),
+            max_score: 0,
+            highest_tile: 0,
+        }];
+        write_metadata(&dataset_dir, &runs, true).unwrap();
+
+        let opts = ValueSidecarOptions {
+            dataset_dir: dataset_dir.clone(),
+            output_dir: dataset_dir.clone(),
+            gamma: 1.0,
+            reward_scale: 1.0,
+            max_workers: None,
+            overwrite: true,
+        };
+
+        let summary = add_value_sidecar(opts).unwrap();
+        assert_eq!(summary.shards, 2);
+        assert_eq!(summary.steps, rows.len());
+
+        let mut value_paths: Vec<PathBuf> = fs::read_dir(&dataset_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("values-") && n.ends_with(".npy"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        value_paths.sort();
+        let shard_sizes = step_shard_row_counts(&value_paths).unwrap();
+        assert_eq!(shard_sizes, vec![2, 5]);
     }
 
     fn read_values(dir: &Path) -> Vec<ValueRow> {

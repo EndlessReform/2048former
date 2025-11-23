@@ -83,7 +83,7 @@ class ShardLoader:
                 f"value sidecar shard count ({len(value_paths)}) does not match steps shards ({len(self.shards)})"
             )
 
-        offsets: list[int] = []
+        offsets: list[int] = [s.offset for s in self.shards]
         total = 0
         # Lightweight alignment check on run_id/step_index without materializing full arrays
         sample_positions = (0, 1, -1)
@@ -112,7 +112,6 @@ class ShardLoader:
                             f"steps run_id={s_row['run_id']} step_index={s_row['step_index']} "
                             f"vs values run_id={v_row['run_id']} step_index={v_row['step_index']}"
                         )
-            offsets.append(total)
             total += rows
 
         if expected_total_steps is not None and total != int(expected_total_steps):
