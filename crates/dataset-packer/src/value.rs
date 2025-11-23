@@ -174,6 +174,7 @@ pub fn add_value_sidecar(opts: ValueSidecarOptions) -> Result<ValueSidecarSummar
             run_buf.push(StepValueInput {
                 step_index: row.step_index,
                 board: row.board,
+                tile_65536_mask: row.tile_65536_mask,
                 move_dir: row.move_dir,
             });
         }
@@ -264,6 +265,7 @@ fn shard_rows_per_output(input_shards: &[usize]) -> Option<usize> {
 struct StepValueInput {
     step_index: u32,
     board: u64,
+    tile_65536_mask: u16,
     move_dir: u8,
 }
 
@@ -276,7 +278,7 @@ fn compute_run(
     // Compute per-step rewards in parallel to fully utilise cores even for a single long run.
     let rewards: Vec<f32> = steps
         .par_iter()
-        .map(|step| compute_reward(step.board, step.move_dir))
+        .map(|step| compute_reward(step.board, step.tile_65536_mask, step.move_dir))
         .collect::<Result<Vec<_>>>()?;
 
     let mut out = Vec::with_capacity(steps.len());
@@ -307,8 +309,9 @@ fn compute_run(
     Ok(out)
 }
 
-fn compute_reward(board_raw: u64, move_dir: u8) -> Result<f32> {
-    use twenty48_utils::engine::{Board, Move};
+fn compute_reward(board_raw: u64, tile_65536_mask: u16, move_dir: u8) -> Result<f32> {
+    use crate::macroxue::{decode_board, BOARD_LEN};
+    use twenty48_utils::engine::Move;
 
     let dir = match move_dir {
         0 => Move::Up,
@@ -318,11 +321,84 @@ fn compute_reward(board_raw: u64, move_dir: u8) -> Result<f32> {
         other => bail!("invalid move_dir {} (expected 0..=3)", other),
     };
 
-    let board = Board::from_raw(board_raw);
-    let before = twenty48_utils::engine::get_score(board);
-    let after = twenty48_utils::engine::get_score(board.shift(dir));
-    debug!("move {:?}: before={} after={}", dir, before, after);
-    Ok((after as f64 - before as f64) as f32)
+    let exps = decode_board(board_raw, tile_65536_mask);
+    let mut reward: u64 = 0;
+
+    match dir {
+        Move::Left | Move::Right => {
+            for row in 0..4 {
+                let mut line = [
+                    exps[row * 4],
+                    exps[row * 4 + 1],
+                    exps[row * 4 + 2],
+                    exps[row * 4 + 3],
+                ];
+                if matches!(dir, Move::Right) {
+                    line.reverse();
+                }
+                reward = reward.checked_add(line_reward_left(line)?).ok_or_else(|| {
+                    anyhow!("reward overflow while processing row {}", row)
+                })?;
+            }
+        }
+        Move::Up | Move::Down => {
+            for col in 0..(BOARD_LEN / 4) {
+                let mut line = [
+                    exps[col],
+                    exps[4 + col],
+                    exps[8 + col],
+                    exps[12 + col],
+                ];
+                if matches!(dir, Move::Down) {
+                    line.reverse();
+                }
+                reward = reward.checked_add(line_reward_left(line)?).ok_or_else(|| {
+                    anyhow!("reward overflow while processing column {}", col)
+                })?;
+            }
+        }
+    }
+
+    debug!("move {:?}: reward={}", dir, reward);
+    Ok(reward as f32)
+}
+
+fn line_reward_left(mut tiles: [u8; 4]) -> Result<u64> {
+    let mut reward = 0u64;
+    for start in 0..4 {
+        reward = reward
+            .checked_add(calculate_left_shift_with_reward(&mut tiles[start..])?)
+            .ok_or_else(|| anyhow!("reward overflow while shifting line"))?;
+    }
+    Ok(reward)
+}
+
+fn calculate_left_shift_with_reward(slice: &mut [u8]) -> Result<u64> {
+    let mut acc = 0u8;
+    let mut reward = 0u64;
+    for cell in slice.iter_mut() {
+        let val = *cell;
+        if acc != 0 && acc == val {
+            *cell = 0;
+            acc = acc
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("tile exponent overflow while merging"))?;
+            let merge_reward = 1u64
+                .checked_shl(acc as u32)
+                .ok_or_else(|| anyhow!("merge reward overflow for exponent {}", acc))?;
+            reward = reward
+                .checked_add(merge_reward)
+                .ok_or_else(|| anyhow!("reward overflow while merging exponent {}", acc))?;
+            break;
+        } else if acc != 0 && val != 0 && acc != val {
+            break;
+        } else if acc == 0 && val != 0 {
+            *cell = 0;
+            acc = val;
+        }
+    }
+    slice[0] = acc;
+    Ok(reward)
 }
 
 fn collect_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -365,6 +441,21 @@ mod tests {
         acc
     }
 
+    fn pack_board_with_mask(exps: [u8; 16]) -> (u64, u16) {
+        let mut packed = 0u64;
+        let mut mask = 0u16;
+        for (i, &exp) in exps.iter().enumerate() {
+            let mut nib = exp;
+            if nib >= 16 {
+                mask |= 1 << i;
+                nib = 15;
+            }
+            let shift = (15 - i) * 4;
+            packed |= (nib as u64 & 0xF) << shift;
+        }
+        (packed, mask)
+    }
+
     fn make_row(run_id: u32, step_index: u32, board: u64, move_dir: u8) -> MacroxueStepRow {
         MacroxueStepRow {
             run_id,
@@ -379,6 +470,39 @@ mod tests {
             seed: 0,
             branch_evs: [0.0; 4],
         }
+    }
+
+    #[test]
+    fn reward_matches_engine_without_overflow_tiles() {
+        twenty48_utils::engine::new();
+        // Two merges: 2+2 -> 4, 4+4 -> 8 (total reward 12).
+        let board = pack_board([1, 1, 0, 0, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let reward = compute_reward(board, 0, 2).unwrap();
+
+        let before = twenty48_utils::engine::get_score(twenty48_utils::engine::Board::from_raw(board));
+        let after = twenty48_utils::engine::get_score(
+            twenty48_utils::engine::Board::from_raw(board).shift(twenty48_utils::engine::Move::Left),
+        );
+        assert_eq!(reward, (after - before) as f32);
+    }
+
+    #[test]
+    fn reward_accounts_for_merging_into_65536() {
+        twenty48_utils::engine::new();
+        // Two 32768 tiles merge into a 65536 (reward 65536), mask is zero pre-move.
+        let board = pack_board([15, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let reward = compute_reward(board, 0, 2).unwrap();
+        assert_eq!(reward, 65536.0);
+    }
+
+    #[test]
+    fn reward_respects_overflow_masked_tiles() {
+        twenty48_utils::engine::new();
+        // Two 65536 tiles (exp=16) merge into a 131072 tile (reward 131072).
+        let (board, mask) =
+            pack_board_with_mask([16, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let reward = compute_reward(board, mask, 2).unwrap();
+        assert_eq!(reward, 131072.0);
     }
 
     #[test]

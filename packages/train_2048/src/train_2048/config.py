@@ -17,6 +17,36 @@ class TargetConfig(BaseModel):
     mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
 
 
+class ValueTrainingConfig(BaseModel):
+    """Optional value-head training controls for SFT or scratch runs."""
+
+    enabled: bool = False
+    # Loss type used for the value head. Only MSE is supported currently.
+    objective: Literal["mse"] = "mse"
+    # Which target to read from the value sidecar.
+    target: Literal["return_scaled", "return_raw"] = "return_scaled"
+    # Weight applied to the value loss before combining with policy loss.
+    loss_weight: float = 1.0
+    # Weight applied to policy loss (set to 0 to train value only).
+    policy_loss_weight: float = 1.0
+    # When true, keep the shared encoder/trunk frozen (train a value head probe).
+    freeze_trunk: bool = False
+    # Convenience flag to disable policy loss entirely without editing weights.
+    value_only: bool = False
+
+    @field_validator("loss_weight", "policy_loss_weight")
+    @classmethod
+    def _non_negative(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError("value training weights must be >= 0")
+        return v
+
+    def effective_policy_weight(self) -> float:
+        if self.value_only:
+            return 0.0
+        return float(self.policy_loss_weight)
+
+
 def _find_repo_root() -> Path:
     """Return the repository root by walking upwards.
 
@@ -343,6 +373,7 @@ class TrainingConfig(BaseModel):
     batch: BatchConfig = Field(default_factory=BatchConfig)
     dropout: DropoutConfig = Field(default_factory=DropoutConfig)
     target: TargetConfig = Field(default_factory=TargetConfig)
+    value_training: ValueTrainingConfig = Field(default_factory=ValueTrainingConfig)
     # Discretization for EV heads
     binning: BinningConfig = Field(default_factory=BinningConfig)
     # Dataset input
@@ -378,6 +409,7 @@ __all__ = [
     "BatchConfig",
     "DropoutConfig",
     "TargetConfig",
+    "ValueTrainingConfig",
     "CheckpointConfig",
     "TrainingConfig",
     "load_config",

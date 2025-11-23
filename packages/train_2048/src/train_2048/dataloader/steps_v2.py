@@ -18,11 +18,10 @@ from torch.utils.data import DataLoader
 from .shard_loader import ShardLoader
 from .dataset import ShardDataset
 from .metadata import MetadataDB
-from .samplers import ShardPoolSampler, BufferedShuffleSampler, SequentialSampler
-from .collate import make_collate_macroxue, make_collate_steps
+from .samplers import ShardPoolSampler, BufferedShuffleSampler
 
 from ..binning import Binner
-from ..tokenization.base import BoardCodec
+from ..config import ValueTrainingConfig
 
 
 def build_steps_dataloaders(
@@ -57,6 +56,7 @@ def build_steps_dataloaders(
     shard_locality_block_size: Optional[int] = None,
     shard_cache_in_memory: bool = True,
     shard_cache_keep_shards: int = 1,
+    value_cfg: Optional[ValueTrainingConfig] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], int, Dict[str, Any]]:
     """Build train/val dataloaders using efficient shard-based loading.
 
@@ -71,14 +71,24 @@ def build_steps_dataloaders(
 
     # Initialize metadata DB and shard loader
     metadata = MetadataDB(dataset_dir)
+    meta_total_steps = metadata.get_total_steps_for_runs()
+    use_value_sidecar = bool(value_cfg and getattr(value_cfg, "enabled", False))
+    value_target_field = value_cfg.target if value_cfg is not None else "return_scaled"
 
     # Use mmap_mode=False when shard_cache_in_memory=True for better performance
     # (we're loading shards fully anyway)
     use_mmap = mmap_mode and not shard_cache_in_memory
-    shard_loader = ShardLoader(dataset_dir, mmap_mode=use_mmap)
+    shard_loader = ShardLoader(
+        dataset_dir,
+        mmap_mode=use_mmap,
+        value_sidecar=use_value_sidecar,
+        expected_total_steps=meta_total_steps,
+    )
 
     print(f"[data] Dataset: {shard_loader}")
     print(f"[data] Metadata: {metadata.get_run_count()} runs")
+    if use_value_sidecar:
+        print(f"[data] Value sidecar enabled (target={value_target_field})")
 
     # Split runs into train/val using metadata
     train_run_ids, val_run_ids = metadata.split_runs_train_val(
@@ -107,10 +117,24 @@ def build_steps_dataloaders(
             raise ValueError("tokenizer_path required for macroxue_tokens mode")
         # Create a worker-safe collate that doesn't capture dataset in closure
         from .collate import make_collate_macroxue_worker_safe
-        collate_fn = make_collate_macroxue_worker_safe(dataset_dir, tokenizer_path)
+        collate_fn = make_collate_macroxue_worker_safe(
+            dataset_dir,
+            tokenizer_path,
+            include_values=use_value_sidecar,
+            value_target_field=value_target_field,
+            expected_total_steps=meta_total_steps,
+        )
     else:
         from .collate import make_collate_steps_worker_safe
-        collate_fn = make_collate_steps_worker_safe(dataset_dir, target_mode, binner, ev_tokenizer=ev_tokenizer)
+        collate_fn = make_collate_steps_worker_safe(
+            dataset_dir,
+            target_mode,
+            binner,
+            ev_tokenizer=ev_tokenizer,
+            include_values=use_value_sidecar,
+            value_target_field=value_target_field,
+            expected_total_steps=meta_total_steps,
+        )
 
     # Build training dataloader
     effective_batch_size = int(batch_size)
@@ -372,6 +396,7 @@ def build_steps_dataloaders(
         "val_run_ids": val_run_ids,
         "meta_train_steps": int(meta_train_steps),
         "meta_val_steps": int(meta_val_steps),
+        "meta_total_steps": int(meta_total_steps),
         "sampler": sampler_info,
         "effective_batch_size": effective_batch_size,
         "loader_batch_size": loader_batch_size,
@@ -380,6 +405,8 @@ def build_steps_dataloaders(
         "resume_skip_samples": int(skip_applied),
         "train_num_steps": int(train_num_steps) if train_num_steps is not None else None,
         "num_epochs": int(num_epochs) if num_epochs is not None else None,
+        "value_sidecar": bool(use_value_sidecar),
+        "value_target": value_target_field,
     }
 
     return dl_train, dl_val, per_epoch_steps, metadata

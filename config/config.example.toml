@@ -53,6 +53,21 @@ special_zero_one = true
 # Semantic edges for EV discretization (default used if omitted)
 edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 
+# Optional: supervised value head training (e.g., return prediction probe)
+[value_training]
+# Enable to consume values.npy/values-*.npy sidecar and train the value head.
+enabled = false
+# Loss type for the value head. Only mse is supported today.
+objective = "mse"           # mse
+# Target source from the value sidecar (return_scaled is default and recommended).
+target = "return_scaled"    # return_scaled | return_raw
+# Loss weights (set policy_loss_weight=0 or value_only=true for value-only training).
+loss_weight = 1.0
+policy_loss_weight = 1.0
+value_only = false
+# Freeze encoder/trunk when training a value probe on a fixed policy.
+freeze_trunk = false
+
 [dataset]
 # Root directory containing steps.npy and metadata.db (resolved relative to repo root)
 dataset_dir = "./dataset_dir"

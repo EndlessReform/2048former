@@ -14,12 +14,13 @@ where the raw reward is the step-wise merge gain. Later we can layer on N-step T
 
 Status snapshot (Apr 2025):
 - ✅ Value sidecar CLI (`value-sidecar`) computes per-step rewards via `twenty48-utils` merge scores and writes discounted returns (`reward`, `reward_scaled`, `return_raw`, `return_scaled`) aligned to `steps-*.npy`. Flags: `--gamma`, `--reward-scale`, `--workers`, `--overwrite`.
-- ⏳ Value head + training/inference plumbing still pending.
+- ✅ Value head + config plumbing: `core_2048` now exposes an optional mean-pooled value head with either MSE (scalar) or discrete cross-entropy (vocab_size + vocab_type) output. See `ValueHeadConfig`/`ValueObjectiveConfig` in `packages/core_2048/src/core_2048/model.py` and the init schema notes in `packages/core_2048/README.md`.
+- ⏳ Training/inference wiring for value targets/predictions is still pending.
 
 - Macroxue packs only store policy metadata: see `crates/dataset-packer/src/schema.rs` and `docs/macroxue_data/data_format.md`. There is no reward/return field yet; `runs.max_score` in SQLite is the final score only.
-- The transformer only exposes policy heads: `packages/core_2048/src/core_2048/model.py` implements four binned EV heads or a single 4-way policy head. No value head or shared/value config exists.
-- Training plumbs policy-only batches: `packages/train_2048/src/train_2048/dataloader/collate.py` emits branch EV bins/moves; objectives are policy-only (`objectives/binned_ev.py`, `macroxue_tokens.py`).
-- Inference and annotations are policy-only: the protobuf (`proto/train_2048/inference/v1/inference.proto`) and server (`packages/infer_2048/src/infer_2048/server.py`) return policy bins/logits and optional embeddings; the annotation writer (`crates/dataset-packer/src/schema.rs`) has no value slots.
+- The transformer now returns `(hidden_states, policy_out, value_out)` where `value_out` is `None` when disabled; policy heads are unchanged (binned EV or action_policy). Legacy callers still work because unpacking is handled centrally.
+- Training still batches policy-only today: `packages/train_2048/src/train_2048/dataloader/collate.py` emits branch EV bins/moves; objectives are policy-only (`objectives/binned_ev.py`, `macroxue_tokens.py`). A small helper (`objectives/utils.py::unpack_model_outputs`) makes objectives tolerant of the optional value head, but value losses are not wired yet.
+- Inference and annotations remain policy-only: the protobuf (`proto/train_2048/inference/v1/inference.proto`) and server (`packages/infer_2048/src/infer_2048/server.py`) ignore `value_out` for now; the annotation writer (`crates/dataset-packer/src/schema.rs`) has no value slots.
 
 ## Data pipeline plan
 
@@ -44,20 +45,20 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 
 ## Model and training plan
 
-- [ ] Add a value head atop the pooled board representation (same mean-pooled hidden state as policy heads). Keep the option to share trunk weights with policy.
-- [ ] Config knobs to enable value head, choose objective (MSE vs discrete/two-hot), and freeze/unfreeze the encoder.
+- [x] Add a value head atop the pooled board representation (same mean-pooled hidden state as policy heads). Keep the option to share trunk weights with policy.
+- [x] Config knobs to enable value head, choose objective (MSE vs discrete/two-hot), and freeze/unfreeze the encoder. (`value_head.enabled/pooling/objective.type|vocab_size|vocab_type` in config.json; pooling is mean-only for now. Trunk freezing to be handled in trainer.)
 - [ ] Data loader joins: load value sidecar and align on `(run_id, step_index)` to batch `return` targets alongside existing policy fields.
 - [ ] Training modes: (a) train value head only on frozen trunk; (b) fine-tune both heads jointly with weighted losses; (c) from-scratch co-training.
 - [ ] Optional: experiment with Perceiver-style aggregation instead of mean-pooling for the value readout.
 
 ## Inference and evaluation plan
 
-- [ ] Extend the protobuf + server to stream value predictions (raw and inverse-transformed) optionally, without forcing 1-ply inference to pay for it.
+- [ ] Extend the protobuf + server to stream value predictions (raw and inverse-transformed) optionally, without forcing 1-ply inference to pay for it. Server already accepts the third output but currently ignores it.
 - [ ] Add value fields to annotation sidecars and viewer rails so per-step values can be inspected (match `annotation_manifest.json` shape checks).
 - [ ] Add a smoke-test script mirroring `bin/play_2048.py` that logs predicted value vs realised returns over a short rollout.
 
 ## Contradictions vs current stack (review)
 
-- There is **no value head implemented** today in `core_2048` or `train_2048`; all heads are policy-only.
+- The value head exists and is optional; policy-only configs remain backward compatible (omit `value_head` in config.json).
 - Datasets **do not carry reward/return columns**; only `max_score` per run exists, so a new sidecar/pack step is required before value training is possible.
-- Inference/annotation rails **only move policy logits/bins**; the gRPC schema and Rust/Python servers would need extensions before value outputs can flow end-to-end.
+- Inference/annotation rails **only move policy logits/bins**; the gRPC schema and Rust/Python servers still need extensions before value outputs can flow end-to-end.

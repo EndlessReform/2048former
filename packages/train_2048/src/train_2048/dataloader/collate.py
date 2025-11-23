@@ -335,7 +335,14 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
     return _collate
 
 
-def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> Callable:
+def make_collate_macroxue_worker_safe(
+    dataset_dir: str,
+    tokenizer_path: str,
+    *,
+    include_values: bool = False,
+    value_target_field: str = "return_scaled",
+    expected_total_steps: Optional[int] = None,
+) -> Callable:
     """Worker-safe collate that creates its own shard loader per worker."""
     # Import here to avoid circular deps
     from .shard_loader import ShardLoader
@@ -345,7 +352,12 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
 
     def _get_loader():
         if _worker_loader[0] is None:
-            _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=True)
+            _worker_loader[0] = ShardLoader(
+                dataset_dir,
+                mmap_mode=True,
+                value_sidecar=include_values,
+                expected_total_steps=expected_total_steps,
+            )
         return _worker_loader[0]
 
     # Load tokenizer config once
@@ -443,11 +455,20 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
                     board_eval=board_evals[i],
                 )
 
-            return {
+            out = {
                 "tokens": tokens,
                 "targets": torch.from_numpy(targets.copy()).long(),
                 "n_classes": n_classes,
             }
+            if include_values:
+                value_rows = loader.get_value_rows(idxs)
+                if value_target_field not in value_rows.dtype.names:
+                    raise KeyError(f"value sidecar missing '{value_target_field}'")
+                value_targets = torch.from_numpy(
+                    value_rows[value_target_field].astype(_np.float32, copy=False).copy()
+                )
+                out["value_targets"] = value_targets
+            return out
 
         return _collate
     else:
@@ -461,7 +482,10 @@ def make_collate_steps_worker_safe(
     target_mode: str,
     binner: Optional[Binner],
     *,
-    ev_tokenizer: Optional[object] = None
+    ev_tokenizer: Optional[object] = None,
+    include_values: bool = False,
+    value_target_field: str = "return_scaled",
+    expected_total_steps: Optional[int] = None,
 ) -> Callable:
     """Worker-safe collate for regular steps datasets."""
     from .shard_loader import ShardLoader
@@ -470,7 +494,12 @@ def make_collate_steps_worker_safe(
 
     def _get_loader():
         if _worker_loader[0] is None:
-            _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=True)
+            _worker_loader[0] = ShardLoader(
+                dataset_dir,
+                mmap_mode=True,
+                value_sidecar=include_values,
+                expected_total_steps=expected_total_steps,
+            )
         return _worker_loader[0]
 
     if target_mode not in {"binned_ev", "hard_move"}:
@@ -526,6 +555,15 @@ def make_collate_steps_worker_safe(
             else:
                 raise KeyError("move_dir/move missing")
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
+
+        if include_values:
+            value_rows = loader.get_value_rows(idxs)
+            if value_target_field not in value_rows.dtype.names:
+                raise KeyError(f"value sidecar missing '{value_target_field}'")
+            value_targets = torch.from_numpy(
+                value_rows[value_target_field].astype(_np.float32, copy=False).copy()
+            )
+            out["value_targets"] = value_targets
 
         return out
 

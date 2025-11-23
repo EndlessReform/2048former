@@ -53,6 +53,9 @@ def _format_postfix(
                 pa = metrics.get("policy_agree")
             if pa is not None:
                 base += f"  agree={float(pa) * 100:.1f}%"
+    value_loss = metrics.get("value_loss")
+    if value_loss is not None:
+        base += f"  value={float(value_loss):.4f}"
     else:
         acc = metrics.get("policy_accuracy")
         if acc is None:
@@ -221,6 +224,7 @@ def init_datasets(
         val_split_seed=cfg.dataset.val_split_seed,
         num_workers_train=12,
         mmap_mode=cfg.dataset.mmap_mode,
+        value_cfg=getattr(cfg, "value_training", None),
     )
 
 
@@ -403,6 +407,10 @@ def _build_train_payload(
             acc = metrics.get("policy_acc")
         if acc is not None:
             payload["train/policy_accuracy"] = float(acc)
+    if metrics.get("policy_loss") is not None:
+        payload["train/policy_loss"] = float(metrics["policy_loss"])
+    if metrics.get("value_loss") is not None:
+        payload["train/value_loss"] = float(metrics["value_loss"])
     if effective_batch_size is not None:
         payload["train/effective_batch_size"] = int(effective_batch_size)
     if accum_steps is not None:
@@ -424,6 +432,10 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
             acc = metrics.get("policy_acc")
         if acc is not None:
             payload["val/policy_accuracy"] = float(acc)
+    if metrics.get("policy_loss") is not None:
+        payload["val/policy_loss"] = float(metrics["policy_loss"])
+    if metrics.get("value_loss") is not None:
+        payload["val/value_loss"] = float(metrics["value_loss"])
     return payload
 
 

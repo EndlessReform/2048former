@@ -27,11 +27,23 @@ class ShardLoader:
     - Eager loading entire shards into RAM for fast random access
     """
 
-    def __init__(self, dataset_dir: str, mmap_mode: bool = False):
+    def __init__(
+        self,
+        dataset_dir: str,
+        mmap_mode: bool = False,
+        *,
+        value_sidecar: bool = False,
+        expected_total_steps: Optional[int] = None,
+    ):
         self.dataset_dir = Path(dataset_dir)
         self.mmap_mode = mmap_mode
         self.shards: list[ShardInfo] = []
         self._loaded_shards: dict[int, np.ndarray] = {}
+        # Optional value sidecar shards (values.npy / values-*.npy)
+        self._value_paths: list[Path] | None = None
+        self._value_offsets: list[int] | None = None
+        self._loaded_value_shards: dict[int, np.ndarray] = {}
+        self.value_total_steps: Optional[int] = None
 
         # Discover shards
         shard_paths = sorted(self.dataset_dir.glob("steps-*.npy"))
@@ -54,6 +66,66 @@ class ShardLoader:
             offset += num_steps
 
         self.total_steps = offset
+        if value_sidecar:
+            self._init_value_sidecar(expected_total_steps)
+
+    def _init_value_sidecar(self, expected_total_steps: Optional[int]) -> None:
+        """Load metadata for the value sidecar and validate alignment."""
+        value_paths = sorted(self.dataset_dir.glob("values-*.npy"))
+        if not value_paths:
+            single = self.dataset_dir / "values.npy"
+            if single.is_file():
+                value_paths = [single]
+        if not value_paths:
+            raise FileNotFoundError(f"value_sidecar requested but no values.npy/values-*.npy found in {self.dataset_dir}")
+        if len(value_paths) != len(self.shards):
+            raise ValueError(
+                f"value sidecar shard count ({len(value_paths)}) does not match steps shards ({len(self.shards)})"
+            )
+
+        offsets: list[int] = []
+        total = 0
+        # Lightweight alignment check on run_id/step_index without materializing full arrays
+        sample_positions = (0, 1, -1)
+        for idx, (val_path, step_info) in enumerate(zip(value_paths, self.shards)):
+            val_arr = np.load(str(val_path), mmap_mode="r")
+            rows = val_arr.shape[0]
+            if rows != step_info.num_steps:
+                raise ValueError(
+                    f"value shard {val_path.name} has {rows} rows but steps shard {step_info.path.name} has {step_info.num_steps}"
+                )
+            for required in ("run_id", "step_index"):
+                if required not in val_arr.dtype.names:
+                    raise ValueError(f"value shard {val_path.name} missing '{required}' column")
+            # Spot-check alignment on a few positions (first/second/last) to catch obvious drift.
+            if rows > 0:
+                step_arr = np.load(str(step_info.path), mmap_mode="r")
+                for required in ("run_id", "step_index"):
+                    if required not in step_arr.dtype.names:
+                        raise ValueError(f"steps shard {step_info.path.name} missing '{required}' column")
+                for pos in {p if p >= 0 else rows + p for p in sample_positions if abs(p) < rows}:
+                    s_row = step_arr[int(pos)]
+                    v_row = val_arr[int(pos)]
+                    if s_row["run_id"] != v_row["run_id"] or s_row["step_index"] != v_row["step_index"]:
+                        raise ValueError(
+                            f"value shard {val_path.name} mismatch at position {pos}: "
+                            f"steps run_id={s_row['run_id']} step_index={s_row['step_index']} "
+                            f"vs values run_id={v_row['run_id']} step_index={v_row['step_index']}"
+                        )
+            offsets.append(total)
+            total += rows
+
+        if expected_total_steps is not None and total != int(expected_total_steps):
+            raise ValueError(
+                f"value sidecar rows ({total}) do not match metadata steps ({expected_total_steps})"
+            )
+        if total != self.total_steps:
+            raise ValueError(
+                f"value sidecar rows ({total}) do not match steps rows ({self.total_steps})"
+            )
+        self._value_paths = value_paths
+        self._value_offsets = offsets
+        self.value_total_steps = total
 
     def load_shard(self, shard_idx: int) -> np.ndarray:
         """Load a shard into memory (or return mmap view)."""
@@ -70,9 +142,24 @@ class ShardLoader:
 
         return arr
 
+    def load_value_shard(self, shard_idx: int) -> np.ndarray:
+        """Load a value shard into memory (or return mmap view)."""
+        if self._value_paths is None or self._value_offsets is None:
+            raise RuntimeError("value sidecar not initialised for this ShardLoader")
+        if shard_idx in self._loaded_value_shards:
+            return self._loaded_value_shards[shard_idx]
+
+        path = self._value_paths[shard_idx]
+        mode = "r" if self.mmap_mode else None
+        arr = np.load(str(path), mmap_mode=mode)
+        if not self.mmap_mode:
+            self._loaded_value_shards[shard_idx] = arr
+        return arr
+
     def unload_shard(self, shard_idx: int) -> None:
         """Release a shard from memory cache."""
         self._loaded_shards.pop(shard_idx, None)
+        self._loaded_value_shards.pop(shard_idx, None)
 
     def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
         """Fetch rows by global index (legacy interface for compatibility)."""
@@ -104,9 +191,40 @@ class ShardLoader:
         unsort_idx[sorted_idx] = np.arange(len(global_indices))
         return out[unsort_idx]
 
+    def get_value_rows(self, global_indices: np.ndarray) -> np.ndarray:
+        """Fetch value sidecar rows aligned with the given global indices."""
+        if self._value_paths is None or self._value_offsets is None:
+            raise RuntimeError("value sidecar not initialised for this ShardLoader")
+
+        sorted_idx = np.argsort(global_indices)
+        sorted_global = global_indices[sorted_idx]
+        shard_boundaries = np.array(list(self._value_offsets) + [self.total_steps])  # type: ignore[arg-type]
+        shard_idx = np.searchsorted(shard_boundaries[:-1], sorted_global, side="right") - 1
+
+        first_value = self.load_value_shard(0)
+        out = np.empty(len(global_indices), dtype=first_value.dtype)
+
+        pos = 0
+        for sid in np.unique(shard_idx):
+            mask = shard_idx == sid
+            count = mask.sum()
+            shard = self.load_value_shard(sid)
+            shard_offset = self._value_offsets[sid]
+            local_idx = sorted_global[mask] - shard_offset
+            out[pos:pos + count] = shard[local_idx]
+            pos += count
+
+        unsort_idx = np.empty_like(sorted_idx)
+        unsort_idx[sorted_idx] = np.arange(len(global_indices))
+        return out[unsort_idx]
+
     def __repr__(self) -> str:
         mode = "mmap" if self.mmap_mode else "eager"
-        return f"ShardLoader({len(self.shards)} shards, {self.total_steps:,} steps, mode={mode})"
+        value = " +values" if self._value_paths else ""
+        return f"ShardLoader({len(self.shards)} shards, {self.total_steps:,} steps, mode={mode}{value})"
+
+    def has_value_sidecar(self) -> bool:
+        return self._value_paths is not None
 
 
 class InMemoryShardPool:
