@@ -29,12 +29,14 @@ class ValueTrainingConfig(BaseModel):
     loss_weight: float = 1.0
     # Weight applied to policy loss (set to 0 to train value only).
     policy_loss_weight: float = 1.0
+    # Additional multiplier for the value loss when mixing it with policy loss.
+    value_loss_policy_scale: float = 1.0
     # When true, keep the shared encoder/trunk frozen (train a value head probe).
     freeze_trunk: bool = False
     # Convenience flag to disable policy loss entirely without editing weights.
     value_only: bool = False
 
-    @field_validator("loss_weight", "policy_loss_weight")
+    @field_validator("loss_weight", "policy_loss_weight", "value_loss_policy_scale")
     @classmethod
     def _non_negative(cls, v: float) -> float:
         if v < 0.0:

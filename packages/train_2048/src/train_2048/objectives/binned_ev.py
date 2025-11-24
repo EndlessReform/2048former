@@ -65,6 +65,7 @@ class BinnedEV(Objective):
         value_enabled = bool(value_cfg and getattr(value_cfg, "enabled", False))
         policy_weight = float(value_cfg.effective_policy_weight()) if value_cfg else 1.0
         value_weight = float(getattr(value_cfg, "loss_weight", 0.0)) if value_cfg else 0.0
+        value_scale = float(getattr(value_cfg, "value_loss_policy_scale", 1.0)) if value_cfg else 1.0
 
         if zero_grad:
             optimizer.zero_grad(set_to_none=True)
@@ -105,7 +106,7 @@ class BinnedEV(Objective):
                 value_loss_tensor = F.mse_loss(value_pred, value_targets, reduction="mean")
             loss = policy_loss * float(policy_weight)
             if value_loss_tensor is not None:
-                loss = loss + value_loss_tensor * float(value_weight)
+                loss = loss + value_loss_tensor * float(value_weight * value_scale)
 
         scaled_loss = loss * float(loss_scale)
         scaled_loss.backward()
@@ -140,6 +141,7 @@ class BinnedEV(Objective):
         value_enabled = bool(value_cfg and getattr(value_cfg, "enabled", False))
         policy_weight = float(value_cfg.effective_policy_weight()) if value_cfg else 1.0
         value_weight = float(getattr(value_cfg, "loss_weight", 0.0)) if value_cfg else 0.0
+        value_scale = float(getattr(value_cfg, "value_loss_policy_scale", 1.0)) if value_cfg else 1.0
 
         if device.type == "cuda":
             autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -182,7 +184,7 @@ class BinnedEV(Objective):
                     value_loss_tensor = F.mse_loss(value_pred, value_targets, reduction="mean")
                 loss = policy_loss * float(policy_weight)
                 if value_loss_tensor is not None:
-                    loss = loss + value_loss_tensor * float(value_weight)
+                    loss = loss + value_loss_tensor * float(value_weight * value_scale)
 
             total_loss += float(loss.detach().item())
             total_heads += torch.tensor([lh.detach().item() for lh in per_head_losses], dtype=torch.float64)

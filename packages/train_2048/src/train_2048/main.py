@@ -20,6 +20,11 @@ def main(argv: Optional[list[str]] = None):
         default=None,
         help="Device override (e.g., cuda, cpu). Defaults to CUDA if available.",
     )
+    parser.add_argument(
+        "--show-bar-timing",
+        action="store_true",
+        help="Include data/compute timing on the progress bar (off by default).",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -79,7 +84,7 @@ def main(argv: Optional[list[str]] = None):
     )
     print(f"Config loaded from: {args.config}")
 
-    _ckpt_path, _global_step = run_training(cfg, device_str, wandb_run)
+    _ckpt_path, _global_step = run_training(cfg, device_str, wandb_run, show_timing_in_bar=args.show_bar_timing)
 
 
 if __name__ == "__main__":

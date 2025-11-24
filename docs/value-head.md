@@ -15,11 +15,11 @@ where the raw reward is the step-wise merge gain. Later we can layer on N-step T
 Status snapshot (Apr 2025):
 - ✅ Value sidecar CLI (`value-sidecar`) computes per-step rewards via `twenty48-utils` merge scores and writes discounted returns (`reward`, `reward_scaled`, `return_raw`, `return_scaled`) aligned to `steps-*.npy`. Flags: `--gamma`, `--reward-scale`, `--workers`, `--overwrite`.
 - ✅ Value head + config plumbing: `core_2048` now exposes an optional mean-pooled value head with either MSE (scalar) or discrete cross-entropy (vocab_size + vocab_type) output. See `ValueHeadConfig`/`ValueObjectiveConfig` in `packages/core_2048/src/core_2048/model.py` and the init schema notes in `packages/core_2048/README.md`.
-- ⏳ Training/inference wiring for value targets/predictions is still pending.
+- ✅ Training path: dataloaders can join the value sidecar and `BinnedEV` will mix an MSE value loss alongside policy loss (tunable via `value_training.value_loss_policy_scale`; defaults to 1.0). Inference remains policy-only for now.
 
 - Macroxue packs only store policy metadata: see `crates/dataset-packer/src/schema.rs` and `docs/macroxue_data/data_format.md`. There is no reward/return field yet; `runs.max_score` in SQLite is the final score only.
 - The transformer now returns `(hidden_states, policy_out, value_out)` where `value_out` is `None` when disabled; policy heads are unchanged (binned EV or action_policy). Legacy callers still work because unpacking is handled centrally.
-- Training still batches policy-only today: `packages/train_2048/src/train_2048/dataloader/collate.py` emits branch EV bins/moves; objectives are policy-only (`objectives/binned_ev.py`, `macroxue_tokens.py`). A small helper (`objectives/utils.py::unpack_model_outputs`) makes objectives tolerant of the optional value head, but value losses are not wired yet.
+- Training defaults to policy-only, but when `value_training.enabled=true` the dataloaders emit `value_targets` and the objectives consume them (policy/objective wiring stays backward compatible when value is disabled).
 - Inference and annotations remain policy-only: the protobuf (`proto/train_2048/inference/v1/inference.proto`) and server (`packages/infer_2048/src/infer_2048/server.py`) ignore `value_out` for now; the annotation writer (`crates/dataset-packer/src/schema.rs`) has no value slots.
 
 ## Data pipeline plan
@@ -47,8 +47,8 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 
 - [x] Add a value head atop the pooled board representation (same mean-pooled hidden state as policy heads). Keep the option to share trunk weights with policy.
 - [x] Config knobs to enable value head, choose objective (MSE vs discrete/two-hot), and freeze/unfreeze the encoder. (`value_head.enabled/pooling/objective.type|vocab_size|vocab_type` in config.json; pooling is mean-only for now. Trunk freezing to be handled in trainer.)
-- [ ] Data loader joins: load value sidecar and align on `(run_id, step_index)` to batch `return` targets alongside existing policy fields.
-- [ ] Training modes: (a) train value head only on frozen trunk; (b) fine-tune both heads jointly with weighted losses; (c) from-scratch co-training.
+- [x] Data loader joins: load value sidecar and align on `(run_id, step_index)` to batch `return` targets alongside existing policy fields (`value_training.enabled`).
+- [x] Training modes: (a) train value head only on frozen trunk; (b) fine-tune both heads jointly with weighted losses; (c) from-scratch co-training (`value_training.freeze_trunk`, `value_only`, loss weights/scales).
 - [ ] Optional: experiment with Perceiver-style aggregation instead of mean-pooling for the value readout.
 
 ## Inference and evaluation plan

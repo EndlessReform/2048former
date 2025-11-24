@@ -45,29 +45,36 @@ def _format_postfix(
     parts: list[str] = []
     if global_step is not None:
         parts.append(f"step={global_step}")
-    base = f"loss={loss:.4f}"
+    info_parts: list[str] = [f"loss={loss:.4f}"]
     if target_mode in ("binned_ev", "macroxue_tokens"):
         if target_mode == "macroxue_tokens":
             pa = metrics.get("policy_agreement")
             if pa is None:
                 pa = metrics.get("policy_agree")
             if pa is not None:
-                base += f"  agree={float(pa) * 100:.1f}%"
+                info_parts.append(f"agree={float(pa) * 100:.1f}%")
     value_loss = metrics.get("value_loss")
+    policy_loss = metrics.get("policy_loss")
     if value_loss is not None:
-        base += f"  value={float(value_loss):.4f}"
+        if policy_loss is not None:
+            info_parts.append(f"policy_ce={float(policy_loss):.4f}")
+        info_parts.append(f"value_mse={float(value_loss):.4f}")
     else:
         acc = metrics.get("policy_accuracy")
         if acc is None:
             acc = metrics.get("policy_acc")
         if acc is not None:
-            base += f"  policy_acc={float(acc):.3f}"
-    base += f"  lr={lr:.2e}"
-    if accum_steps is not None and micro_batch_size is not None:
+            info_parts.append(f"policy_acc={float(acc):.3f}")
+        elif policy_loss is not None:
+            info_parts.append(f"policy_ce={float(policy_loss):.4f}")
+    info_parts.append(f"lr={lr:.2e}")
+    if accum_steps is not None and micro_batch_size is not None and accum_steps > 1:
         effective = int(accum_steps) * int(micro_batch_size)
         parts.append(f"mb={int(micro_batch_size)} eff={effective}")
     if dt_data_ms is not None and dt_comp_ms is not None:
-        base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
+        info_parts.append(f"data={dt_data_ms:.1f}ms")
+        info_parts.append(f"comp={dt_comp_ms:.1f}ms")
+    base = "  ".join(info_parts)
     if parts:
         return f"{' '.join(parts)}  {base}"
     return base
@@ -409,8 +416,10 @@ def _build_train_payload(
             payload["train/policy_accuracy"] = float(acc)
     if metrics.get("policy_loss") is not None:
         payload["train/policy_loss"] = float(metrics["policy_loss"])
+        payload["train/policy_ce"] = float(metrics["policy_loss"])
     if metrics.get("value_loss") is not None:
         payload["train/value_loss"] = float(metrics["value_loss"])
+        payload["train/value_mse"] = float(metrics["value_loss"])
     if effective_batch_size is not None:
         payload["train/effective_batch_size"] = int(effective_batch_size)
     if accum_steps is not None:
@@ -434,8 +443,10 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
             payload["val/policy_accuracy"] = float(acc)
     if metrics.get("policy_loss") is not None:
         payload["val/policy_loss"] = float(metrics["policy_loss"])
+        payload["val/policy_ce"] = float(metrics["policy_loss"])
     if metrics.get("value_loss") is not None:
         payload["val/value_loss"] = float(metrics["value_loss"])
+        payload["val/value_mse"] = float(metrics["value_loss"])
     return payload
 
 
@@ -495,7 +506,7 @@ def _finalize_metric_sums(
     return result
 
 
-def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
+def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None, *, show_timing_in_bar: bool = False) -> Tuple[Path, int]:
     device = torch.device(device_str)
     target_mode = getattr(cfg.target, "mode", "binned_ev")
 
@@ -747,8 +758,8 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                     global_step=global_step,
                     accum_steps=accum_steps,
                     micro_batch_size=micro_batch_size,
-                    dt_data_ms=dt_data_ms,
-                    dt_comp_ms=dt_comp_ms,
+                    dt_data_ms=(dt_data_ms if show_timing_in_bar else None),
+                    dt_comp_ms=(dt_comp_ms if show_timing_in_bar else None),
                 )
             )
             if wandb_run is not None and (global_step % wandb_report_every == 0):

@@ -64,6 +64,8 @@ target = "return_scaled"    # return_scaled | return_raw
 # Loss weights (set policy_loss_weight=0 or value_only=true for value-only training).
 loss_weight = 1.0
 policy_loss_weight = 1.0
+# Extra scale for the value loss relative to the policy component.
+value_loss_policy_scale = 1.0
 value_only = false
 # Freeze encoder/trunk when training a value probe on a fixed policy.
 freeze_trunk = false
