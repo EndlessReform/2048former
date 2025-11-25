@@ -3,24 +3,24 @@ checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
-enabled = false
+enabled = true
 project = "train-2048-bin-v2"
 entity = ""
 run_name = ""
-tags = ["v2", "macroxue-binned", "narrow_n1", "value-head", "mse"]
-mode = "online"                                                    # online | offline | disabled
-report_every = 50                                                  # log to W&B every N steps (>=1)
+tags = ["v2", "macroxue-binned", "narrow_n1", "value-head", "ce"]
+mode = "online"                                                   # online | offline | disabled
+report_every = 50                                                 # log to W&B every N steps (>=1)
 
 [target]
 mode = "macroxue_tokens"
 
 [value_training]
 enabled = true
-objective = "mse"
+objective = "cross_entropy"
 target = "return_scaled"
 loss_weight = 1.0
 policy_loss_weight = 1.0
-value_loss_policy_scale = 0.005
+value_loss_policy_scale = 1.0
 freeze_trunk = false
 value_only = false
 
@@ -44,7 +44,7 @@ beta2 = 0.98
 eps = 1e-8
 
 [batch]
-batch_size = 3072
+batch_size = 1024
 
 [dropout]
 dropout_prob = 0.03

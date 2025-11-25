@@ -21,8 +21,8 @@ class ValueTrainingConfig(BaseModel):
     """Optional value-head training controls for SFT or scratch runs."""
 
     enabled: bool = False
-    # Loss type used for the value head. Only MSE is supported currently.
-    objective: Literal["mse"] = "mse"
+    # Loss type used for the value head.
+    objective: Literal["mse", "cross_entropy"] = "mse"
     # Which target to read from the value sidecar.
     target: Literal["return_scaled", "return_raw"] = "return_scaled"
     # Weight applied to the value loss before combining with policy loss.
@@ -35,6 +35,13 @@ class ValueTrainingConfig(BaseModel):
     freeze_trunk: bool = False
     # Convenience flag to disable policy loss entirely without editing weights.
     value_only: bool = False
+    # Two-hot/cross-entropy support definition (MuZero-style transform + integer support).
+    ce_vocab_size: int = 601
+    ce_support_min: float = 0.0
+    ce_support_max: float = 600.0
+    ce_transform_epsilon: float = 0.001
+    # Apply MuZero transform before binning; disable if the sidecar already applied it (e.g., using return_scaled).
+    ce_apply_transform: bool = False
 
     @field_validator("loss_weight", "policy_loss_weight", "value_loss_policy_scale")
     @classmethod
@@ -47,6 +54,34 @@ class ValueTrainingConfig(BaseModel):
         if self.value_only:
             return 0.0
         return float(self.policy_loss_weight)
+
+    @field_validator("ce_vocab_size")
+    @classmethod
+    def _validate_ce_vocab_size(cls, v: int) -> int:
+        if v <= 1:
+            raise ValueError("ce_vocab_size must be > 1")
+        return v
+
+    @field_validator("ce_support_max")
+    @classmethod
+    def _validate_ce_support_range(cls, v: float, info):
+        data = info.data or {}
+        lo = data.get("ce_support_min", 0.0)
+        if v <= lo:
+            raise ValueError("ce_support_max must be greater than ce_support_min")
+        vocab = data.get("ce_vocab_size")
+        if vocab and abs((v - lo) - (vocab - 1)) > 1e-4:
+            raise ValueError(
+                f"ce_support range [{lo}, {v}] does not match ce_vocab_size={vocab} (expected max = min + vocab_size - 1)"
+            )
+        return v
+
+    @field_validator("ce_transform_epsilon")
+    @classmethod
+    def _validate_ce_eps(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError("ce_transform_epsilon must be non-negative")
+        return v
 
 
 def _find_repo_root() -> Path:

@@ -341,6 +341,7 @@ def make_collate_macroxue_worker_safe(
     *,
     include_values: bool = False,
     value_target_field: str = "return_scaled",
+    value_target_spec: Optional[dict] = None,
     expected_total_steps: Optional[int] = None,
 ) -> Callable:
     """Worker-safe collate that creates its own shard loader per worker."""
@@ -467,6 +468,17 @@ def make_collate_macroxue_worker_safe(
                 value_targets = torch.from_numpy(
                     value_rows[value_target_field].astype(_np.float32, copy=False).copy()
                 )
+                if value_target_spec and value_target_spec.get("objective") == "cross_entropy":
+                    from ..value_support import scalar_to_two_hot
+
+                    value_targets = scalar_to_two_hot(
+                        value_targets,
+                        support_min=float(value_target_spec["support_min"]),
+                        support_max=float(value_target_spec["support_max"]),
+                        vocab_size=int(value_target_spec["vocab_size"]),
+                        epsilon=float(value_target_spec["epsilon"]),
+                        apply_transform=bool(value_target_spec.get("apply_transform", True)),
+                    )
                 out["value_targets"] = value_targets
             return out
 
@@ -485,6 +497,7 @@ def make_collate_steps_worker_safe(
     ev_tokenizer: Optional[object] = None,
     include_values: bool = False,
     value_target_field: str = "return_scaled",
+    value_target_spec: Optional[dict] = None,
     expected_total_steps: Optional[int] = None,
 ) -> Callable:
     """Worker-safe collate for regular steps datasets."""
@@ -563,6 +576,17 @@ def make_collate_steps_worker_safe(
             value_targets = torch.from_numpy(
                 value_rows[value_target_field].astype(_np.float32, copy=False).copy()
             )
+            if value_target_spec and value_target_spec.get("objective") == "cross_entropy":
+                from ..value_support import scalar_to_two_hot
+
+                value_targets = scalar_to_two_hot(
+                    value_targets,
+                    support_min=float(value_target_spec["support_min"]),
+                    support_max=float(value_target_spec["support_max"]),
+                    vocab_size=int(value_target_spec["vocab_size"]),
+                    epsilon=float(value_target_spec["epsilon"]),
+                    apply_transform=bool(value_target_spec.get("apply_transform", True)),
+                )
             out["value_targets"] = value_targets
 
         return out

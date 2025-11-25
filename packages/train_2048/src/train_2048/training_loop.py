@@ -35,6 +35,7 @@ def _format_postfix(
     lr: float,
     target_mode: str,
     *,
+    value_objective: str | None = None,
     global_step: Optional[int] = None,
     accum_steps: Optional[int] = None,
     micro_batch_size: Optional[int] = None,
@@ -58,7 +59,8 @@ def _format_postfix(
     if value_loss is not None:
         if policy_loss is not None:
             info_parts.append(f"policy_ce={float(policy_loss):.4f}")
-        info_parts.append(f"value_mse={float(value_loss):.4f}")
+        label = "value_mse" if (value_objective in (None, "mse")) else "value_ce"
+        info_parts.append(f"{label}={float(value_loss):.4f}")
     else:
         acc = metrics.get("policy_accuracy")
         if acc is None:
@@ -395,6 +397,7 @@ def _build_train_payload(
     dt_comp_ms: float,
     effective_batch_size: Optional[int],
     accum_steps: Optional[int],
+    value_objective: Optional[str] = None,
 ) -> Dict[str, float | int]:
     payload: Dict[str, float | int] = {
         "train/loss": float(metrics["loss"]),
@@ -419,7 +422,8 @@ def _build_train_payload(
         payload["train/policy_ce"] = float(metrics["policy_loss"])
     if metrics.get("value_loss") is not None:
         payload["train/value_loss"] = float(metrics["value_loss"])
-        payload["train/value_mse"] = float(metrics["value_loss"])
+        label = "value_mse" if (value_objective in (None, "mse")) else "value_ce"
+        payload[f"train/{label}"] = float(metrics["value_loss"])
     if effective_batch_size is not None:
         payload["train/effective_batch_size"] = int(effective_batch_size)
     if accum_steps is not None:
@@ -427,7 +431,7 @@ def _build_train_payload(
     return payload
 
 
-def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mode: str, *, epoch: Optional[int]) -> Dict[str, float | int]:
+def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mode: str, *, epoch: Optional[int], value_objective: Optional[str] = None) -> Dict[str, float | int]:
     payload: Dict[str, float | int] = {"val/loss": float(metrics["loss"])}
     if epoch is not None:
         payload["train/epoch"] = int(epoch)
@@ -446,11 +450,12 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
         payload["val/policy_ce"] = float(metrics["policy_loss"])
     if metrics.get("value_loss") is not None:
         payload["val/value_loss"] = float(metrics["value_loss"])
-        payload["val/value_mse"] = float(metrics["value_loss"])
+        label = "value_mse" if (value_objective in (None, "mse")) else "value_ce"
+        payload[f"val/{label}"] = float(metrics["value_loss"])
     return payload
 
 
-def _maybe_log_val(objective, model, dl_val, device, *, cfg: TrainingConfig, target_mode: str, step: int, wandb_run: Optional[object], epoch: Optional[int]) -> Optional[Dict[str, float | list[float] | None]]:
+def _maybe_log_val(objective, model, dl_val, device, *, cfg: TrainingConfig, target_mode: str, step: int, wandb_run: Optional[object], epoch: Optional[int], value_objective: Optional[str] = None) -> Optional[Dict[str, float | list[float] | None]]:
     if dl_val is None:
         return None
     if (cfg.dataset.val_every or 0) <= 0:
@@ -459,7 +464,7 @@ def _maybe_log_val(objective, model, dl_val, device, *, cfg: TrainingConfig, tar
         return None
     val_metrics = objective.evaluate(model, dl_val, device)
     if wandb_run is not None:
-        _wandb_log(_build_val_payload(val_metrics, target_mode, epoch=epoch), step=step)
+        _wandb_log(_build_val_payload(val_metrics, target_mode, epoch=epoch, value_objective=value_objective), step=step)
     return val_metrics
 
 
@@ -509,6 +514,9 @@ def _finalize_metric_sums(
 def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None, *, show_timing_in_bar: bool = False) -> Tuple[Path, int]:
     device = torch.device(device_str)
     target_mode = getattr(cfg.target, "mode", "binned_ev")
+    value_objective = None
+    if getattr(cfg, "value_training", None) is not None and getattr(cfg.value_training, "enabled", False):
+        value_objective = getattr(cfg.value_training, "objective", None)
 
     dataset_signature = _collect_dataset_signature(cfg)
     dataset_fingerprint = _compute_dataset_fingerprint(dataset_signature)
@@ -755,6 +763,7 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                     aggregated_metrics,
                     lr_now,
                     target_mode,
+                    value_objective=value_objective,
                     global_step=global_step,
                     accum_steps=accum_steps,
                     micro_batch_size=micro_batch_size,
@@ -773,10 +782,22 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                         dt_comp_ms=dt_comp_ms,
                         effective_batch_size=effective_batch_now,
                         accum_steps=accum_steps,
+                        value_objective=value_objective,
                     ),
                     step=global_step,
                 )
-            _maybe_log_val(objective, model, dl_val, device, cfg=cfg, target_mode=target_mode, step=global_step, wandb_run=wandb_run, epoch=(None if fixed_steps > 0 else epoch))
+            _maybe_log_val(
+                objective,
+                model,
+                dl_val,
+                device,
+                cfg=cfg,
+                target_mode=target_mode,
+                step=global_step,
+                wandb_run=wandb_run,
+                epoch=(None if fixed_steps > 0 else epoch),
+                value_objective=value_objective,
+            )
             global_step += 1
             resume_state_dict = _build_resume_state(global_step, samples_consumed, resume_skip_samples, cfg)
             maybe_save_pt_interval(

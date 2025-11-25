@@ -31,8 +31,8 @@ class BinnedEV(Objective):
     def prepare_model(self, model: torch.nn.Module, device: torch.device, *, cfg: object, dl_train=None) -> torch.nn.Module:
         self.value_cfg = getattr(cfg, "value_training", None)
         if self.value_cfg and getattr(self.value_cfg, "enabled", False):
-            if getattr(self.value_cfg, "objective", "mse") != "mse":
-                raise ValueError(f"Unsupported value objective {self.value_cfg.objective}; only 'mse' is wired for training")
+            if getattr(self.value_cfg, "objective", "mse") not in {"mse", "cross_entropy"}:
+                raise ValueError(f"Unsupported value objective {self.value_cfg.objective}")
             if getattr(model, "value_head", None) is None:
                 raise ValueError("value_training.enabled but model has no value head")
             if getattr(self.value_cfg, "freeze_trunk", False):
@@ -63,6 +63,7 @@ class BinnedEV(Objective):
         targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
         value_cfg = self.value_cfg or getattr(cfg, "value_training", None)
         value_enabled = bool(value_cfg and getattr(value_cfg, "enabled", False))
+        value_objective = getattr(value_cfg, "objective", "mse") if value_cfg else "mse"
         policy_weight = float(value_cfg.effective_policy_weight()) if value_cfg else 1.0
         value_weight = float(getattr(value_cfg, "loss_weight", 0.0)) if value_cfg else 0.0
         value_scale = float(getattr(value_cfg, "value_loss_policy_scale", 1.0)) if value_cfg else 1.0
@@ -99,11 +100,21 @@ class BinnedEV(Objective):
                     raise ValueError("Model did not return a value head output while value_training.enabled")
                 value_targets = batch["value_targets"].to(device, non_blocking=True).float()
                 value_pred = value_out.float()
-                if value_pred.shape != value_targets.shape:
-                    raise ValueError(
-                        f"value target shape {tuple(value_targets.shape)} does not match predictions {tuple(value_pred.shape)}"
-                    )
-                value_loss_tensor = F.mse_loss(value_pred, value_targets, reduction="mean")
+                if value_objective == "mse":
+                    if value_pred.shape != value_targets.shape:
+                        raise ValueError(
+                            f"value target shape {tuple(value_targets.shape)} does not match predictions {tuple(value_pred.shape)}"
+                        )
+                    value_loss_tensor = F.mse_loss(value_pred, value_targets, reduction="mean")
+                elif value_objective == "cross_entropy":
+                    if value_pred.shape != value_targets.shape:
+                        raise ValueError(
+                            f"value target shape {tuple(value_targets.shape)} does not match predictions {tuple(value_pred.shape)}"
+                        )
+                    log_probs = F.log_softmax(value_pred, dim=-1)
+                    value_loss_tensor = -(value_targets * log_probs).sum(dim=-1).mean()
+                else:
+                    raise ValueError(f"Unsupported value objective {value_objective}")
             loss = policy_loss * float(policy_weight)
             if value_loss_tensor is not None:
                 loss = loss + value_loss_tensor * float(value_weight * value_scale)
@@ -139,6 +150,7 @@ class BinnedEV(Objective):
         value_batches = 0
         value_cfg = self.value_cfg
         value_enabled = bool(value_cfg and getattr(value_cfg, "enabled", False))
+        value_objective = getattr(value_cfg, "objective", "mse") if value_cfg else "mse"
         policy_weight = float(value_cfg.effective_policy_weight()) if value_cfg else 1.0
         value_weight = float(getattr(value_cfg, "loss_weight", 0.0)) if value_cfg else 0.0
         value_scale = float(getattr(value_cfg, "value_loss_policy_scale", 1.0)) if value_cfg else 1.0
@@ -177,11 +189,21 @@ class BinnedEV(Objective):
                         raise ValueError("Model did not return a value head output while value_training.enabled")
                     value_targets = batch["value_targets"].to(device, non_blocking=True).float()
                     value_pred = value_out.float()
-                    if value_pred.shape != value_targets.shape:
-                        raise ValueError(
-                            f"value target shape {tuple(value_targets.shape)} does not match predictions {tuple(value_pred.shape)}"
-                        )
-                    value_loss_tensor = F.mse_loss(value_pred, value_targets, reduction="mean")
+                    if value_objective == "mse":
+                        if value_pred.shape != value_targets.shape:
+                            raise ValueError(
+                                f"value target shape {tuple(value_targets.shape)} does not match predictions {tuple(value_pred.shape)}"
+                            )
+                        value_loss_tensor = F.mse_loss(value_pred, value_targets, reduction="mean")
+                    elif value_objective == "cross_entropy":
+                        if value_pred.shape != value_targets.shape:
+                            raise ValueError(
+                                f"value target shape {tuple(value_targets.shape)} does not match predictions {tuple(value_pred.shape)}"
+                            )
+                        log_probs = F.log_softmax(value_pred, dim=-1)
+                        value_loss_tensor = -(value_targets * log_probs).sum(dim=-1).mean()
+                    else:
+                        raise ValueError(f"Unsupported value objective {value_objective}")
                 loss = policy_loss * float(policy_weight)
                 if value_loss_tensor is not None:
                     loss = loss + value_loss_tensor * float(value_weight * value_scale)

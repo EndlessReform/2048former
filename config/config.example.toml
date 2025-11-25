@@ -57,8 +57,8 @@ edges = [0.0, 0.5, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.998, 0.999, 1.0]
 [value_training]
 # Enable to consume values.npy/values-*.npy sidecar and train the value head.
 enabled = false
-# Loss type for the value head. Only mse is supported today.
-objective = "mse"           # mse
+# Loss type for the value head.
+objective = "mse"           # mse | cross_entropy
 # Target source from the value sidecar (return_scaled is default and recommended).
 target = "return_scaled"    # return_scaled | return_raw
 # Loss weights (set policy_loss_weight=0 or value_only=true for value-only training).
@@ -69,6 +69,12 @@ value_loss_policy_scale = 1.0
 value_only = false
 # Freeze encoder/trunk when training a value probe on a fixed policy.
 freeze_trunk = false
+# Cross-entropy/two-hot support (MuZero transform). Range must match vocab_size-1.
+# ce_vocab_size = 601
+# ce_support_min = 0.0
+# ce_support_max = 600.0
+# ce_transform_epsilon = 0.001
+# ce_apply_transform = false   # set true when using return_raw; keep false for return_scaled
 
 [dataset]
 # Root directory containing steps.npy and metadata.db (resolved relative to repo root)

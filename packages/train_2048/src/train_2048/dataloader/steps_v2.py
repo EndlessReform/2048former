@@ -74,6 +74,16 @@ def build_steps_dataloaders(
     meta_total_steps = metadata.get_total_steps_for_runs()
     use_value_sidecar = bool(value_cfg and getattr(value_cfg, "enabled", False))
     value_target_field = value_cfg.target if value_cfg is not None else "return_scaled"
+    value_target_spec = None
+    if use_value_sidecar and getattr(value_cfg, "objective", "mse") == "cross_entropy":
+        value_target_spec = {
+            "objective": "cross_entropy",
+            "vocab_size": int(getattr(value_cfg, "ce_vocab_size", 0) or 0),
+            "support_min": float(getattr(value_cfg, "ce_support_min", 0.0) or 0.0),
+            "support_max": float(getattr(value_cfg, "ce_support_max", 0.0) or 0.0),
+            "epsilon": float(getattr(value_cfg, "ce_transform_epsilon", 0.0) or 0.0),
+            "apply_transform": bool(getattr(value_cfg, "ce_apply_transform", False)),
+        }
 
     # Use mmap_mode=False when shard_cache_in_memory=True for better performance
     # (we're loading shards fully anyway)
@@ -122,6 +132,7 @@ def build_steps_dataloaders(
             tokenizer_path,
             include_values=use_value_sidecar,
             value_target_field=value_target_field,
+            value_target_spec=value_target_spec,
             expected_total_steps=meta_total_steps,
         )
     else:
@@ -133,6 +144,7 @@ def build_steps_dataloaders(
             ev_tokenizer=ev_tokenizer,
             include_values=use_value_sidecar,
             value_target_field=value_target_field,
+            value_target_spec=value_target_spec,
             expected_total_steps=meta_total_steps,
         )
 
