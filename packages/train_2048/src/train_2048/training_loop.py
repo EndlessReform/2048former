@@ -399,8 +399,14 @@ def _build_train_payload(
     accum_steps: Optional[int],
     value_objective: Optional[str] = None,
 ) -> Dict[str, float | int]:
+    # If value head is enabled (value_loss present), report policy_loss as the main "loss"
+    # for backwards compatibility.
+    train_loss = float(metrics["loss"])
+    if metrics.get("value_loss") is not None and metrics.get("policy_loss") is not None:
+        train_loss = float(metrics["policy_loss"])
+
     payload: Dict[str, float | int] = {
-        "train/loss": float(metrics["loss"]),
+        "train/loss": train_loss,
         "train/lr": float(lr),
         "train/data_time_ms": float(dt_data_ms),
         "train/compute_time_ms": float(dt_comp_ms),
@@ -417,13 +423,20 @@ def _build_train_payload(
             acc = metrics.get("policy_acc")
         if acc is not None:
             payload["train/policy_accuracy"] = float(acc)
+    
     if metrics.get("policy_loss") is not None:
         payload["train/policy_loss"] = float(metrics["policy_loss"])
-        payload["train/policy_ce"] = float(metrics["policy_loss"])
+    
     if metrics.get("value_loss") is not None:
-        payload["train/value_loss"] = float(metrics["value_loss"])
         label = "value_mse" if (value_objective in (None, "mse")) else "value_ce"
         payload[f"train/{label}"] = float(metrics["value_loss"])
+
+    pa = metrics.get("policy_agreement")
+    if pa is None:
+        pa = metrics.get("policy_agree")
+    if pa is not None:
+        payload["train/policy_agreement"] = float(pa)
+
     if effective_batch_size is not None:
         payload["train/effective_batch_size"] = int(effective_batch_size)
     if accum_steps is not None:
@@ -432,7 +445,11 @@ def _build_train_payload(
 
 
 def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mode: str, *, epoch: Optional[int], value_objective: Optional[str] = None) -> Dict[str, float | int]:
-    payload: Dict[str, float | int] = {"val/loss": float(metrics["loss"])}
+    val_loss = float(metrics["loss"])
+    if metrics.get("value_loss") is not None and metrics.get("policy_loss") is not None:
+        val_loss = float(metrics["policy_loss"])
+
+    payload: Dict[str, float | int] = {"val/loss": val_loss}
     if epoch is not None:
         payload["train/epoch"] = int(epoch)
     if target_mode in ("binned_ev", "macroxue_tokens"):
@@ -445,13 +462,20 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
             acc = metrics.get("policy_acc")
         if acc is not None:
             payload["val/policy_accuracy"] = float(acc)
+
     if metrics.get("policy_loss") is not None:
         payload["val/policy_loss"] = float(metrics["policy_loss"])
-        payload["val/policy_ce"] = float(metrics["policy_loss"])
+
     if metrics.get("value_loss") is not None:
-        payload["val/value_loss"] = float(metrics["value_loss"])
         label = "value_mse" if (value_objective in (None, "mse")) else "value_ce"
         payload[f"val/{label}"] = float(metrics["value_loss"])
+    
+    pa = metrics.get("policy_agreement")
+    if pa is None:
+        pa = metrics.get("policy_agree")
+    if pa is not None:
+        payload["val/policy_agreement"] = float(pa)
+
     return payload
 
 
