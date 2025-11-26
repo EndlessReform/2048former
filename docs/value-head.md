@@ -2,15 +2,15 @@
 
 ## Background
 
-The 2048 score is the sum of all merges made throughout the game (episode). In addition to the supervised _policy_ head trained from Macroxue game states, we want to add a _value head_ that predicts discounted return per state.
+The 2048 score is the sum of all merges made throughout the game (episode). In addition to the supervised _policy_ head (trained from brute-force expectimax depth-6 relative disadvantage predictions), we are adding a _value head_ that predicts Monte Carlo discounted return per state.
 
 With full episodes available, the target should start as full Monte Carlo discounted reward,
 $$G_t = \sum_{k=0}^{T-t-1} \gamma^k r_{t+k},$$
 where the raw reward is the step-wise merge gain. Later we can layer on N-step TD for self-play/distillation. Following MuZero (Schrittwieser et al. 2019) and Stochastic MuZero (Antonoglou et al. 2022):
 - Apply the invertible transform $h(x) = \mathrm{sign}(x)(\sqrt{x + 1} - 1 + \epsilon x)$ with $\epsilon = 0.001$ to stabilise large targets.
-- Experiment with **MSE** vs **two-hot** (or one-hot) discrete cross-entropy over $n$ bins (e.g., 601).
+- Use **two-hot** discrete cross-entropy over $n$ bins (e.g., 601).
 
-## Cross-entropy
+### Literature on two-hot cross-entropy
 
 From Stochastic MuZero paper:
 > In both the afterstate dynamics and dynamics network the parent states and codes or actions were combined by simple concatenation. The reward and value predictions used the categorical representation introduced in MuZero (Schrittwieser et al., 2020). We used 601 bins for both the value and the reward predictions with both the value and the reward being able to represent values between [0, 600.]. Furthermore, similarly to MuZero, we used the invertible transform h(x) = sign(x)(√x + 1 − 1 + x) with = 0.001 for scaling the targets. The value targets were computed using n-step TD(λ) bootstrapping with n = 10, a discount of 0.999 and λ = 0.5.
@@ -18,13 +18,11 @@ From Stochastic MuZero paper:
 From original MuZero paper:
 > We use a discrete support set of size 601 with one support for every integer between −300 and 300. Under this transformation, each scalar is represented as the linear combination of its two adjacent supports, such that the original value can be recovered by x = xlow ∗ plow + xhigh ∗ phigh. As an example, a target of 3.7 would be represented as a weight of 0.3 on the support for 3 and a weight of 0.7 on the support for 4. The value and reward outputs of the network are also modeled using a softmax output of size 601. During inference the actual value and rewards are obtained by first computing their expected value under their respective softmax distribution and subsequently by inverting the scaling transformation. Scaling and transformation of the value and reward happens transparently on the network side and is not visible to the rest of the algorithm.
 
-We need to implement this "two-hot" transformation with CE as a target.
-
 ## Where things stand (2025-xx)
 
 Status snapshot (Apr 2025):
 - ✅ Value sidecar CLI (`value-sidecar`) computes per-step rewards via `twenty48-utils` merge scores and writes discounted returns (`reward`, `reward_scaled`, `return_raw`, `return_scaled`) aligned to `steps-*.npy`. Flags: `--gamma`, `--reward-scale`, `--workers`, `--overwrite`.
-- ✅ Value head + config plumbing: `core_2048` exposes an optional mean-pooled value head with either MSE (scalar) or discrete cross-entropy (vocab_size + vocab_type) output. See `ValueHeadConfig`/`ValueObjectiveConfig` in `packages/core_2048/src/core_2048/model.py` and the init schema notes in `packages/core_2048/README.md`.
+- ✅ Value head + config plumbing: `core_2048` exposes an optional mean-pooled value head with either MSE (scalar) or discrete cross-entropy (vocab_size + vocab_type) output. A pre-pool SwiGLU block can be enabled for the value path via `value_head.pre_pool_mlp` (inherits the trunk width/expansion defaults). See `ValueHeadConfig`/`ValueObjectiveConfig` in `packages/core_2048/src/core_2048/model.py` and the init schema notes in `packages/core_2048/README.md`.
 - ✅ Training path: dataloaders can join the value sidecar and `BinnedEV`/`MacroxueTokens` mix value loss alongside policy loss (tunable via `value_training.value_loss_policy_scale`; defaults to 1.0). Value path now supports MSE **and** MuZero two-hot cross-entropy (default support [0,600], vocab=601, configurable in `value_training.ce_*`). Inference remains policy-only for now.
 
 - Macroxue packs only store policy metadata: see `crates/dataset-packer/src/schema.rs` and `docs/macroxue_data/data_format.md`. There is no reward/return field yet; `runs.max_score` in SQLite is the final score only.

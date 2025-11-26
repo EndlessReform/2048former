@@ -1,6 +1,5 @@
 # init_dir = "inits/v2/50m_ablations/n1_binned"
-# init_dir = "checkpoints/20251011_203456/model-stable.pt"
-init_dir = "inits/v2/50m_ablations/n1_binned_value_ce"
+init_dir = "checkpoints/20251124_234853/model-stable.pt"
 checkpoint_dir = "checkpoints"
 seed = 42
 
@@ -66,7 +65,7 @@ mmap_mode = true
 # num_steps represents the final global step target for the full run.
 # When resuming from a checkpoint, the harness will automatically continue
 # from the recorded global_step and finish the remaining steps.
-num_steps = 500_000
+num_steps = 1_100_000
 shard_locality = true
 shard_cache_in_memory = true
 shard_cache_keep_shards = 1

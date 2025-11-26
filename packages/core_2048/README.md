@@ -34,6 +34,7 @@ Optional
 - value_head (object|null) — optional scalar/value readout on the mean-pooled board embedding
   - enabled (bool, default true when the block is present)
   - pooling (string, default "mean"; only mean pooling is supported)
+  - pre_pool_mlp (bool, default false) — add a SwiGLU MLP before pooling the value readout
   - objective (object)
     - type (string) — "mse" or "cross_entropy"
     - vocab_size (int) — required when type="cross_entropy"; output dimension

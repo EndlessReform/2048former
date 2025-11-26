@@ -199,6 +199,8 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
                 obj_cfg.setdefault("vocab_size", int(v_w.shape[0]))
                 obj_cfg.setdefault("vocab_type", str(obj_cfg.get("vocab_type") or "unknown"))
             vh_cfg["objective"] = obj_cfg
+            if any(k.startswith("value_pre_pool_mlp.") for k in state.keys()):
+                vh_cfg.setdefault("pre_pool_mlp", True)
             enc_cfg_dict["value_head"] = vh_cfg
 
         # Infer vocab size from embedding if present (ensure >= current)

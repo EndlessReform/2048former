@@ -27,6 +27,8 @@ class ValueHeadConfig(BaseModel):
     enabled: bool = True
     # Pooling strategy for value readout. Only mean pooling is supported today.
     pooling: Literal["mean"] = "mean"
+    # Optional extra MLP applied before value pooling.
+    pre_pool_mlp: bool = False
     objective: ValueObjectiveConfig = ValueObjectiveConfig()
 
     @classmethod
@@ -320,10 +322,22 @@ class Encoder(nn.Module):
         # Optional value head (mean-pooled linear probe)
         vh_cfg = getattr(config, "value_head", None)
         self.value_head_cfg = vh_cfg if vh_cfg is not None and vh_cfg.enabled else None
+        self.value_pre_pool_mlp: nn.Module | None = None
+        self.value_pre_pool_norm: nn.Module | None = None
         if self.value_head_cfg is not None:
             objective = self.value_head_cfg.objective
             out_dim = 1 if objective.type == "mse" else int(objective.vocab_size)
             self.value_head = nn.Linear(config.hidden_size, out_dim)
+            if bool(getattr(self.value_head_cfg, "pre_pool_mlp", False)):
+                self.value_pre_pool_norm = nn.RMSNorm(
+                    config.hidden_size, eps=config.layer_norm_eps
+                )
+                self.value_pre_pool_mlp = SwiGLU(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=config.intermediate_size,
+                    dropout_prob=config.dropout_prob,
+                    eps=config.layer_norm_eps,
+                )
         else:
             self.value_head = None
 
@@ -359,11 +373,22 @@ class Encoder(nn.Module):
 
         x = self.final_ln(x)
 
-        # Final mean pooling
+        # Final mean pooling for policy heads
         board_repr = x.mean(dim=1)  # (B, H)
         value_out: torch.Tensor | None = None
         if self.value_head is not None:
-            value_out = self.value_head(board_repr)
+            value_tokens = x
+            if (
+                self.value_head_cfg
+                and bool(getattr(self.value_head_cfg, "pre_pool_mlp", False))
+                and self.value_pre_pool_mlp is not None
+                and self.value_pre_pool_norm is not None
+            ):
+                value_tokens = value_tokens + self.value_pre_pool_mlp(
+                    self.value_pre_pool_norm(value_tokens)
+                )
+            value_repr = value_tokens.mean(dim=1)
+            value_out = self.value_head(value_repr)
             if self.value_head_cfg and self.value_head_cfg.objective.type == "mse":
                 value_out = value_out.squeeze(-1)
         if self.head_type == "binned_ev":
