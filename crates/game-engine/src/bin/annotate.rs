@@ -21,6 +21,9 @@ struct Args {
     /// Optional: limit number of steps to annotate (for smoke tests)
     #[arg(long, value_name = "N")]
     limit: Option<usize>,
+    /// Skip writing value sidecar even if the server exposes a value head
+    #[arg(long)]
+    no_value_sidecar: bool,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -35,6 +38,7 @@ async fn main() -> Result<()> {
         overwrite: args.overwrite,
         limit: args.limit,
         config: cfg,
+        write_value_sidecar: !args.no_value_sidecar,
     })
     .await
 }

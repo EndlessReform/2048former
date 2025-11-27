@@ -139,6 +139,8 @@ pub type StepRow = MacroxueStepRow;
 
 /// Annotation row written by the offline policy annotator.
 pub const MAX_STUDENT_BINS: usize = 64;
+/// Upper bound on value vocab bins stored in value annotation sidecars.
+pub const MAX_VALUE_BINS: usize = 1024;
 
 #[repr(C)]
 #[derive(
@@ -166,6 +168,13 @@ pub mod annotation_kinds {
     pub const POLICY_HARD: u8 = 1 << 2;
     /// Student policy includes per-bin log probabilities (sidecar shard).
     pub const POLICY_STUDENT_BINS: u8 = 1 << 3;
+}
+
+pub mod value_annotation_kinds {
+    /// Value head returned at inference time (scalar or transformed).
+    pub const VALUE: u8 = 1 << 0;
+    /// Value head exposes per-bin probabilities (cross-entropy style).
+    pub const VALUE_PROBS: u8 = 1 << 1;
 }
 
 impl StructuredRow for AnnotationRow {
@@ -213,6 +222,43 @@ impl StructuredRow for AnnotationRow {
             Field {
                 name: "policy_hard".into(),
                 dtype: DType::Array(4, Box::new(DType::Plain(f4))),
+            },
+        ])
+    }
+}
+
+/// Scalar value annotations aligned with the policy annotation shards.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, npyz::Serialize, npyz::Deserialize, npyz::AutoSerialize,
+)]
+pub struct ValueAnnotationRow {
+    pub run_id: u32,
+    pub step_index: u32,
+    pub value: f32,
+    pub value_xform: f32,
+}
+
+impl StructuredRow for ValueAnnotationRow {
+    fn dtype() -> DType {
+        let u4: TypeStr = "<u4".parse().unwrap();
+        let f4: TypeStr = "<f4".parse().unwrap();
+        DType::Record(vec![
+            Field {
+                name: "run_id".into(),
+                dtype: DType::Plain(u4.clone()),
+            },
+            Field {
+                name: "step_index".into(),
+                dtype: DType::Plain(u4),
+            },
+            Field {
+                name: "value".into(),
+                dtype: DType::Plain(f4.clone()),
+            },
+            Field {
+                name: "value_xform".into(),
+                dtype: DType::Plain(f4),
             },
         ])
     }

@@ -5,7 +5,7 @@
 - Ships two binaries:
   - `game-engine` &mdash; drives on-policy self-play and records new datasets.
   - `annotation-engine` &mdash; re-scores existing Macroxue or self-play shards and writes annotation sidecars (including per-bin log-probabilities).
-- Inference responses carry per-head bin distributions (`InferenceOutput::Bins`). The annotator now persists both the legacy summary (`annotations-*.npy`) and a new log-probability sidecar (`annotations-logp-<dtype>-*.npy`, `dtype = f32` by default, `f16` via CLI).
+- Inference responses carry per-head bin distributions (`InferenceOutput::Bins`) and, when present, value predictions. The annotator persists both the legacy summary (`annotations-*.npy`) and a log-probability sidecar (`annotations-logp-<dtype>-*.npy`, `dtype = f32` by default, `f16` via CLI), plus value sidecars (`annotations-value-*.npy` and `annotations-value-bins-*.npy`) when the server exposes a value head.
 
 ## Prerequisites
 - A running inference server that implements `train_2048.inference.v1.Infer` (see `packages/infer_2048`).
@@ -78,16 +78,33 @@ top_k = 2
 
    - `--student-bins-dtype` selects the dtype for the log-probability sidecar (`f32` default, `f16` optional).
    - Use `--limit N` for smoke tests and `--overwrite` to replace previous shards.
-   - The inference server now advertises tokenizer metadata (`model_metadata.policy`), so the annotator sizes the log-probability sidecar automatically from the first response.
+   - The inference server now advertises tokenizer/value metadata via `Describe`; the annotator sizes sidecars from that handshake. Pass `--no-value-sidecar` to skip writing value outputs even when the server exposes a value head.
 
 ## Output Artifacts
 
 | Binary             | Artifacts                                                                                                      |
 |--------------------|---------------------------------------------------------------------------------------------------------------|
 | `game-engine`      | `steps-*.npy`, optional `embeddings-*.npy`, and `metadata.db` inside `session_dir`.                             |
-| `annotation-engine`| `annotations-*.npy` (summary row), `annotations-logp-<dtype>-*.npy` (per-bin log-probs), copied `metadata.db`, `valuation_types.json`, and `annotation_manifest.json` capturing bitmasks, dtype, and max bin count. |
+| `annotation-engine`| `annotations-*.npy` (summary row), `annotations-logp-<dtype>-*.npy` (per-bin log-probs), optional `annotations-value-*.npy` (scalar value/value_xform), optional `annotations-value-bins-*.npy` (value distribution), copied `metadata.db`, `valuation_types.json`, and `annotation_manifest.json` capturing bitmasks, dtype, and max bin counts. |
 
-Manifest `policy_kind_mask` now exposes `POLICY_P1`, `POLICY_LOGPROBS`, `POLICY_HARD`, and `POLICY_STUDENT_BINS` bits so downstream tools can detect available annotations without scanning shards.
+Manifest `policy_kind_mask` now exposes `POLICY_P1`, `POLICY_LOGPROBS`, `POLICY_HARD`, and `POLICY_STUDENT_BINS` bits so downstream tools can detect available annotations without scanning shards. When present, `value_kind_mask` records `VALUE` and `VALUE_PROBS` coverage per run alongside value metadata.
+
+## Kendall tau evaluator (value head vs teacher branch_evs)
+- Binary: `kendall-tau`
+- Purpose: For each Macroxue step, expand legal moves into new boards via `twenty48_utils::engine::Board::shift`, run value-only inference on those boards (static batches, default `--batch-size 2048`), compute Kendall’s tau against teacher `branch_evs`, and write a sidecar `kendall-*.npy` aligned to `steps-*.npy`.
+- Row fields: `run_id`, `step_index`, `legal_mask` (source), `scored_mask` (post-shift non-noop moves), `teacher_best`, `predicted_best`, `kendall_tau`, `value_scores[4]`.
+- CLI example:
+
+  ```bash
+  cargo run -p game-engine --bin kendall-tau -- \
+    --dataset datasets/macroxue/d7_test_v1 \
+    --uds /tmp/2048_infer.sock \
+    --batch-size 2048 \
+    --output annotations/d7_test_v1/kendall \
+    --overwrite
+  ```
+
+  Use `--limit N` for smoke tests. Requires a value head; Describe must report `has_value_head=true`.
 
 ## Notes & Safety Knobs
 - `max_concurrent_games`, `max_steps`, and `[orchestrator.batch]` control throughput/backpressure.

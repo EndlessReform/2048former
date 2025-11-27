@@ -40,6 +40,11 @@ message InferRequest {
   // a value head exists in the checkpoint.
   OutputMode output_mode = 6;
 
+  // Optional: request value per-bin probabilities. By default, value probs are
+  // sent when policy is requested; value-only calls omit the distribution to
+  // keep responses small unless this is explicitly set.
+  bool include_value_probs = 7;
+
   enum OutputMode {
     OUTPUT_MODE_UNSPECIFIED = 0; // Default/autodetect: policy always, value if available.
     OUTPUT_MODE_POLICY_ONLY = 1; // Force policy only even if value head exists.
@@ -158,7 +163,21 @@ message InferResponse {
   ModelMetadata model_metadata = 10;
 }
 
+// Request server capabilities and model metadata without running inference.
+message DescribeRequest {}
+
+message DescribeResponse {
+  // Advertised metadata for the loaded model/init.
+  ModelMetadata model_metadata = 1;
+  // True when the server exposes a policy head.
+  bool has_policy_head = 2;
+  // True when the server exposes a value head and can return value outputs.
+  bool has_value_head = 3;
+}
+
 service Inference {
   // Compute per-head probability distributions over bins for each input.
   rpc Infer (InferRequest) returns (InferResponse);
+  // Advertise server capabilities (policy/value/tokenizer metadata).
+  rpc Describe (DescribeRequest) returns (DescribeResponse);
 }

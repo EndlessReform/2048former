@@ -72,6 +72,7 @@ pub async fn infer_once(
         return_embedding: false,
         argmax_only: false,
         output_mode: pb::infer_request::OutputMode::Unspecified as i32,
+        include_value_probs: true,
     };
     let resp = client.infer(req).await?.into_inner();
     Ok(resp)

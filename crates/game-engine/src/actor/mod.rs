@@ -146,7 +146,7 @@ impl GameActor {
             let order = self.head_order.clone();
             let legal = legal_mask(self.board, order.clone());
             let mv = match inference {
-                InferenceOutput::Bins(bins) => {
+                InferenceOutput::Bins { heads: bins, .. } => {
                     // Gate non-argmax sampling by steps: before start_gate or at/after stop_gate -> argmax
                     let start_gate = self.sampling.start_gate_or_default();
                     let stop_gate = self.sampling.stop_gate();

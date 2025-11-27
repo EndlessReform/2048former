@@ -444,7 +444,7 @@ fn h_transform(x: f64, epsilon: f64, run_id: u32, step_index: u32) -> Result<f64
 }
 
 fn compute_reward(board_raw: u64, tile_65536_mask: u16, move_dir: u8) -> Result<f32> {
-    use crate::macroxue::{decode_board, BOARD_LEN};
+    use crate::macroxue::{BOARD_LEN, decode_board};
     use twenty48_utils::engine::Move;
 
     let dir = match move_dir {
@@ -470,25 +470,20 @@ fn compute_reward(board_raw: u64, tile_65536_mask: u16, move_dir: u8) -> Result<
                 if matches!(dir, Move::Right) {
                     line.reverse();
                 }
-                reward = reward.checked_add(line_reward_left(line)?).ok_or_else(|| {
-                    anyhow!("reward overflow while processing row {}", row)
-                })?;
+                reward = reward
+                    .checked_add(line_reward_left(line)?)
+                    .ok_or_else(|| anyhow!("reward overflow while processing row {}", row))?;
             }
         }
         Move::Up | Move::Down => {
             for col in 0..(BOARD_LEN / 4) {
-                let mut line = [
-                    exps[col],
-                    exps[4 + col],
-                    exps[8 + col],
-                    exps[12 + col],
-                ];
+                let mut line = [exps[col], exps[4 + col], exps[8 + col], exps[12 + col]];
                 if matches!(dir, Move::Down) {
                     line.reverse();
                 }
-                reward = reward.checked_add(line_reward_left(line)?).ok_or_else(|| {
-                    anyhow!("reward overflow while processing column {}", col)
-                })?;
+                reward = reward
+                    .checked_add(line_reward_left(line)?)
+                    .ok_or_else(|| anyhow!("reward overflow while processing column {}", col))?;
             }
         }
     }
@@ -613,9 +608,11 @@ mod tests {
         let board = pack_board([1, 1, 0, 0, 2, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let reward = compute_reward(board, 0, 2).unwrap();
 
-        let before = twenty48_utils::engine::get_score(twenty48_utils::engine::Board::from_raw(board));
+        let before =
+            twenty48_utils::engine::get_score(twenty48_utils::engine::Board::from_raw(board));
         let after = twenty48_utils::engine::get_score(
-            twenty48_utils::engine::Board::from_raw(board).shift(twenty48_utils::engine::Move::Left),
+            twenty48_utils::engine::Board::from_raw(board)
+                .shift(twenty48_utils::engine::Move::Left),
         );
         assert_eq!(reward, (after - before) as f32);
     }
@@ -649,8 +646,8 @@ mod tests {
 
         // Run 0 has 3 steps; run 1 has 1 step. Shard after every 2 rows.
         let rows_per_shard = Some(2);
-        let mut writer = StepsWriter::<MacroxueStepRow>::new(&dataset_dir, rows_per_shard, true)
-            .unwrap();
+        let mut writer =
+            StepsWriter::<MacroxueStepRow>::new(&dataset_dir, rows_per_shard, true).unwrap();
 
         // Run 0 step boards chosen to produce rewards [4, 8, 16] when moving left.
         let b0 = pack_board([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -797,7 +794,8 @@ mod tests {
             .filter_map(|e| {
                 let name = e.file_name();
                 let name = name.to_str()?;
-                if (name == "values.npy") || (name.starts_with("values-") && name.ends_with(".npy")) {
+                if (name == "values.npy") || (name.starts_with("values-") && name.ends_with(".npy"))
+                {
                     Some(e.path())
                 } else {
                     None

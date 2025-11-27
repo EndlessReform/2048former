@@ -24,7 +24,16 @@ pub fn build_feeder(
     batch_cfg: config::Batch,
     argmax_only: bool,
 ) -> (feeder::Feeder, feeder::FeederHandle) {
-    feeder::Feeder::new(batch_cfg, argmax_only)
+    build_feeder_with_value(batch_cfg, argmax_only, true)
+}
+
+/// Construct a feeder while controlling whether value outputs are requested.
+pub fn build_feeder_with_value(
+    batch_cfg: config::Batch,
+    argmax_only: bool,
+    value_outputs: bool,
+) -> (feeder::Feeder, feeder::FeederHandle) {
+    feeder::Feeder::new(batch_cfg, argmax_only, value_outputs)
 }
 
 /// Maximum number of inflight items based on batch configuration. Useful for

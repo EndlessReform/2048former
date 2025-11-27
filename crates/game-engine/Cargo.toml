@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "annotation-engine"
 path = "src/bin/annotate.rs"
 
+[[bin]]
+name = "kendall-tau"
+path = "src/bin/kendall_tau.rs"
+
 [dependencies]
 anyhow = "1.0.99"
 clap = { version = "4.5.47", features = ["derive"] }

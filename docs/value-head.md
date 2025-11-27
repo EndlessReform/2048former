@@ -23,12 +23,12 @@ From original MuZero paper:
 Status snapshot (Apr 2025):
 - ✅ Value sidecar CLI (`value-sidecar`) computes per-step rewards via `twenty48-utils` merge scores and writes discounted returns (`reward`, `reward_scaled`, `return_raw`, `return_scaled`) aligned to `steps-*.npy`. Flags: `--gamma`, `--reward-scale`, `--workers`, `--overwrite`.
 - ✅ Value head + config plumbing: `core_2048` exposes an optional mean-pooled value head with either MSE (scalar) or discrete cross-entropy (vocab_size + vocab_type) output. A pre-pool SwiGLU block can be enabled for the value path via `value_head.pre_pool_mlp` (inherits the trunk width/expansion defaults). See `ValueHeadConfig`/`ValueObjectiveConfig` in `packages/core_2048/src/core_2048/model.py` and the init schema notes in `packages/core_2048/README.md`.
-- ✅ Training path: dataloaders can join the value sidecar and `BinnedEV`/`MacroxueTokens` mix value loss alongside policy loss (tunable via `value_training.value_loss_policy_scale`; defaults to 1.0). Value path now supports MSE **and** MuZero two-hot cross-entropy (default support [0,600], vocab=601, configurable in `value_training.ce_*`). Inference remains policy-only for now.
+- ✅ Training path: dataloaders can join the value sidecar and `BinnedEV`/`MacroxueTokens` mix value loss alongside policy loss (tunable via `value_training.value_loss_policy_scale`; defaults to 1.0). Value path now supports MSE **and** MuZero two-hot cross-entropy (default support [0,600], vocab=601, configurable in `value_training.ce_*`). Inference returns `(hidden_states, policy_out, value_out)`; policy-only callers stay compatible.
 
 - Macroxue packs only store policy metadata: see `crates/dataset-packer/src/schema.rs` and `docs/macroxue_data/data_format.md`. There is no reward/return field yet; `runs.max_score` in SQLite is the final score only.
 - The transformer now returns `(hidden_states, policy_out, value_out)` where `value_out` is `None` when disabled; policy heads are unchanged (binned EV or action_policy). Legacy callers still work because unpacking is handled centrally.
 - Training defaults to policy-only, but when `value_training.enabled=true` the dataloaders emit `value_targets` and the objectives consume them (policy/objective wiring stays backward compatible when value is disabled).
-- Inference and annotations remain policy-only: the protobuf (`proto/train_2048/inference/v1/inference.proto`) and server (`packages/infer_2048/src/infer_2048/server.py`) ignore `value_out` for now; the annotation writer (`crates/dataset-packer/src/schema.rs`) has no value slots.
+- Inference now streams policy + optional value (`InferRequest.output_mode` controls the mix) and advertises tokenizer/value metadata via a new `Describe` RPC. Annotation now writes value sidecars (`annotations-value-*.npy` with `value`/`value_xform`, `annotations-value-bins-*.npy` when the value head is categorical) unless `--no-value-sidecar` is passed.
 
 ## Data pipeline plan
 
@@ -61,8 +61,8 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 
 ## Inference and evaluation plan
 
-- [x] Extend the protobuf + server to stream value predictions (raw + inverse-transformed) optionally, without forcing 1-ply inference to pay for it. `InferRequest.output_mode` controls policy/value combinations (auto, policy-only, value-only, policy+value w/ require-value), and `Output.value` now carries the current-board value alongside policy heads when present. `ModelMetadata.value` surfaces objective/support/transform hints for downstream decoding.
-- [ ] Add value fields to annotation sidecars and viewer rails so per-step values can be inspected (match `annotation_manifest.json` shape checks).
+- [x] Extend the protobuf + server to stream value predictions (raw + inverse-transformed) optionally, without forcing 1-ply inference to pay for it. `InferRequest.output_mode` controls policy/value combinations (auto, policy-only, value-only, policy+value w/ require-value), and `Output.value` now carries the current-board value alongside policy heads when present. `ModelMetadata.value` surfaces objective/support/transform hints for downstream decoding and `Describe` advertises tokenizer/value support up front.
+- [x] Add value fields to annotation sidecars (scalars + optional per-bin probs) and manifest bits, with an opt-out flag (`--no-value-sidecar`) when policy-only annotation is desired.
 - [ ] Add a smoke-test script mirroring `bin/play_2048.py` that logs predicted value vs realised returns over a short rollout.
 
 ## Two-hot cross-entropy touchpoints (what changed / what to edit next)
@@ -72,10 +72,10 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 - Objectives (`BinnedEV`, `MacroxueTokens`) train either MSE or CE; CE uses soft two-hot targets (`-target * log_softmax`) and logs `value_loss` accordingly.
 - Model/helpers: shared MuZero transform + inverse + two-hot utilities live in `packages/train_2048/src/train_2048/value_support.py`. Inference now decodes value heads (best-effort inverse when metadata is available) and returns both transformed and inverse-transformed scalars.
 - Logging: training/val payloads and progress bar label value loss as `value_ce` when CE is active; wandb tags follow the same naming.
-- Still pending: inference plumbing, annotation output, and surfacing sidecar transform metadata alongside the support definition for downstream decoding.
+- Still pending: viewer rails and smoke-tests that exercise value predictions end-to-end; revisit manifest metadata if we add more transforms.
 
 ## Contradictions vs current stack (review)
 
 - The value head exists and is optional; policy-only configs remain backward compatible (omit `value_head` in config.json).
 - Datasets **do not carry reward/return columns**; only `max_score` per run exists, so a new sidecar/pack step is required before value training is possible.
-- Inference rails now stream value outputs + metadata; annotation storage/viewer rails still need value fields.
+- Inference rails now stream value outputs + metadata; annotation sidecars capture value predictions, but viewers/analysis still need to consume them.

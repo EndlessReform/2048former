@@ -167,7 +167,9 @@ def extract_value_metadata(model: torch.nn.Module) -> ValueHeadMeta:
     return meta
 
 
-def compute_value_outputs(value_out: Optional[torch.Tensor], meta: ValueHeadMeta) -> Optional[ValueOutputs]:
+def compute_value_outputs(
+    value_out: Optional[torch.Tensor], meta: ValueHeadMeta, include_probs: bool
+) -> Optional[ValueOutputs]:
     if value_out is None:
         return None
 
@@ -188,7 +190,7 @@ def compute_value_outputs(value_out: Optional[torch.Tensor], meta: ValueHeadMeta
         if should_apply_inverse(meta):
             eps = meta.transform_epsilon if meta.transform_epsilon is not None else DEFAULT_VALUE_EPS
             value_list = muzero_inverse(value_xform, float(eps)).to("cpu", non_blocking=False).tolist()
-        probs_list = probs.to("cpu", non_blocking=False).tolist()
+        probs_list = probs.to("cpu", non_blocking=False).tolist() if include_probs else None
         return ValueOutputs(probs=probs_list, value=value_list, value_xform=value_xform_list)
 
     # Regression / scalar value head
@@ -286,9 +288,11 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         model: torch.nn.Module,
         metadata: Optional[inference_pb2.ModelMetadata] = None,
         value_meta: Optional[ValueHeadMeta] = None,
+        init_dir: Optional[str] = None,
     ) -> None:
         self.model = model
         self._value_meta = value_meta or extract_value_metadata(model)
+        self._init_dir = init_dir
         # Reusable pinned host buffer for tokens to enable async H2D copies.
         # Allocated lazily and grown geometrically to avoid realloc thrash.
         self._tokens_cpu = None  # type: Optional[torch.Tensor]
@@ -340,6 +344,9 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                 inference_pb2.InferRequest.OUTPUT_MODE_UNSPECIFIED,
             )
             include_policy, include_value, require_value = resolve_output_mode(int(output_mode_raw))
+            include_value_probs: bool = bool(getattr(request, "include_value_probs", False))
+            # Preserve legacy behavior: when policy is requested, also return value probs.
+            include_value_probs = include_value_probs or include_policy
 
             # Build item_ids and a single contiguous bytes buffer of boards
             item_ids: list[int] = []
@@ -436,7 +443,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                         )
                     include_value = False
                 if include_value:
-                    value_batch = compute_value_outputs(value_out, self._value_meta)
+                    value_batch = compute_value_outputs(value_out, self._value_meta, include_value_probs)
                     if value_batch is None and require_value:
                         await context.abort(
                             grpc.StatusCode.INVALID_ARGUMENT,
@@ -564,7 +571,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                         v_msg.value = float(value_batch.value[i])
                     if value_batch.value_xform is not None:
                         v_msg.value_xform = float(value_batch.value_xform[i])
-                    if value_batch.probs is not None:
+                    if include_value_probs and value_batch.probs is not None:
                         v_msg.probs.extend(value_batch.probs[i])
                     outputs[i].value.CopyFrom(v_msg)
             # Restore training state
@@ -596,6 +603,26 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             resp.model_metadata.CopyFrom(self._model_metadata)
         vlog(f"[server] Infer end: B={B} latency_ms={latency_ms}")
         return resp
+
+    async def Describe(self, request, context):  # type: ignore[override]
+        try:
+            resp = inference_pb2.DescribeResponse(
+                has_policy_head=True, has_value_head=self._value_meta.has_head
+            )
+            if self._model_metadata is None and self._init_dir:
+                try:
+                    self._model_metadata = build_model_metadata(
+                        self.model, self._init_dir, value_meta=self._value_meta
+                    )
+                except Exception:
+                    pass
+            if self._model_metadata is not None:
+                resp.model_metadata.CopyFrom(self._model_metadata)
+            return resp
+        except Exception as e:
+            print(f"[server] Describe exception: {e}", flush=True)
+            await context.abort(grpc.StatusCode.INTERNAL, f"server exception: {e}")
+            raise
 
 
 async def serve_async(
@@ -650,7 +677,9 @@ async def serve_async(
 
     value_meta = extract_value_metadata(model)
     model_metadata = build_model_metadata(model, init_dir, value_meta=value_meta)
-    svc = InferenceService(model, metadata=model_metadata, value_meta=value_meta)
+    svc = InferenceService(
+        model, metadata=model_metadata, value_meta=value_meta, init_dir=init_dir
+    )
 
     vlog("[server] creating grpc server...")
     # Allow large batch payloads by increasing gRPC message limits (both directions).

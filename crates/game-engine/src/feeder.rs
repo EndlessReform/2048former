@@ -27,11 +27,25 @@ pub struct InferenceItem {
 /// The outer dimension is heads in the fixed order [Up, Down, Left, Right].
 pub type Bins = Vec<Vec<f32>>; // heads x n_bins
 
+/// Value head outputs returned alongside policy bins when available.
+#[derive(Debug, Clone)]
+pub struct ValuePrediction {
+    pub value: Option<f32>,
+    pub value_xform: Option<f32>,
+    pub probs: Vec<f32>,
+}
+
 /// Inference response payload returned to actors.
 #[derive(Debug, Clone)]
 pub enum InferenceOutput {
-    Bins(Bins),
-    Argmax { head: u32, _p1: f32 },
+    Bins {
+        heads: Bins,
+        value: Option<ValuePrediction>,
+    },
+    Argmax {
+        head: u32,
+        _p1: f32,
+    },
 }
 
 /// Micro-batching feeder. Builds batches from a bounded queue, submits RPCs,
@@ -48,6 +62,7 @@ pub struct Feeder {
     emb_tx: Option<tokio_mpsc::Sender<EmbeddingRow>>, // optional inline embeddings
     cancel: Option<CancellationToken>,
     argmax_only: bool,
+    value_outputs: bool,
 }
 
 impl Feeder {
@@ -55,7 +70,11 @@ impl Feeder {
     ///
     /// Usage: let (feeder, handle) = Feeder::new(cfg.orchestrator.batch.clone());
     ///        let _task = feeder.spawn(client);
-    pub fn new(batch_cfg: config::Batch, argmax_only: bool) -> (Self, FeederHandle) {
+    pub fn new(
+        batch_cfg: config::Batch,
+        argmax_only: bool,
+        value_outputs: bool,
+    ) -> (Self, FeederHandle) {
         let (req_tx, req_rx) = mpsc::channel(batch_cfg.queue_cap);
         let (completion_tx, completion_rx) = mpsc::channel::<usize>(batch_cfg.inflight_batches * 2);
         let pending = Arc::new(Mutex::new(HashMap::new()));
@@ -74,6 +93,7 @@ impl Feeder {
             emb_tx: None,
             cancel: None,
             argmax_only,
+            value_outputs,
         };
         (
             feeder,
@@ -199,6 +219,13 @@ impl Feeder {
                         board: it.board.to_vec(),
                     })
                     .collect();
+                let output_mode = if self.value_outputs {
+                    pb::infer_request::OutputMode::Unspecified
+                } else {
+                    pb::infer_request::OutputMode::PolicyOnly
+                };
+                // Keep value probs when policy is requested; omit for value-only paths.
+                let include_value_probs = self.value_outputs && !self.argmax_only;
 
                 let req = pb::InferRequest {
                     model_id: String::new(),
@@ -206,7 +233,8 @@ impl Feeder {
                     batch_id: 0,
                     return_embedding: self.emb_tx.is_some() && !self.argmax_only,
                     argmax_only: self.argmax_only,
-                    output_mode: pb::infer_request::OutputMode::Unspecified as i32,
+                    output_mode: output_mode as i32,
+                    include_value_probs,
                 };
                 let mut client_clone = client.clone();
                 let completion = self.completion_tx.clone();
@@ -280,12 +308,20 @@ impl Feeder {
                                         resp.outputs
                                             .get(i)
                                             .map(|o| {
-                                                InferenceOutput::Bins(
-                                                    o.heads
+                                                let value =
+                                                    o.value.as_ref().map(|v| ValuePrediction {
+                                                        value: v.value,
+                                                        value_xform: v.value_xform,
+                                                        probs: v.probs.clone(),
+                                                    });
+                                                InferenceOutput::Bins {
+                                                    heads: o
+                                                        .heads
                                                         .iter()
                                                         .map(|h| h.probs.clone())
                                                         .collect(),
-                                                )
+                                                    value,
+                                                }
                                             })
                                             .ok_or_else(|| {
                                                 Status::internal("missing output for item")

@@ -161,12 +161,7 @@ impl<T: StructuredRow> StepsWriter<T> {
         }
         self.prepare()?;
         let limit = self.next_limit()?;
-        let shard = ShardWriter::new(
-            &self.out_dir,
-            &self.prefix,
-            self.shard_idx,
-            limit,
-        )?;
+        let shard = ShardWriter::new(&self.out_dir, &self.prefix, self.shard_idx, limit)?;
         self.current_limit = limit;
         self.current = Some(shard);
         Ok(())
