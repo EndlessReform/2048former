@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
-from typing import Optional, List
 import os
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import grpc
 
@@ -59,7 +60,160 @@ def vlog(msg: str) -> None:
         print(msg, flush=True)
 
 
-def build_model_metadata(model: torch.nn.Module, init_dir: str) -> inference_pb2.ModelMetadata:
+DEFAULT_VALUE_EPS = 0.001
+
+
+@dataclass
+class ValueHeadMeta:
+    objective: Optional[str] = None
+    vocab_size: Optional[int] = None
+    vocab_type: Optional[str] = None
+    support_min: Optional[float] = None
+    support_max: Optional[float] = None
+    transform_epsilon: Optional[float] = None
+    apply_transform: Optional[bool] = None
+    target: Optional[str] = None
+
+    @property
+    def has_head(self) -> bool:
+        return bool(self.objective or self.vocab_size or self.vocab_type)
+
+
+@dataclass
+class ValueOutputs:
+    probs: Optional[list[list[float]]] = None
+    value: Optional[list[float]] = None
+    value_xform: Optional[list[float]] = None
+
+
+def muzero_inverse(x: torch.Tensor, epsilon: float) -> torch.Tensor:
+    eps = float(epsilon)
+    abs_x = torch.abs(x)
+    sign = torch.sign(x)
+    if eps == 0.0:
+        return sign * ((abs_x + 1.0) ** 2 - 1.0)
+    tmp = torch.sqrt(1.0 + 4.0 * eps * (abs_x + 1.0 + eps))
+    inner = (tmp - 1.0) / (2.0 * eps)
+    return sign * (inner * inner - 1.0)
+
+
+def value_expectation_from_probs(
+    probs: torch.Tensor, *, support_min: float, support_max: float
+) -> torch.Tensor:
+    vocab_size = probs.shape[-1]
+    step = (support_max - support_min) / max(1, vocab_size - 1)
+    if step < 0:
+        raise ValueError("support_max must be greater than support_min")
+    supports = torch.linspace(
+        support_min, support_max, vocab_size, device=probs.device, dtype=probs.dtype
+    )
+    return (probs * supports).sum(dim=-1)
+
+
+def should_apply_inverse(meta: ValueHeadMeta) -> bool:
+    target = (meta.target or "").lower()
+    if meta.apply_transform:
+        return True
+    if target == "return_scaled":
+        return True
+    return False
+
+
+def extract_value_metadata(model: torch.nn.Module) -> ValueHeadMeta:
+    meta = ValueHeadMeta()
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        vcfg = getattr(cfg, "value_head", None)
+        if vcfg is not None:
+            obj = getattr(vcfg, "objective", None)
+            meta.objective = getattr(obj, "type", None) or meta.objective
+            vs = getattr(obj, "vocab_size", None)
+            meta.vocab_size = int(vs) if vs is not None else meta.vocab_size
+            meta.vocab_type = getattr(obj, "vocab_type", None) or meta.vocab_type
+
+    init_info = getattr(model, "_init_load_info", None)
+    if isinstance(init_info, dict):
+        bundle_meta = init_info.get("bundle_metadata") or {}
+        training_cfg = bundle_meta.get("training_config")
+        if isinstance(training_cfg, dict):
+            vt = training_cfg.get("value_training") or {}
+            if isinstance(vt, dict):
+                meta.target = vt.get("target") or meta.target
+                if "ce_apply_transform" in vt:
+                    try:
+                        meta.apply_transform = bool(vt.get("ce_apply_transform"))
+                    except Exception:
+                        pass
+                if "ce_transform_epsilon" in vt:
+                    try:
+                        meta.transform_epsilon = float(vt.get("ce_transform_epsilon"))
+                    except Exception:
+                        pass
+                if "ce_support_min" in vt:
+                    try:
+                        meta.support_min = float(vt.get("ce_support_min"))
+                    except Exception:
+                        pass
+                if "ce_support_max" in vt:
+                    try:
+                        meta.support_max = float(vt.get("ce_support_max"))
+                    except Exception:
+                        pass
+                if meta.vocab_size is None and "ce_vocab_size" in vt:
+                    try:
+                        meta.vocab_size = int(vt.get("ce_vocab_size"))
+                    except Exception:
+                        pass
+    return meta
+
+
+def compute_value_outputs(value_out: Optional[torch.Tensor], meta: ValueHeadMeta) -> Optional[ValueOutputs]:
+    if value_out is None:
+        return None
+
+    objective = (meta.objective or "").lower()
+    if objective == "cross_entropy" or (value_out.dim() > 1 and value_out.shape[-1] > 1):
+        probs = F.softmax(value_out.float(), dim=-1)
+        vocab_size = int(meta.vocab_size or probs.shape[-1])
+        support_min = meta.support_min if meta.support_min is not None else 0.0
+        support_max = (
+            meta.support_max if meta.support_max is not None else float(max(0, vocab_size - 1))
+        )
+
+        value_xform = value_expectation_from_probs(
+            probs, support_min=float(support_min), support_max=float(support_max)
+        )
+        value_xform_list = value_xform.to("cpu", non_blocking=False).tolist()
+        value_list = value_xform_list
+        if should_apply_inverse(meta):
+            eps = meta.transform_epsilon if meta.transform_epsilon is not None else DEFAULT_VALUE_EPS
+            value_list = muzero_inverse(value_xform, float(eps)).to("cpu", non_blocking=False).tolist()
+        probs_list = probs.to("cpu", non_blocking=False).tolist()
+        return ValueOutputs(probs=probs_list, value=value_list, value_xform=value_xform_list)
+
+    # Regression / scalar value head
+    pred = value_out.float().view(-1)
+    value_xform_list = pred.to("cpu", non_blocking=False).tolist()
+    value_list = value_xform_list
+    if should_apply_inverse(meta) and meta.transform_epsilon is not None:
+        value_list = muzero_inverse(pred, float(meta.transform_epsilon)).to("cpu", non_blocking=False).tolist()
+    return ValueOutputs(probs=None, value=value_list, value_xform=value_xform_list)
+
+
+def resolve_output_mode(mode: int) -> tuple[bool, bool, bool]:
+    if mode == inference_pb2.InferRequest.OUTPUT_MODE_POLICY_ONLY:
+        return True, False, False
+    if mode == inference_pb2.InferRequest.OUTPUT_MODE_VALUE_ONLY:
+        return False, True, True
+    if mode == inference_pb2.InferRequest.OUTPUT_MODE_POLICY_AND_VALUE:
+        return True, True, True
+    # Default: policy always, value when present (no error if absent)
+    return True, True, False
+
+
+def build_model_metadata(
+    model: torch.nn.Module, init_dir: str, *, value_meta: Optional[ValueHeadMeta] = None
+) -> inference_pb2.ModelMetadata:
     metadata = inference_pb2.ModelMetadata()
     policy_meta = inference_pb2.PolicyMetadata()
 
@@ -91,12 +245,50 @@ def build_model_metadata(model: torch.nn.Module, init_dir: str) -> inference_pb2
 
     if policy_meta.head_type or policy_meta.bin_count or policy_meta.tokenizer_type or len(policy_meta.vocab_labels):
         metadata.policy.CopyFrom(policy_meta)
+
+    vm_info = value_meta or extract_value_metadata(model)
+    vm_pb = inference_pb2.ValueMetadata()
+    if vm_info.objective:
+        vm_pb.objective = str(vm_info.objective)
+    if vm_info.vocab_size is not None:
+        try:
+            vm_pb.vocab_size = int(vm_info.vocab_size)
+        except (TypeError, ValueError):
+            pass
+    if vm_info.vocab_type:
+        vm_pb.vocab_type = str(vm_info.vocab_type)
+    if vm_info.support_min is not None:
+        vm_pb.support_min = float(vm_info.support_min)
+    if vm_info.support_max is not None:
+        vm_pb.support_max = float(vm_info.support_max)
+    if vm_info.transform_epsilon is not None:
+        vm_pb.transform_epsilon = float(vm_info.transform_epsilon)
+    if vm_info.apply_transform is not None:
+        vm_pb.apply_transform = bool(vm_info.apply_transform)
+    if vm_info.target:
+        vm_pb.target = str(vm_info.target)
+
+    if (
+        vm_info.has_head
+        or vm_info.target
+        or vm_info.support_min is not None
+        or vm_info.support_max is not None
+        or vm_info.transform_epsilon is not None
+        or vm_info.apply_transform is not None
+    ):
+        metadata.value.CopyFrom(vm_pb)
     return metadata
 
 
 class InferenceService(inference_pb2_grpc.InferenceServicer):
-    def __init__(self, model: torch.nn.Module, metadata: Optional[inference_pb2.ModelMetadata] = None) -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        metadata: Optional[inference_pb2.ModelMetadata] = None,
+        value_meta: Optional[ValueHeadMeta] = None,
+    ) -> None:
         self.model = model
+        self._value_meta = value_meta or extract_value_metadata(model)
         # Reusable pinned host buffer for tokens to enable async H2D copies.
         # Allocated lazily and grown geometrically to avoid realloc thrash.
         self._tokens_cpu = None  # type: Optional[torch.Tensor]
@@ -142,6 +334,12 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             return_embedding: bool = bool(getattr(request, "return_embedding", False))
             if argmax_only and return_embedding:
                 return_embedding = False
+            output_mode_raw = getattr(
+                request,
+                "output_mode",
+                inference_pb2.InferRequest.OUTPUT_MODE_UNSPECIFIED,
+            )
+            include_policy, include_value, require_value = resolve_output_mode(int(output_mode_raw))
 
             # Build item_ids and a single contiguous bytes buffer of boards
             item_ids: list[int] = []
@@ -199,6 +397,15 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             # Forward once to obtain hidden states and logits/policy
             prev_mode = self.model.training
             self.model.eval()
+            head_probs_t: list[torch.Tensor] = []
+            policy_probs: Optional[torch.Tensor]
+            policy_probs = None
+            policy_logits: Optional[torch.Tensor]
+            policy_logits = None
+            value_batch: Optional[ValueOutputs] = None
+            is_binned: bool = False
+            board_repr: Optional[torch.Tensor]
+            board_repr = None
             with torch.inference_mode():
                 forward_out = self.model(tokens)
                 if isinstance(forward_out, tuple) and len(forward_out) == 3:
@@ -206,23 +413,45 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                 else:
                     hidden_states, head_out = forward_out
                     value_out = None
+                policy_outputs_needed = include_policy or argmax_only
                 # Outputs are already in canonical UDLR order
-                if isinstance(head_out, (list, tuple)):
-                    # Binned heads: list length 4
-                    is_binned = True
-                    head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in head_out]
+                if policy_outputs_needed:
+                    if isinstance(head_out, (list, tuple)):
+                        # Binned heads: list length 4
+                        is_binned = True
+                        head_probs_t = [F.softmax(logits.float(), dim=-1) for logits in head_out]
+                    else:
+                        # Single 4-way policy head (UDLR)
+                        policy_logits = head_out.float()  # (B,4)
+                        is_binned = False
+                        policy_probs = F.softmax(policy_logits, dim=-1)
                 else:
-                    # Single 4-way policy head (UDLR)
-                    policy_logits = head_out.float()  # (B,4)
-                    is_binned = False
-                    policy_probs = F.softmax(policy_logits, dim=-1)
+                    is_binned = isinstance(head_out, (list, tuple))
+
+                if include_value and value_out is None:
+                    if require_value:
+                        await context.abort(
+                            grpc.StatusCode.INVALID_ARGUMENT,
+                            "value head requested but model did not return one",
+                        )
+                    include_value = False
+                if include_value:
+                    value_batch = compute_value_outputs(value_out, self._value_meta)
+                    if value_batch is None and require_value:
+                        await context.abort(
+                            grpc.StatusCode.INVALID_ARGUMENT,
+                            "value head requested but model did not return outputs",
+                        )
+                    if value_batch is None:
+                        include_value = False
+
                 if return_embedding:
                     board_repr = hidden_states.mean(dim=1)  # (B, H)
 
                 # Optional: dump the first batch's raw logits once
-                if (self._dump_logits_path or self._dump_tokens_path) and not self._dump_done:
+                if (self._dump_logits_path or self._dump_tokens_path) and not self._dump_done and policy_outputs_needed:
                     try:
-                        if not is_binned and self._dump_logits_path:
+                        if not is_binned and self._dump_logits_path and policy_logits is not None:
                             np.save(self._dump_logits_path, policy_logits.to("cpu").numpy())
                         elif is_binned and self._dump_logits_path:
                             arr = np.stack([t.to("cpu").numpy() for t in head_out], axis=1)
@@ -237,7 +466,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
             argmax_heads: list[int] = []
             argmax_p1: list[float] = []
 
-            if argmax_only:
+            if argmax_only and include_policy:
                 if is_binned:
                     # Use p1 (last bin) by default; permit tail2 scoring via env override.
                     use_tail2 = os.environ.get("INFER_2048_TAIL2", "0") != "0"
@@ -275,7 +504,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                             vlog(f"[server] DEBUG policy (argmax_only) probs[0]={first} best_idx={argmax_heads[0] if argmax_heads else None}")
                         except Exception:
                             pass
-            else:
+            elif include_policy:
                 if not is_binned:
                     # Support non-argmax for action_policy by returning per-move probabilities
                     # encoded as 4 heads with a single-bin probability each. The Rust client
@@ -289,7 +518,7 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                         except Exception:
                             pass
 
-                    if return_embedding:
+                    if return_embedding and board_repr is not None:
                         br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
                         emb_dim = int(br_cpu.shape[1])
                         embeddings_concat = br_cpu.numpy().tobytes()
@@ -310,23 +539,34 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
                         except Exception:
                             pass
 
-                    if return_embedding:
+                    if return_embedding and board_repr is not None:
                         br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
                         emb_dim = int(br_cpu.shape[1])
                         embeddings_concat = br_cpu.numpy().tobytes()
-                        outputs = [
-                            inference_pb2.Output(
-                                heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
-                            )
-                            for i in range(B)
-                        ]
-                    else:
-                        outputs = [
-                            inference_pb2.Output(
-                                heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]]
-                            )
-                            for i in range(B)
-                        ]
+                    outputs = [
+                        inference_pb2.Output(
+                            heads=[inference_pb2.HeadProbs(probs=head) for head in probs_list[i]],
+                        )
+                        for i in range(B)
+                    ]
+
+            if return_embedding and embeddings_concat is None and board_repr is not None:
+                br_cpu = board_repr.to(dtype=torch.float32, device="cpu", non_blocking=False).contiguous()
+                emb_dim = int(br_cpu.shape[1])
+                embeddings_concat = br_cpu.numpy().tobytes()
+
+            if include_value and value_batch is not None:
+                if not outputs:
+                    outputs = [inference_pb2.Output() for _ in range(B)]
+                for i in range(B):
+                    v_msg = inference_pb2.ValueOutput()
+                    if value_batch.value is not None:
+                        v_msg.value = float(value_batch.value[i])
+                    if value_batch.value_xform is not None:
+                        v_msg.value_xform = float(value_batch.value_xform[i])
+                    if value_batch.probs is not None:
+                        v_msg.probs.extend(value_batch.probs[i])
+                    outputs[i].value.CopyFrom(v_msg)
             # Restore training state
             self.model.train(prev_mode)
             vlog("[server] response materialized")
@@ -338,32 +578,20 @@ class InferenceService(inference_pb2_grpc.InferenceServicer):
         t1 = time.perf_counter()
         latency_ms = int((t1 - t0) * 1000.0)
         # Build response; include embedding metadata if present
-        if argmax_only:
-            resp = inference_pb2.InferResponse(
-                batch_id=request.batch_id,
-                item_ids=item_ids,
-                outputs=[],
-                latency_ms=latency_ms,
-                argmax_heads=argmax_heads,
-                argmax_p1=argmax_p1,
-            )
-        elif return_embedding:
-            resp = inference_pb2.InferResponse(
-                batch_id=request.batch_id,
-                item_ids=item_ids,
-                outputs=outputs,
-                latency_ms=latency_ms,
-                embed_dim=int(emb_dim),
-                embed_dtype=inference_pb2.InferResponse.FP32,
-                embeddings_concat=embeddings_concat or b"",
-            )
-        else:
-            resp = inference_pb2.InferResponse(
-                batch_id=request.batch_id,
-                item_ids=item_ids,
-                outputs=outputs,
-                latency_ms=latency_ms,
-            )
+        resp_kwargs: Dict[str, object] = {
+            "batch_id": request.batch_id,
+            "item_ids": item_ids,
+            "outputs": outputs,
+            "latency_ms": latency_ms,
+        }
+        if argmax_only and include_policy:
+            resp_kwargs["argmax_heads"] = argmax_heads
+            resp_kwargs["argmax_p1"] = argmax_p1
+        if return_embedding:
+            resp_kwargs["embed_dim"] = int(emb_dim)
+            resp_kwargs["embed_dtype"] = inference_pb2.InferResponse.FP32
+            resp_kwargs["embeddings_concat"] = embeddings_concat or b""
+        resp = inference_pb2.InferResponse(**resp_kwargs)
         if self._model_metadata is not None:
             resp.model_metadata.CopyFrom(self._model_metadata)
         vlog(f"[server] Infer end: B={B} latency_ms={latency_ms}")
@@ -420,8 +648,9 @@ async def serve_async(
             _ = forward_distributions(model, ex, set_eval=True)
         vlog("[server] warmup complete")
 
-    model_metadata = build_model_metadata(model, init_dir)
-    svc = InferenceService(model, metadata=model_metadata)
+    value_meta = extract_value_metadata(model)
+    model_metadata = build_model_metadata(model, init_dir, value_meta=value_meta)
+    svc = InferenceService(model, metadata=model_metadata, value_meta=value_meta)
 
     vlog("[server] creating grpc server...")
     # Allow large batch payloads by increasing gRPC message limits (both directions).

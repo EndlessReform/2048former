@@ -61,7 +61,7 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 
 ## Inference and evaluation plan
 
-- [ ] Extend the protobuf + server to stream value predictions (raw and inverse-transformed) optionally, without forcing 1-ply inference to pay for it. Server already accepts the third output but currently ignores it.
+- [x] Extend the protobuf + server to stream value predictions (raw + inverse-transformed) optionally, without forcing 1-ply inference to pay for it. `InferRequest.output_mode` controls policy/value combinations (auto, policy-only, value-only, policy+value w/ require-value), and `Output.value` now carries the current-board value alongside policy heads when present. `ModelMetadata.value` surfaces objective/support/transform hints for downstream decoding.
 - [ ] Add value fields to annotation sidecars and viewer rails so per-step values can be inspected (match `annotation_manifest.json` shape checks).
 - [ ] Add a smoke-test script mirroring `bin/play_2048.py` that logs predicted value vs realised returns over a short rollout.
 
@@ -70,7 +70,7 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 - Training config now accepts `objective = "cross_entropy"` with MuZero two-hot support controls (`ce_vocab_size/support_[min|max]/transform_epsilon/apply_transform` in `ValueTrainingConfig`). Default support is `[0, 600]` → vocab 601.
 - Dataloaders build two-hot targets when CE is selected via `scalar_to_two_hot` in `packages/train_2048/src/train_2048/value_support.py`; enable/disable the MuZero transform via config (use `return_raw` + apply_transform=true, or `return_scaled` + apply_transform=false to avoid double scaling).
 - Objectives (`BinnedEV`, `MacroxueTokens`) train either MSE or CE; CE uses soft two-hot targets (`-target * log_softmax`) and logs `value_loss` accordingly.
-- Model/helpers: shared MuZero transform + inverse + two-hot utilities live in `packages/train_2048/src/train_2048/value_support.py`. Inference path still needs to consume value logits and invert to scalars.
+- Model/helpers: shared MuZero transform + inverse + two-hot utilities live in `packages/train_2048/src/train_2048/value_support.py`. Inference now decodes value heads (best-effort inverse when metadata is available) and returns both transformed and inverse-transformed scalars.
 - Logging: training/val payloads and progress bar label value loss as `value_ce` when CE is active; wandb tags follow the same naming.
 - Still pending: inference plumbing, annotation output, and surfacing sidecar transform metadata alongside the support definition for downstream decoding.
 
@@ -78,4 +78,4 @@ Per-step reward computation is parallelized even for a single long run to avoid 
 
 - The value head exists and is optional; policy-only configs remain backward compatible (omit `value_head` in config.json).
 - Datasets **do not carry reward/return columns**; only `max_score` per run exists, so a new sidecar/pack step is required before value training is possible.
-- Inference/annotation rails **only move policy logits/bins**; the gRPC schema and Rust/Python servers still need extensions before value outputs can flow end-to-end.
+- Inference rails now stream value outputs + metadata; annotation storage/viewer rails still need value fields.

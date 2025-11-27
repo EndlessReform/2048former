@@ -71,6 +71,7 @@ pub async fn infer_once(
         batch_id: batch_id.unwrap_or_default(),
         return_embedding: false,
         argmax_only: false,
+        output_mode: pb::infer_request::OutputMode::Unspecified as i32,
     };
     let resp = client.infer(req).await?.into_inner();
     Ok(resp)

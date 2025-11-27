@@ -34,6 +34,18 @@ message InferRequest {
   // instead emit argmax-only decisions (see InferResponse.argmax_heads /
   // argmax_p1). Clients should fall back to full distributions when unset.
   bool argmax_only = 5;
+
+  // Control which outputs are returned. The default is backward-compatible:
+  // policy heads are always returned, and value outputs are included only when
+  // a value head exists in the checkpoint.
+  OutputMode output_mode = 6;
+
+  enum OutputMode {
+    OUTPUT_MODE_UNSPECIFIED = 0; // Default/autodetect: policy always, value if available.
+    OUTPUT_MODE_POLICY_ONLY = 1; // Force policy only even if value head exists.
+    OUTPUT_MODE_VALUE_ONLY = 2;  // Require value head; emit value only (error if missing).
+    OUTPUT_MODE_POLICY_AND_VALUE = 3; // Require value head; emit both policy and value.
+  }
 }
 
 // A single head's distribution as probabilities over bins.
@@ -51,6 +63,19 @@ message Output {
   // Optional pooled embedding for this item, encoded per InferResponse.embed_dtype.
   // When empty, no embedding was requested or returned.
   bytes embedding = 2;
+
+  // Optional value head output for the current board (not the next move).
+  ValueOutput value = 3;
+}
+
+// Value head output for the current board state.
+message ValueOutput {
+  // Expected value after applying any known inverse transform (best effort).
+  optional float value = 1;
+  // Expected value in the model's output space before inverse transform.
+  optional float value_xform = 2;
+  // Probability distribution over value bins (categorical/two-hot heads).
+  repeated float probs = 3;
 }
 
 // Metadata describing model/tokenizer semantics for policy heads.
@@ -68,6 +93,26 @@ message PolicyMetadata {
 message ModelMetadata {
   // Policy/tokenizer metadata; future fields may cover embeddings/value heads.
   PolicyMetadata policy = 1;
+  // Value head metadata (objective, support, transform hints).
+  ValueMetadata value = 2;
+}
+
+// Metadata describing value head semantics.
+message ValueMetadata {
+  // Objective type (e.g., "mse", "cross_entropy"). Empty when no value head exists.
+  string objective = 1;
+  // Number of bins emitted by a categorical value head.
+  uint32 vocab_size = 2;
+  // Optional label for the value vocab/bins.
+  string vocab_type = 3;
+  // Optional support definition for categorical heads.
+  optional float support_min = 4;
+  optional float support_max = 5;
+  // Optional MuZero transform epsilon and application flag.
+  optional float transform_epsilon = 6;
+  optional bool apply_transform = 7;
+  // Optional training target used for the value head (e.g., return_scaled).
+  string target = 8;
 }
 
 // Batched inference response.

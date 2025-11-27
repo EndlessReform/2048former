@@ -206,6 +206,7 @@ impl Feeder {
                     batch_id: 0,
                     return_embedding: self.emb_tx.is_some() && !self.argmax_only,
                     argmax_only: self.argmax_only,
+                    output_mode: pb::infer_request::OutputMode::Unspecified as i32,
                 };
                 let mut client_clone = client.clone();
                 let completion = self.completion_tx.clone();
