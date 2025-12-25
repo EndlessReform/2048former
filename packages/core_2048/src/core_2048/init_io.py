@@ -6,8 +6,51 @@ from typing import Any, Dict, Optional, Tuple
 
 from safetensors.torch import load_file as safe_load_file
 import torch
+from huggingface_hub import snapshot_download
 
 from .model import Encoder, EncoderConfig
+
+
+_HF_PREFIX = "hf://"
+
+
+def _resolve_init_path(init_dir: str, init_info: Dict[str, Any]) -> Path:
+    """Return a local filesystem path, downloading from HuggingFace if needed."""
+    if not init_dir.startswith(_HF_PREFIX):
+        path = Path(init_dir)
+        init_info.setdefault("resolved_init_path", str(path))
+        return path
+
+    raw = init_dir[len(_HF_PREFIX) :].strip("/")
+    revision = None
+    if "@" in raw:
+        raw, revision = raw.split("@", 1)
+
+    parts = raw.split("/")
+    if len(parts) < 2:
+        raise ValueError("HuggingFace init path must be hf://<org>/<repo>[/subdir][@revision]")
+    repo_id = "/".join(parts[:2])
+    subpath = "/".join(parts[2:]) if len(parts) > 2 else ""
+
+    cache_path = Path(
+        snapshot_download(
+            repo_id=repo_id,
+            revision=revision or None,
+        )
+    )
+    resolved = cache_path / subpath if subpath else cache_path
+
+    init_info.update(
+        {
+            "source": "huggingface",
+            "hf_repo_id": repo_id,
+            "hf_revision": revision,
+            "hf_subpath": subpath or None,
+            "hf_cache_path": str(cache_path),
+            "resolved_init_path": str(resolved),
+        }
+    )
+    return resolved
 
 
 def _load_pt_bundle(path: Path) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict[str, Any], Dict[str, Any]]:
@@ -49,13 +92,14 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
     Accepts either:
     - A directory that contains `config.json` and optionally model weights.
     - A `.pt` bundle produced by this project (state + encoder_config).
+    - A Hugging Face repo path prefixed with ``hf://`` (optionally with a subdir).
 
     Returns a model on CPU with random weights if no weights are found.
     """
-    init_path = Path(init_dir)
+    init_info: Dict[str, Any] = {"init_path": str(init_dir)}
+    init_path = _resolve_init_path(init_dir, init_info)
     enc_cfg_dict: Optional[Dict[str, Any]] = None
     bundle_meta: Optional[Dict[str, Any]] = None
-    init_info: Dict[str, Any] = {"init_path": str(init_path)}
 
     # Load encoder config either from config.json (directory case) or from the
     # checkpoint payload (file case / fallback).

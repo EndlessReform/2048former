@@ -563,7 +563,8 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     resumed_step: Optional[int] = None
     resume_state = None
     bundle_path_for_resume = None
-    init_dir_path = Path(cfg.init_dir)
+    resolved_init_path = init_info.get("resolved_init_path", cfg.init_dir)
+    init_dir_path = Path(resolved_init_path)
     if bundle_path_from_weights:
         bundle_path_for_resume = Path(bundle_path_from_weights)
     elif init_dir_path.is_file() and init_dir_path.suffix.lower() in {".pt", ".pth"}:
@@ -578,7 +579,9 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
 
     try:
         if bundle_path_for_resume is not None:
-            resume_state = maybe_resume_optimizer_from_init(cfg.init_dir, optimizer, bundle_path=str(bundle_path_for_resume))
+            resume_state = maybe_resume_optimizer_from_init(
+                resolved_init_path, optimizer, bundle_path=str(bundle_path_for_resume)
+            )
             if resume_state is not None:
                 resumed_step = resume_state.global_step
         else:

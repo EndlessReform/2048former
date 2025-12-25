@@ -118,11 +118,11 @@ STEP_ROW_DTYPE = np.dtype(
 )
 
 assert STEP_ROW_DTYPE.itemsize == 48
+```
 
 Dataset pack shards preserve this layout. `crates/dataset-packer` walks `.meta.json` files lexicographically, assigns sequential `run_id`s (matching `runs.id`), and appends each run's rows in the order they appear in the source JSONL. Readers should rely on `run_id` + `step_index` when reconstructing trajectories rather than assuming global contiguity beyond per-run grouping.
 
 `board_eval` is re-computed during packing using the Rust port of the original Macroxue heuristic (see `crates/dataset-packer/src/macroxue/board_eval.rs`). Values match `packages/train_2048/tokenization/macroxue/board_eval.py` and remain within 32-bit signed range. Downstream tokenization code can use this field directly when constructing advantage bins without re-running the heuristic in Python.
-```
 
 ### Runs metadata
 

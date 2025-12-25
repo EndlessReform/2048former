@@ -226,7 +226,7 @@ async fn main() {
     debug!("Loaded config: {:#?}", config);
 
     // Initialize game engine tables if needed
-    ai_2048::engine::new();
+    twenty48_utils::engine::new();
 
     // Establish gRPC connection (UDS preferred when set; else TCP)
     let client = match pipeline::connect_inference(&config.base.orchestrator.connection).await {

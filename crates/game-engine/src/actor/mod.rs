@@ -1,8 +1,6 @@
 use crate::config;
 use crate::ds_writer::StepRow as DsStepRow;
 use crate::feeder::{FeederHandle, InferenceOutput};
-use ai_2048::engine as GameEngine;
-use ai_2048::engine::{Board, Move};
 use rand::SeedableRng;
 use std::sync::{
     Arc,
@@ -10,6 +8,8 @@ use std::sync::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
+use twenty48_utils::engine as GameEngine;
+use twenty48_utils::engine::{Board, Move};
 
 pub mod strategies;
 

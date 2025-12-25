@@ -1,7 +1,7 @@
 use crate::config;
 use crate::feeder::Bins;
-use ai_2048::engine::Move;
 use rand::distributions::Distribution;
+use twenty48_utils::engine::Move;
 
 fn map_idx(idx: usize, _order: &config::HeadOrder) -> Move {
     // Canonical UDLR mapping

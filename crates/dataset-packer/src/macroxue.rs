@@ -1,5 +1,10 @@
-pub mod board_eval;
-pub mod tokenizer;
+pub mod board_eval {
+    pub use twenty48_utils::macroxue::board_eval::*;
+}
+
+pub mod tokenizer {
+    pub use twenty48_utils::macroxue::tokenizer::*;
+}
 
 /// Number of tiles in a 2048 board.
 pub const BOARD_LEN: usize = 16;
