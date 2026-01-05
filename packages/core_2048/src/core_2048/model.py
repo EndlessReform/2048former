@@ -35,7 +35,7 @@ class EncoderConfig(BaseModel):
         return cfg
 
 
-class EncoderAttention(nn.Module):
+class LLaMA3Attention(nn.Module):
     """
     LLaMA 3-style self-attention with GQA using F.scaled_dot_product_attention.
 
@@ -112,7 +112,10 @@ class EncoderAttention(nn.Module):
         is_causal: bool = False,
     ):
         # Expect x as (B, S, H) — assumed pre-normalized by caller
+        # Encoder uses full bidirectional attention only; no masks/causality.
         q, k, v = self._shape_qkv(x)
+        assert self.groups >= 1, "GQA requires num_attention_heads >= num_key_value_heads"
+        assert attn_mask is None and not is_causal, "Masks/causal attention not supported yet"
 
         # Compute attention. If using GQA (groups > 1), avoid head-wise repeats by
         # reshaping into (B * groups, n_kv_heads, S, D) and sharing K/V across groups.
@@ -126,33 +129,12 @@ class EncoderAttention(nn.Module):
             k_g = k.unsqueeze(1).expand(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
             v_g = v.unsqueeze(1).expand(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
 
-            # Adjust mask if provided: expect broadcastable to (B, n_heads, S, S).
-            # We reshape to (B*g, n_kv, S, S) by similar expansion when needed.
-            if attn_mask is not None:
-                # Try to broadcast by expanding along group dimension if possible.
-                # Accept masks shaped (B, 1, S, S) or (B, n_h, S, S).
-                if attn_mask.dim() == 4 and attn_mask.size(0) == B:
-                    if attn_mask.size(1) == 1:
-                        # (B, 1, S, S) -> (B, g, 1, S, S) -> (B*g, 1, S, S) -> (B*g, n_kv, S, S)
-                        m = attn_mask.unsqueeze(1).expand(B, g, 1, S, S)
-                        attn_mask_g = m.reshape(B * g, 1, S, S)
-                    else:
-                        # (B, n_heads, S, S) -> (B, g, n_kv, S, S) -> (B*g, n_kv, S, S)
-                        m = attn_mask.view(B, g, n_kv, S, S)
-                        attn_mask_g = m.reshape(B * g, n_kv, S, S)
-                else:
-                    # Fallback: let PyTorch attempt broadcasting
-                    attn_mask_g = attn_mask
-            else:
-                attn_mask_g = None
-
             attn_out_g = F.scaled_dot_product_attention(
                 q_g,
                 k_g,
                 v_g,
-                attn_mask=attn_mask_g,
                 dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=is_causal,
+                is_causal=False,
             )  # (B*g, n_kv, S, D)
 
             # Reshape back to (B, n_heads, S, D)
@@ -163,9 +145,8 @@ class EncoderAttention(nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=attn_mask,
                 dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=is_causal,
+                is_causal=False,
             )  # (B, n_heads, S, D)
 
         # Merge heads back: (B, S, H)
@@ -206,7 +187,7 @@ class EncoderBlock(nn.Module):
 
     def __init__(self, config: EncoderConfig):
         super().__init__()
-        self.attn = EncoderAttention(config)
+        self.attn = LLaMA3Attention(config)
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -220,10 +201,9 @@ class EncoderBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ):
         # Encoder uses non-causal (bidirectional) self-attention.
-        x = x + self.attn(self.attn_norm(x), attn_mask=attn_mask, is_causal=False)
+        x = x + self.attn(self.attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -278,13 +258,10 @@ class Encoder(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ):
         """
         Args:
             input_ids: Long tensor (batch, seq_len) with token IDs.
-            attn_mask: Optional mask broadcastable to (batch, num_heads, seq_len, seq_len).
-                Use bool (True=keep, False=mask) or additive float mask.
 
         Returns:
             hidden_states: Tensor (batch, seq_len, hidden_size)
@@ -302,7 +279,7 @@ class Encoder(nn.Module):
         # No embedding pre-norm; position added directly
 
         for blk in self.blocks:
-            x = blk(x, attn_mask=attn_mask)
+            x = blk(x)
 
         x = self.final_ln(x)
 

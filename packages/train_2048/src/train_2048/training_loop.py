@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple, Callable
 from pathlib import Path
+import contextlib
 import math
 import time
 import hashlib
@@ -483,9 +484,25 @@ def _finalize_metric_sums(
     return result
 
 
-def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[object] = None) -> Tuple[Path, int]:
+def run_training(
+    cfg: TrainingConfig,
+    device_str: str,
+    wandb_run: Optional[object] = None,
+    *,
+    profile: bool = False,
+    profile_start: int = 2,
+    profile_end: int = 10,
+) -> Tuple[Path, int]:
     device = torch.device(device_str)
     target_mode = getattr(cfg.target, "mode", "binned_ev")
+    profile_start = max(0, int(profile_start))
+    profile_end = max(profile_start, int(profile_end))
+    profile_enabled = bool(profile) and device.type == "cuda"
+    profiler_active = False
+    profiler: Optional[torch.profiler.profile] = None
+    profile_trace_path: Optional[Path] = None
+    if profile and device.type != "cuda":
+        print("[profile] Torch profiling requested but device is not CUDA; ignoring.")
 
     dataset_signature = _collect_dataset_signature(cfg)
     dataset_fingerprint = _compute_dataset_fingerprint(dataset_signature)
@@ -628,6 +645,10 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
     run_ckpt_dir = create_run_dir(cfg.checkpoint_dir)
     print(f"Checkpoint directory: {run_ckpt_dir}")
     dump_training_and_model_config(run_ckpt_dir, cfg, model)
+    if profile_enabled:
+        profile_dir = run_ckpt_dir / "profiles"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        profile_trace_path = profile_dir / f"torch_profile_step_{profile_start:06d}_{profile_end:06d}.json"
 
     dataset_checkpoint_meta = _build_dataset_checkpoint_metadata(dataset_signature, dataloader_meta, dataset_fingerprint)
 
@@ -656,6 +677,25 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
             total=current_epoch_steps,
         )
         for _ in pbar:
+            step_id = global_step
+            in_profile_step = profile_enabled and profile_start <= step_id <= profile_end
+            if profile_enabled and step_id == profile_start and not profiler_active:
+                profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
+                )
+                profiler.start()
+                profiler_active = True
+                if profile_trace_path is not None:
+                    print(
+                        "[profile] Torch profiler active "
+                        f"(steps {profile_start}-{profile_end} -> {profile_trace_path})"
+                    )
             maybe_save_stable(
                 model,
                 run_ckpt_dir,
@@ -684,35 +724,43 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
             total_data_time = 0.0
             total_comp_time = 0.0
 
-            for accum_idx in range(accum_steps):
-                zero_grad = accum_idx == 0
-                optimizer_step = accum_idx == (accum_steps - 1)
-                t0 = time.perf_counter()
-                try:
-                    batch = next(it)
-                except StopIteration:
-                    it = iter(dl_train)
-                    batch = next(it)
-                t1 = time.perf_counter()
-                metrics = objective.train_step(
-                    model,
-                    batch,
-                    optimizer,
-                    device,
-                    cfg=cfg,
-                    zero_grad=zero_grad,
-                    optimizer_step=optimizer_step,
-                    loss_scale=loss_scale,
-                )
-                try:
-                    samples_consumed += _infer_batch_size(batch)
-                except Exception:
-                    samples_consumed += cfg.batch.physical_batch_size()
-                last_metrics = metrics
-                _accumulate_metric_sums(metric_sums, metric_counts, metrics)
-                t2 = time.perf_counter()
-                total_data_time += (t1 - t0)
-                total_comp_time += (t2 - t1)
+            profile_context: contextlib.AbstractContextManager[None]
+            if in_profile_step and profiler_active and profiler is not None:
+                profile_context = torch.profiler.record_function(f"train_step_{step_id}")
+            else:
+                profile_context = contextlib.nullcontext()
+            with profile_context:
+                for accum_idx in range(accum_steps):
+                    zero_grad = accum_idx == 0
+                    optimizer_step = accum_idx == (accum_steps - 1)
+                    t0 = time.perf_counter()
+                    try:
+                        batch = next(it)
+                    except StopIteration:
+                        it = iter(dl_train)
+                        batch = next(it)
+                    t1 = time.perf_counter()
+                    metrics = objective.train_step(
+                        model,
+                        batch,
+                        optimizer,
+                        device,
+                        cfg=cfg,
+                        zero_grad=zero_grad,
+                        optimizer_step=optimizer_step,
+                        loss_scale=loss_scale,
+                    )
+                    try:
+                        samples_consumed += _infer_batch_size(batch)
+                    except Exception:
+                        samples_consumed += cfg.batch.physical_batch_size()
+                    last_metrics = metrics
+                    _accumulate_metric_sums(metric_sums, metric_counts, metrics)
+                    t2 = time.perf_counter()
+                    total_data_time += (t1 - t0)
+                    total_comp_time += (t2 - t1)
+            if in_profile_step and profiler_active and profiler is not None:
+                profiler.step()
 
             aggregated_metrics = _finalize_metric_sums(metric_sums, metric_counts, last_metrics)
             agreement = aggregated_metrics.get("policy_agreement")
@@ -782,11 +830,25 @@ def run_training(cfg: TrainingConfig, device_str: str, wandb_run: Optional[objec
                 resume_state=resume_state_dict,
                 dataset_metadata=dataset_checkpoint_meta,
             )
+            if profile_enabled and profiler_active and step_id == profile_end:
+                if profiler is not None:
+                    profiler.stop()
+                    if profile_trace_path is not None:
+                        profiler.export_chrome_trace(str(profile_trace_path))
+                        print(f"[profile] Trace written: {profile_trace_path}")
+                    profiler = None
+                profiler_active = False
             if fixed_steps == 0:
                 dangerous_dump_pt(cfg=cfg, run_dir=run_ckpt_dir, model=model, optimizer=optimizer, step=global_step)
         if fixed_steps == 0 and getattr(cfg, "checkpoint", None) is not None and cfg.checkpoint.every_epochs is not None and ((epoch + 1) % int(cfg.checkpoint.every_epochs) == 0):
             save_safetensors(model, run_ckpt_dir / f"model-epoch-{epoch + 1:04d}.safetensors")
 
+    if profile_enabled and profiler_active and profiler is not None:
+        profiler.stop()
+        if profile_trace_path is not None:
+            profiler.export_chrome_trace(str(profile_trace_path))
+            print(f"[profile] Trace written: {profile_trace_path}")
+        profiler = None
     ckpt_path = save_safetensors(model, run_ckpt_dir / "model.safetensors")
     print(f"Final checkpoint saved: {ckpt_path}")
 

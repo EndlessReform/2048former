@@ -59,4 +59,5 @@ Notes and rationale:
 Quick usage:
 
 - Train (example): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml`
+- Profile steps 2-10 with torch profiler (trace saved under the run `profiles/` dir): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml --device cuda --profile --profile-start 2 --profile-end 10`
 - The tokenizer path is configured at `dataset.tokenizer_path` and must point to a `tokenizer.json` generated as above.

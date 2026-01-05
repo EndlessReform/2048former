@@ -4,7 +4,7 @@ checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
-enabled = true
+enabled = false
 project = "train-2048-bin-v2"
 entity = ""
 run_name = ""
