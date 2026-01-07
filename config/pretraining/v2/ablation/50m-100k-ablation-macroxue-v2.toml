@@ -1,4 +1,4 @@
-init_dir = "inits/v2/50m_ablations/n1_binned"
+init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink"
 checkpoint_dir = "checkpoints"
 seed = 42
 

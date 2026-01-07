@@ -1,3 +1,5 @@
+import math
+
 from pydantic import BaseModel
 import torch
 import torch.nn as nn
@@ -13,10 +15,12 @@ class EncoderConfig(BaseModel):
     intermediate_size: int
     layer_norm_eps: float
     dropout_prob: float = 0.1
+    # Attention parameters
     # GQA: number of key/value heads. If None, defaults to num_attention_heads (MHA)
     num_key_value_heads: int | None = None
     # Attention dropout (used by scaled_dot_product_attention during training)
     attention_dropout_prob: float = 0.0
+    use_attention_sinks: bool = False
     # Absolute positional embeddings length
     max_position_embeddings: int = 16
     # Output head type: default binned EV per direction; alternative single policy head over 4 moves
@@ -81,6 +85,11 @@ class LLaMA3Attention(nn.Module):
             getattr(config, "attention_dropout_prob", 0.0) or 0.0
         )
         self.resid_dropout = nn.Dropout(config.dropout_prob)
+        self.use_attention_sinks = config.use_attention_sinks
+        if self.use_attention_sinks:
+            # One sink scalar per attention head (num_heads = num_kv_heads * groups).
+            self.sinks = nn.Parameter(torch.zeros(self.num_heads))
+            self.sm_scale = 1.0 / math.sqrt(self.head_dim)
 
     def _shape_qkv(self, x: torch.Tensor):
         # x: (B, S, H)
@@ -117,12 +126,25 @@ class LLaMA3Attention(nn.Module):
         assert self.groups >= 1, "GQA requires num_attention_heads >= num_key_value_heads"
         assert attn_mask is None and not is_causal, "Masks/causal attention not supported yet"
 
-        # Compute attention. If using GQA (groups > 1), avoid head-wise repeats by
-        # reshaping into (B * groups, n_kv_heads, S, D) and sharing K/V across groups.
-        if self.groups > 1:
-            B, n_h, S, D = q.shape
-            n_kv = k.shape[1]
-            g = self.groups
+        # Compute attention. Use a unified GQA path; groups==1 covers MHA.
+        B, n_h, S, D = q.shape
+        n_kv = k.shape[1]
+        g = self.groups
+        if self.use_attention_sinks:
+            # q -> (B, n_kv, g, S, D) for sink attention
+            q_g = q.view(B, g, n_kv, S, D).permute(0, 2, 1, 3, 4)
+            # QK: (B, n_kv, g, S, S)
+            qk = torch.einsum("bhmsd,bhtd->bhmst", q_g, k)
+            qk = qk * self.sm_scale
+
+            sinks = self.sinks.view(1, n_kv, g, 1, 1).expand(B, n_kv, g, S, 1)
+            qk = torch.cat([qk, sinks], dim=-1)
+            w = torch.softmax(qk, dim=-1)
+            w = w[..., :-1]
+
+            attn_out = torch.einsum("bhmst,bhtd->bhmsd", w, v)
+            attn_out = attn_out.permute(0, 2, 1, 3, 4).reshape(B, n_h, S, D)
+        else:
             # q -> (B, g, n_kv, S, D) -> (B*g, n_kv, S, D)
             q_g = q.view(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
             # k/v -> (B, 1, n_kv, S, D) expanded across groups, then merge batch
@@ -137,17 +159,7 @@ class LLaMA3Attention(nn.Module):
                 is_causal=False,
             )  # (B*g, n_kv, S, D)
 
-            # Reshape back to (B, n_heads, S, D)
             attn_out = attn_out_g.view(B, g, n_kv, S, D).reshape(B, n_h, S, D)
-        else:
-            # Standard MHA case: heads match
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=False,
-            )  # (B, n_heads, S, D)
 
         # Merge heads back: (B, S, H)
         attn_out = (
