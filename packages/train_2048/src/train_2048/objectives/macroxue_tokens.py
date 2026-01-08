@@ -14,6 +14,29 @@ class MacroxueTokens(Objective):
 
     def __init__(self, *, tokenizer_path: Optional[str] = None) -> None:
         self.tokenizer_path = tokenizer_path
+        self._class_weights: Optional[torch.Tensor] = None
+        self._weights_n_classes: Optional[int] = None
+        self._weights_winner_weight: Optional[float] = None
+
+    def _get_class_weights(
+        self, n_classes: int, winner_weight: float, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        """Build or retrieve cached class weight tensor for CE loss."""
+        if winner_weight == 1.0:
+            return None
+        if (
+            self._class_weights is not None
+            and self._weights_n_classes == n_classes
+            and self._weights_winner_weight == winner_weight
+            and self._class_weights.device == device
+        ):
+            return self._class_weights
+        weights = torch.ones(n_classes, device=device, dtype=torch.float32)
+        weights[-1] = winner_weight  # WINNER is always last
+        self._class_weights = weights
+        self._weights_n_classes = n_classes
+        self._weights_winner_weight = winner_weight
+        return weights
 
     def prepare_model(
         self, model: torch.nn.Module, device: torch.device, *, cfg: object, dl_train: Optional[DataLoader]
@@ -82,6 +105,9 @@ class MacroxueTokens(Objective):
             if tmin < 0 or tmax >= int(vocab):
                 raise RuntimeError(f"Token id out of range: min={tmin} max={tmax} vocab={int(vocab)}")
 
+        # Get winner weight from config (default 1.0 = uniform)
+        winner_weight = getattr(getattr(cfg, "target", None), "winner_weight", 1.0)
+
         with autocast:
             _hs, head_out = model(tokens)
             per_head_losses: list[torch.Tensor] = []
@@ -99,7 +125,8 @@ class MacroxueTokens(Objective):
                         raise RuntimeError(
                             f"Target out of range for head {h}: min={tmin} max={tmax} n_classes={n_classes}"
                         )
-                loss_h = F.cross_entropy(logits_h, tgt_h)
+                class_weights = self._get_class_weights(n_classes, winner_weight, device)
+                loss_h = F.cross_entropy(logits_h, tgt_h, weight=class_weights)
                 per_head_losses.append(loss_h)
                 # Winner probability agreement
                 winner_idx = n_classes - 1
