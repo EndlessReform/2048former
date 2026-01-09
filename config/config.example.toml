@@ -99,3 +99,8 @@ mode = "none"         # none | random_axis
 # save_best_every_steps = 1000
 # best_min_delta = 0.0
 # save_pt_every_steps = 5000    # Persist model-step-XXXXXXXX.pt bundles for resume
+
+[amp]
+# Keep fp32 master weights while running bf16 autocast on CUDA.
+# Set false to store weights in bf16 instead.
+master_weights_fp32 = true

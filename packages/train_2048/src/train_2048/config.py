@@ -380,6 +380,11 @@ class CheckpointConfig(BaseModel):
         return v
 
 
+class AmpConfig(BaseModel):
+    # Keep master weights in fp32 while autocast runs bf16 kernels on CUDA.
+    master_weights_fp32: bool = True
+
+
 class TrainingConfig(BaseModel):
     # IO
     init_dir: str  # directory with config/weights or path to a .pt bundle
@@ -397,6 +402,7 @@ class TrainingConfig(BaseModel):
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     # Checkpointing
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    amp: AmpConfig = Field(default_factory=AmpConfig)
 
     # Misc
     seed: int = 0
@@ -429,6 +435,7 @@ __all__ = [
     "RotationAugmentConfig",
     "FlipAugmentConfig",
     "CheckpointConfig",
+    "AmpConfig",
     "TrainingConfig",
     "load_config",
     "load_encoder_from_init",

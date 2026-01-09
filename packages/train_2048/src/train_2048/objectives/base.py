@@ -4,6 +4,7 @@ from typing import Dict, Optional, Protocol
 
 import torch
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 
 
 class Objective(Protocol):
@@ -28,6 +29,7 @@ class Objective(Protocol):
         device: torch.device,
         *,
         cfg: object,
+        grad_scaler: Optional[GradScaler] = None,
         zero_grad: bool = True,
         optimizer_step: bool = True,
         loss_scale: float = 1.0,

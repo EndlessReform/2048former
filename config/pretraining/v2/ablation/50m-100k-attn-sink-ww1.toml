@@ -1,6 +1,7 @@
 # Ablation: attention sink + winner_weight=1.0 (baseline)
 # Compare with ww5 variant to measure effect of WINNER upweighting
 
+# init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
 init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink"
 checkpoint_dir = "checkpoints"
 seed = 42
@@ -10,7 +11,7 @@ enabled = true
 project = "train-2048-bin-v2"
 entity = ""
 # run_name = "50m-100k-attn-sink-ww1"
-tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww1"]
+tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww1", "autocast"]
 mode = "online"
 report_every = 50
 

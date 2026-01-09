@@ -9,6 +9,7 @@ import hashlib
 
 import torch
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 
 import numpy as np
@@ -253,13 +254,32 @@ def _apply_dropout_from_config(model: torch.nn.Module, dropout_cfg: DropoutConfi
                 mlp_dropout.p = dropout_p
 
 
+def _use_fp32_master_weights(cfg: TrainingConfig, device: torch.device) -> bool:
+    amp_cfg = getattr(cfg, "amp", None)
+    return device.type == "cuda" and bool(getattr(amp_cfg, "master_weights_fp32", False))
+
+
+def _move_model_to_device(
+    model: torch.nn.Module,
+    device: torch.device,
+    *,
+    use_fp32_master_weights: bool,
+) -> torch.nn.Module:
+    if device.type == "cuda":
+        if use_fp32_master_weights:
+            return model.to(device=device, dtype=torch.float32)
+        return model.to(device=device, dtype=torch.bfloat16)
+    return model.to(device=device)
+
+
 def init_model(cfg: TrainingConfig, device: torch.device, *, target_mode: str, dl_train: Optional[DataLoader]):
+    use_fp32_master_weights = _use_fp32_master_weights(cfg, device)
     model = load_encoder_from_init(cfg.init_dir)
     _apply_dropout_from_config(model, cfg.dropout)
-    model = model.to(device=(device if device.type != "cuda" else device), dtype=(torch.bfloat16 if device.type == "cuda" else None))
     objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
     _apply_dropout_from_config(model, cfg.dropout)
+    model = _move_model_to_device(model, device, use_fp32_master_weights=use_fp32_master_weights)
     if getattr(cfg, "compile_enabled", True):
         model = torch.compile(model, mode="reduce-overhead")
     return model, objective
@@ -506,6 +526,10 @@ def run_training(
     profile_end: int = 10,
 ) -> Tuple[Path, int]:
     device = torch.device(device_str)
+    use_fp32_master_weights = _use_fp32_master_weights(cfg, device)
+    grad_scaler: Optional[GradScaler] = None
+    if device.type == "cuda" and use_fp32_master_weights:
+        grad_scaler = GradScaler()
     target_mode = getattr(cfg.target, "mode", "binned_ev")
     profile_start = max(0, int(profile_start))
     profile_end = max(profile_start, int(profile_end))
@@ -571,13 +595,10 @@ def run_training(
         resume_skip_samples=resume_skip_samples,
     )
 
-    model = model.to(
-        device=(device if device.type != "cuda" else device),
-        dtype=(torch.bfloat16 if device.type == "cuda" else None),
-    )
     objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
     _apply_dropout_from_config(model, cfg.dropout)
+    model = _move_model_to_device(model, device, use_fp32_master_weights=use_fp32_master_weights)
     if getattr(cfg, "compile_enabled", True):
         model = torch.compile(model, mode="reduce-overhead")
 
@@ -758,6 +779,7 @@ def run_training(
                         optimizer,
                         device,
                         cfg=cfg,
+                        grad_scaler=grad_scaler,
                         zero_grad=zero_grad,
                         optimizer_step=optimizer_step,
                         loss_scale=loss_scale,

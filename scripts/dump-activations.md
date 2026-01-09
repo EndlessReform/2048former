@@ -64,7 +64,24 @@ uv run --locked scripts/dump_activations.py \
 | `layer_outputs` | `(N, L, 16, H)` | Hidden states after each encoder block. |
 | `attn_norm` | `(N, L, 16, H)` | Hidden state after attention norm, before QKV projection. |
 | `mlp_input` | `(N, L, 16, H)` | Hidden state after MLP norm, before expansion. |
+| `rmsnorm_gammas` | per-module | Dumps RMSNorm gamma weights under `rmsnorm_gammas/<module_name>`. |
 | `attn_weights` | — | Not implemented. |
+
+## RMSNorm gammas
+
+Use `--outputs rmsnorm_gammas` (or include it with other keys) to dump RMSNorm
+weights from the model. Each RMSNorm module is written as its own tensor with
+key `rmsnorm_gammas/<module_name>` in the output.
+
+```bash
+uv run --locked scripts/dump_activations.py \
+  --init inits/hf/2048former-50m-v0.1 \
+  --dataset ./datasets/raws/d7_test_v1 \
+  --n-samples 1 \
+  --outputs rmsnorm_gammas \
+  -o activations_with_rmsnorms.safetensors \
+  --device cuda
+```
 
 ## Output schema
 

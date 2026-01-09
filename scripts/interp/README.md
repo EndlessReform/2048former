@@ -51,3 +51,31 @@ Optional (exhaustive or slower):
 - Use `--quiet` to suppress debug progress lines.
 - For very large dumps, increase `--outlier-samples` if you only need a rough
   magnitude summary.
+
+## Plot Attention Matrices
+
+`plot_attention_matrices.py` loads `attn_norm` + `boards` from an activation dump
+and renders attention heatmaps for a few random boards at a chosen layer.
+
+```bash
+uv run --locked scripts/interp/plot_attention_matrices.py \
+  --input activations.safetensors \
+  --layer 1 \
+  --n-boards 2
+```
+
+Optional knobs:
+- `--heads 0,4`: plot specific GQA heads.
+- `--no-avg`: skip the all-heads average heatmap.
+- `--output-dir out/attn_viz/custom_run`: customize output folder.
+
+## Check RMSNorm Gammas
+
+`check_rmsnorm_gammas.py` reads RMSNorm gamma weights from an activation dump
+and reports whether they are all exactly 1.0. Make sure the dump was created
+with `--outputs rmsnorm_gammas`.
+
+```bash
+uv run --locked scripts/interp/check_rmsnorm_gammas.py \
+  --input activations_with_rmsnorms.safetensors
+```

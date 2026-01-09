@@ -5,6 +5,7 @@ from typing import Dict, Optional
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 
 from .base import Objective
 
@@ -75,6 +76,7 @@ class MacroxueTokens(Objective):
         device: torch.device,
         *,
         cfg: object,
+        grad_scaler: Optional[GradScaler] = None,
         zero_grad: bool = True,
         optimizer_step: bool = True,
         loss_scale: float = 1.0,
@@ -139,11 +141,20 @@ class MacroxueTokens(Objective):
             loss = sum(per_head_losses)
 
         scaled_loss = loss * float(loss_scale)
-        scaled_loss.backward()
-        if optimizer_step:
-            if cfg.hyperparameters.grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.hyperparameters.grad_clip_norm)
-            optimizer.step()
+        if grad_scaler is not None:
+            grad_scaler.scale(scaled_loss).backward()
+            if optimizer_step:
+                if cfg.hyperparameters.grad_clip_norm is not None:
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.hyperparameters.grad_clip_norm)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+        else:
+            scaled_loss.backward()
+            if optimizer_step:
+                if cfg.hyperparameters.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.hyperparameters.grad_clip_norm)
+                optimizer.step()
 
         head_losses = [float(l.detach().item()) for l in per_head_losses]
         policy_agreement = float((agree_sum / max(1, agree_cnt)).detach().item()) if agree_cnt > 0 else None

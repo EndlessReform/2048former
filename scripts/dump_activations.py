@@ -9,6 +9,7 @@ from typing import Iterable
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file as safe_save_file
 
@@ -25,7 +26,9 @@ VALID_OUTPUTS = {
     "layer_outputs",
     "attn_norm",
     "mlp_input",
+    "attn_sinks",
     "attn_weights",
+    "rmsnorm_gammas",
 }
 
 DTYPE_MAP = {
@@ -33,6 +36,8 @@ DTYPE_MAP = {
     "fp16": torch.float16,
     "bf16": torch.bfloat16,
 }
+
+RMSNORM_PREFIX = "rmsnorm_gammas/"
 
 
 class ActivationCapture:
@@ -168,6 +173,18 @@ def _storage_dtype_for_npz(dtype: torch.dtype) -> np.dtype:
     raise ValueError("npz output does not support bf16; use .safetensors or .pt")
 
 
+def _collect_rmsnorm_gammas(model: nn.Module) -> dict[str, torch.Tensor]:
+    gammas: dict[str, torch.Tensor] = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.RMSNorm):
+            weight = getattr(module, "weight", None)
+            if weight is None:
+                continue
+            key_name = name or "__root__"
+            gammas[f"{RMSNORM_PREFIX}{key_name}"] = weight.detach()
+    return gammas
+
+
 def _maybe_rich_console():
     try:
         from rich.console import Console
@@ -263,11 +280,26 @@ def main() -> None:
     results: dict[str, list[torch.Tensor]] = {k: [] for k in outputs} if collect_outputs else {}
     indices_batches: list[np.ndarray] = []
     boards_batches: list[np.ndarray] = []
+    static_payload: dict[str, torch.Tensor] = {}
 
     def _capture_tensor(t: torch.Tensor) -> torch.Tensor:
         if t.is_floating_point():
             return t.to(device="cpu", dtype=storage_dtype)
         return t.to(device="cpu")
+
+    if "attn_sinks" in outputs:
+        if not all(getattr(blk.attn, "use_attention_sinks", False) for blk in model.blocks):
+            raise ValueError("attn_sinks requested but model does not use attention sinks.")
+        sinks = torch.stack([blk.attn.sinks.detach().cpu() for blk in model.blocks], dim=0)
+        static_payload["attn_sinks"] = sinks
+
+    if "rmsnorm_gammas" in outputs:
+        gammas = _collect_rmsnorm_gammas(model)
+        if not gammas:
+            print("[dump] Warning: no RMSNorm modules found in model.")
+        if collect_outputs:
+            for key, value in gammas.items():
+                static_payload[key] = _capture_tensor(value)
 
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -338,6 +370,7 @@ def main() -> None:
         if chunks:
             payload[key] = torch.cat(chunks, dim=0)
 
+    payload.update(static_payload)
     payload["indices"] = torch.from_numpy(indices_all)
     payload["boards"] = torch.from_numpy(boards_all)
 
