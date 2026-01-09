@@ -21,6 +21,7 @@ class EncoderConfig(BaseModel):
     # Attention dropout (used by scaled_dot_product_attention during training)
     attention_dropout_prob: float = 0.0
     use_attention_sinks: bool = False
+    use_qk_norm: bool = False
     # Absolute positional embeddings length
     max_position_embeddings: int = 16
     # Output head type: default binned EV per direction; alternative single policy head over 4 moves
@@ -91,6 +92,15 @@ class LLaMA3Attention(nn.Module):
             self.sinks = nn.Parameter(torch.zeros(self.num_heads))
             self.sm_scale = 1.0 / math.sqrt(self.head_dim)
 
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = nn.RMSNorm(self.head_dim, eps=config.layer_norm_eps)
+            self.k_norm = nn.RMSNorm(self.head_dim, eps=config.layer_norm_eps)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
+
     def _shape_qkv(self, x: torch.Tensor):
         # x: (B, S, H)
         B, S, _ = x.size()
@@ -104,6 +114,10 @@ class LLaMA3Attention(nn.Module):
         # Reshape to (B, S, n_kv_heads, head_dim) for k and v
         k = k.view(B, S, self.num_kv_heads, self.head_dim)
         v = v.view(B, S, self.num_kv_heads, self.head_dim)
+
+        # Apply QK norm BEFORE transpose (normalizes over head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Transpose to (B, n_*, S, head_dim)
         q = q.transpose(1, 2)
@@ -122,7 +136,7 @@ class LLaMA3Attention(nn.Module):
     ):
         # Expect x as (B, S, H) — assumed pre-normalized by caller
         # Encoder uses full bidirectional attention only; no masks/causality.
-        q, k, v = self._shape_qkv(x)
+        q, k, v = self._shape_qkv(x)  # QK norm applied inside _shape_qkv
         assert self.groups >= 1, "GQA requires num_attention_heads >= num_key_value_heads"
         assert attn_mask is None and not is_causal, "Masks/causal attention not supported yet"
 

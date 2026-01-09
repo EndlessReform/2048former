@@ -222,6 +222,8 @@ def init_datasets(
         val_split_seed=cfg.dataset.val_split_seed,
         num_workers_train=12,
         mmap_mode=cfg.dataset.mmap_mode,
+        rotation_augment=getattr(cfg.dataset, "rotation_augment", None),
+        flip_augment=getattr(cfg.dataset, "flip_augment", None),
     )
 
 
@@ -397,6 +399,11 @@ def _build_train_payload(
     if target_mode in ("binned_ev", "macroxue_tokens"):
         hl = metrics["head_losses"]
         payload.update({"train/loss_u": float(hl[0]), "train/loss_d": float(hl[1]), "train/loss_l": float(hl[2]), "train/loss_r": float(hl[3])})
+        agreement = metrics.get("policy_agreement")
+        if agreement is None:
+            agreement = metrics.get("policy_agree")
+        if agreement is not None:
+            payload["train/policy_agreement"] = float(agreement)
     else:
         # Hard target path (e.g., hard_move): log canonical policy accuracy only.
         acc = metrics.get("policy_accuracy")
@@ -418,6 +425,11 @@ def _build_val_payload(metrics: Dict[str, float | list[float] | None], target_mo
     if target_mode in ("binned_ev", "macroxue_tokens"):
         hl = metrics["head_losses"]
         payload.update({"val/loss_u": float(hl[0]), "val/loss_d": float(hl[1]), "val/loss_l": float(hl[2]), "val/loss_r": float(hl[3])})
+        agreement = metrics.get("policy_agreement")
+        if agreement is None:
+            agreement = metrics.get("policy_agree")
+        if agreement is not None:
+            payload["val/policy_agreement"] = float(agreement)
     else:
         # Hard target path (e.g., hard_move): log canonical policy accuracy only.
         acc = metrics.get("policy_accuracy")

@@ -10,6 +10,22 @@ Large datasets (100GB+) can cause OS page thrashing when randomising across shar
 - Optionally cap per-shard draws via `dataset.shard_locality_block_size` (default is the full shard).
 - Enable `dataset.shard_cache_in_memory = true` (with `dataset.shard_cache_keep_shards`) to materialise the active shard into RAM while keeping only a small number cached.
 
+## Augmentation
+
+Training-time board augmentation is configured under `dataset.rotation_augment` and `dataset.flip_augment` in the training config. Both are optional and applied in collate (rotation first, then flip).
+
+```toml
+[dataset.rotation_augment]
+mode = "random_k"
+allow_noop = true
+
+[dataset.flip_augment]
+mode = "random_axis"
+allow_noop = true
+```
+
+For details and UDLR permutation references, see `docs/board-rotation-augment.md`.
+
 ## Tokenization
 
 The `train_2048.tokenization.macroxue` module provides a tokenizer for "Macroxue" game states. This tokenizer converts game states with expectimax-derived action values into a sequence of tokens that can be used to train a transformer model.

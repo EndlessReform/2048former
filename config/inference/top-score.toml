@@ -21,8 +21,8 @@ max_concurrent_games = 256
 strategy = "TailAgg"
 alpha_p2 = 0.25
 beta_p3 = 0.025
-# alpha_p2 = 0.1
-# beta_p3 = 0.01
+# alpha_p2 = 0.01
+# beta_p3 = 0.001
 
 # Advanced tail aggregation (takes precedence over alpha/beta if set):
 #tail_bins = 4    # number of extra bins to include below p1

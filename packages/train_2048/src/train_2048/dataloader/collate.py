@@ -7,12 +7,52 @@ import numpy as np
 import torch
 
 from ..binning import Binner
+from ..augmentation.rotation import (
+    make_rotation_rng,
+    rotate_board_exps,
+    rotate_branch_udlr,
+    rotate_legal_bits,
+    rotate_move_dir,
+    sample_rotation_k,
+)
+from ..augmentation.flip import (
+    flip_board_exps,
+    flip_branch_udlr,
+    flip_legal_bits,
+    flip_move_dir,
+    make_flip_rng,
+    sample_flip_axis,
+)
 from ..tokenization.base import (
     BoardCodec,
 )
 
 
-def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
+def _rotation_settings(rotation_augment: Optional[object]) -> tuple[str, Optional[int], bool]:
+    if rotation_augment is None:
+        return "none", None, True
+    mode = getattr(rotation_augment, "mode", "none")
+    seed = getattr(rotation_augment, "seed", None)
+    allow_noop = bool(getattr(rotation_augment, "allow_noop", True))
+    return str(mode), seed, allow_noop
+
+
+def _flip_settings(flip_augment: Optional[object]) -> tuple[str, Optional[int], bool]:
+    if flip_augment is None:
+        return "none", None, True
+    mode = getattr(flip_augment, "mode", "none")
+    seed = getattr(flip_augment, "seed", None)
+    allow_noop = bool(getattr(flip_augment, "allow_noop", True))
+    return str(mode), seed, allow_noop
+
+
+def make_collate_macroxue(
+    dataset,
+    tokenizer_path: str,
+    *,
+    rotation_augment: Optional[object] = None,
+    flip_augment: Optional[object] = None,
+) -> Callable:
     """Collate function for macroxue tokenization (v1 or v2 spec)."""
     import json
     from pathlib import Path
@@ -31,6 +71,8 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
         payload = json.load(f)
 
     tokenizer_type = payload.get("tokenizer_type")
+    rotation_mode, rotation_seed, rotation_allow_noop = _rotation_settings(rotation_augment)
+    flip_mode, flip_seed, flip_allow_noop = _flip_settings(flip_augment)
 
     # V2 TOKENIZER PATH
     if tokenizer_type == "macroxue_ev_advantage_v2":
@@ -68,6 +110,19 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
         # Track if we've warned about missing board_eval
         _warned_missing_board_eval = [False]
 
+        _rotation_rng_holder = [None]
+        _flip_rng_holder = [None]
+
+        def _get_rotation_rng():
+            if _rotation_rng_holder[0] is None:
+                _rotation_rng_holder[0] = make_rotation_rng(rotation_seed)
+            return _rotation_rng_holder[0]
+
+        def _get_flip_rng():
+            if _flip_rng_holder[0] is None:
+                _flip_rng_holder[0] = make_flip_rng(flip_seed)
+            return _flip_rng_holder[0]
+
         def _collate_v2(batch_indices):
             import numpy as _np
 
@@ -82,12 +137,42 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
                 else None
             )
             exps = _unpack_board_to_exps_u8(batch["board"], mask65536=mask65536)
-            tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
-
             branch_evs = batch["branch_evs"]
             valuation_types_ds = batch["valuation_type"].astype(_np.int64, copy=False)
             ev_legal = batch["ev_legal"]
             move_dirs = batch["move_dir"]
+
+            rotation_k = None
+            flip_axis = None
+
+            if rotation_mode != "none":
+                if rotation_mode != "random_k":
+                    raise ValueError(f"Unknown rotation_augment mode: {rotation_mode}")
+                rotation_k = sample_rotation_k(
+                    len(idxs),
+                    rng=_get_rotation_rng(),
+                    allow_noop=rotation_allow_noop,
+                )
+                if _np.any(rotation_k != 0):
+                    exps = rotate_board_exps(exps, rotation_k)
+                    branch_evs = rotate_branch_udlr(branch_evs, rotation_k)
+                    ev_legal = rotate_legal_bits(ev_legal, rotation_k)
+                    move_dirs = rotate_move_dir(move_dirs, rotation_k)
+
+            if flip_mode != "none":
+                if flip_mode != "random_axis":
+                    raise ValueError(f"Unknown flip_augment mode: {flip_mode}")
+                flip_axis = sample_flip_axis(
+                    len(idxs),
+                    rng=_get_flip_rng(),
+                    allow_noop=flip_allow_noop,
+                )
+                if _np.any(flip_axis != 0):
+                    exps = flip_board_exps(exps, flip_axis)
+                    branch_evs = flip_branch_udlr(branch_evs, flip_axis)
+                    ev_legal = flip_legal_bits(ev_legal, flip_axis)
+                    move_dirs = flip_move_dir(move_dirs, flip_axis)
+            tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
 
             # Check for board_eval field
             has_board_eval = "board_eval" in batch.dtype.names
@@ -108,6 +193,19 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
                 # Import board eval function
                 from ..tokenization.macroxue.board_eval import evaluate_board_batch
                 board_evals = evaluate_board_batch(exps)
+
+            if has_board_eval and (rotation_mode != "none" or flip_mode != "none"):
+                changed_mask = None
+                if rotation_mode != "none":
+                    rot_mask = rotation_k != 0
+                    changed_mask = rot_mask if changed_mask is None else (changed_mask | rot_mask)
+                if flip_mode != "none":
+                    flip_mask = flip_axis != 0
+                    changed_mask = flip_mask if changed_mask is None else (changed_mask | flip_mask)
+                if changed_mask is not None and _np.any(changed_mask):
+                    from ..tokenization.macroxue.board_eval import evaluate_board_batch
+                    board_evals = board_evals.copy()
+                    board_evals[changed_mask] = evaluate_board_batch(exps[changed_mask])
 
             legal_mask = BoardCodec.legal_mask_from_bits_udlr(ev_legal)
 
@@ -140,6 +238,8 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
     
     # V1 TOKENIZER PATH (ORIGINAL IMPLEMENTATION)
     else:
+        if rotation_mode != "none" or flip_mode != "none":
+            raise AssertionError("Rotation/flip augmentation is not supported for macroxue v1 tokenization.")
         spec = MacroxueTokenizerV1Spec.from_dict(payload)
         knots = {vt: np.array(k) for vt, k in spec.ecdf_knots.items()}
         delta_edges = np.array(spec.delta_edges)
@@ -272,12 +372,35 @@ def make_collate_macroxue(dataset, tokenizer_path: str) -> Callable:
         return _collate_v1
 
 
-def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, ev_tokenizer: Optional[object] = None) -> Callable:
+def make_collate_steps(
+    target_mode: str,
+    dataset,
+    binner: Optional[Binner],
+    *,
+    ev_tokenizer: Optional[object] = None,
+    rotation_augment: Optional[object] = None,
+    flip_augment: Optional[object] = None,
+) -> Callable:
     """Collate function for regular steps datasets (binned_ev or hard_move)."""
     import numpy as _np
 
     if target_mode not in {"binned_ev", "hard_move"}:
         raise ValueError(f"Unknown target mode: {target_mode}")
+
+    rotation_mode, rotation_seed, rotation_allow_noop = _rotation_settings(rotation_augment)
+    flip_mode, flip_seed, flip_allow_noop = _flip_settings(flip_augment)
+    _rotation_rng_holder = [None]
+    _flip_rng_holder = [None]
+
+    def _get_rotation_rng():
+        if _rotation_rng_holder[0] is None:
+            _rotation_rng_holder[0] = make_rotation_rng(rotation_seed)
+        return _rotation_rng_holder[0]
+
+    def _get_flip_rng():
+        if _flip_rng_holder[0] is None:
+            _flip_rng_holder[0] = make_flip_rng(flip_seed)
+        return _flip_rng_holder[0]
 
     def _collate(batch_indices):
         idxs = _np.asarray(batch_indices, dtype=_np.int64)
@@ -290,7 +413,6 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
         # Always decode MSB-first packed boards, then apply 65536 mask
         from ..tokenization.base import BoardCodec as _BC
         exps_np = _BC.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
-        tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
 
         # Branch EVs and legal moves are UDLR in the dataset
         # Support both new ('branch_evs') and old ('ev_values') field names
@@ -300,7 +422,45 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
             evs = batch['ev_values'].astype(_np.float32, copy=False)
         else:
             raise KeyError("'branch_evs' or 'ev_values' missing from steps.npy")
-        legal = BoardCodec.legal_mask_from_bits_udlr(batch['ev_legal']) if 'ev_legal' in batch.dtype.names else _np.isfinite(evs)
+
+        ev_legal_bits = batch['ev_legal'] if 'ev_legal' in batch.dtype.names else None
+        rotation_k = None
+        flip_axis = None
+
+        if rotation_mode != "none":
+            if rotation_mode != "random_k":
+                raise ValueError(f"Unknown rotation_augment mode: {rotation_mode}")
+            rotation_k = sample_rotation_k(
+                len(idxs),
+                rng=_get_rotation_rng(),
+                allow_noop=rotation_allow_noop,
+            )
+            if _np.any(rotation_k != 0):
+                exps_np = rotate_board_exps(exps_np, rotation_k)
+                evs = rotate_branch_udlr(evs, rotation_k)
+                if ev_legal_bits is not None:
+                    ev_legal_bits = rotate_legal_bits(ev_legal_bits, rotation_k)
+
+        if flip_mode != "none":
+            if flip_mode != "random_axis":
+                raise ValueError(f"Unknown flip_augment mode: {flip_mode}")
+            flip_axis = sample_flip_axis(
+                len(idxs),
+                rng=_get_flip_rng(),
+                allow_noop=flip_allow_noop,
+            )
+            if _np.any(flip_axis != 0):
+                exps_np = flip_board_exps(exps_np, flip_axis)
+                evs = flip_branch_udlr(evs, flip_axis)
+                if ev_legal_bits is not None:
+                    ev_legal_bits = flip_legal_bits(ev_legal_bits, flip_axis)
+
+        tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
+        legal = (
+            BoardCodec.legal_mask_from_bits_udlr(ev_legal_bits)
+            if ev_legal_bits is not None
+            else _np.isfinite(evs)
+        )
         branch_values = torch.from_numpy(evs.copy()).to(dtype=torch.float32)
         branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))
 
@@ -329,13 +489,25 @@ def make_collate_steps(target_mode: str, dataset, binner: Optional[Binner], *, e
                 dirs_arr = batch['move'].astype(_np.int64, copy=False)
             else:
                 raise KeyError("move_dir/move missing from steps.npy for hard_move target")
+            if rotation_mode != "none" and rotation_k is not None:
+                if _np.any(rotation_k != 0):
+                    dirs_arr = rotate_move_dir(dirs_arr, rotation_k)
+            if flip_mode != "none" and flip_axis is not None:
+                if _np.any(flip_axis != 0):
+                    dirs_arr = flip_move_dir(dirs_arr, flip_axis)
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
         return out
 
     return _collate
 
 
-def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> Callable:
+def make_collate_macroxue_worker_safe(
+    dataset_dir: str,
+    tokenizer_path: str,
+    *,
+    rotation_augment: Optional[object] = None,
+    flip_augment: Optional[object] = None,
+) -> Callable:
     """Worker-safe collate that creates its own shard loader per worker."""
     # Import here to avoid circular deps
     from .shard_loader import ShardLoader
@@ -364,6 +536,8 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
         payload = json.load(f)
 
     tokenizer_type = payload.get("tokenizer_type")
+    rotation_mode, rotation_seed, rotation_allow_noop = _rotation_settings(rotation_augment)
+    flip_mode, flip_seed, flip_allow_noop = _flip_settings(flip_augment)
 
     # Build the appropriate collate based on tokenizer type
     if tokenizer_type == "macroxue_ev_advantage_v2":
@@ -389,6 +563,18 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
             vt_name_to_ds_id = {"search": 0, "tuple10": 1, "tuple11": 2}
 
         _warned_missing_board_eval = [False]
+        _rotation_rng_holder = [None]
+        _flip_rng_holder = [None]
+
+        def _get_rotation_rng():
+            if _rotation_rng_holder[0] is None:
+                _rotation_rng_holder[0] = make_rotation_rng(rotation_seed)
+            return _rotation_rng_holder[0]
+
+        def _get_flip_rng():
+            if _flip_rng_holder[0] is None:
+                _flip_rng_holder[0] = make_flip_rng(flip_seed)
+            return _flip_rng_holder[0]
 
         def _collate(batch_indices):
             import numpy as _np
@@ -401,12 +587,42 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
                 raise KeyError("Expected 'board' field in steps.npy")
             mask65536 = batch["tile_65536_mask"] if "tile_65536_mask" in batch.dtype.names else None
             exps = BoardCodec.decode_packed_board_to_exps_u8(batch["board"], mask65536=mask65536)
-            tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
-
             branch_evs = batch["branch_evs"]
             valuation_types_ds = batch["valuation_type"].astype(_np.int64, copy=False)
             ev_legal = batch["ev_legal"]
             move_dirs = batch["move_dir"]
+
+            rotation_k = None
+            flip_axis = None
+
+            if rotation_mode != "none":
+                if rotation_mode != "random_k":
+                    raise ValueError(f"Unknown rotation_augment mode: {rotation_mode}")
+                rotation_k = sample_rotation_k(
+                    len(idxs),
+                    rng=_get_rotation_rng(),
+                    allow_noop=rotation_allow_noop,
+                )
+                if _np.any(rotation_k != 0):
+                    exps = rotate_board_exps(exps, rotation_k)
+                    branch_evs = rotate_branch_udlr(branch_evs, rotation_k)
+                    ev_legal = rotate_legal_bits(ev_legal, rotation_k)
+                    move_dirs = rotate_move_dir(move_dirs, rotation_k)
+
+            if flip_mode != "none":
+                if flip_mode != "random_axis":
+                    raise ValueError(f"Unknown flip_augment mode: {flip_mode}")
+                flip_axis = sample_flip_axis(
+                    len(idxs),
+                    rng=_get_flip_rng(),
+                    allow_noop=flip_allow_noop,
+                )
+                if _np.any(flip_axis != 0):
+                    exps = flip_board_exps(exps, flip_axis)
+                    branch_evs = flip_branch_udlr(branch_evs, flip_axis)
+                    ev_legal = flip_legal_bits(ev_legal, flip_axis)
+                    move_dirs = flip_move_dir(move_dirs, flip_axis)
+            tokens = torch.from_numpy(exps.copy()).to(dtype=torch.int64)
 
             has_board_eval = "board_eval" in batch.dtype.names
             if has_board_eval:
@@ -422,6 +638,19 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
                     _warned_missing_board_eval[0] = True
                 from ..tokenization.macroxue.board_eval import evaluate_board_batch
                 board_evals = evaluate_board_batch(exps)
+
+            if has_board_eval and (rotation_mode != "none" or flip_mode != "none"):
+                changed_mask = None
+                if rotation_mode != "none":
+                    rot_mask = rotation_k != 0
+                    changed_mask = rot_mask if changed_mask is None else (changed_mask | rot_mask)
+                if flip_mode != "none":
+                    flip_mask = flip_axis != 0
+                    changed_mask = flip_mask if changed_mask is None else (changed_mask | flip_mask)
+                if changed_mask is not None and _np.any(changed_mask):
+                    from ..tokenization.macroxue.board_eval import evaluate_board_batch
+                    board_evals = board_evals.copy()
+                    board_evals[changed_mask] = evaluate_board_batch(exps[changed_mask])
 
             legal_mask = BoardCodec.legal_mask_from_bits_udlr(ev_legal)
             targets = np.zeros((len(idxs), 4), dtype=np.int64)
@@ -451,6 +680,8 @@ def make_collate_macroxue_worker_safe(dataset_dir: str, tokenizer_path: str) -> 
 
         return _collate
     else:
+        if rotation_mode != "none" or flip_mode != "none":
+            raise AssertionError("Rotation/flip augmentation is not supported for macroxue v1 tokenization.")
         # V1 tokenizer path - similar pattern
         # For brevity, raising error here - implement if needed
         raise NotImplementedError("Worker-safe V1 tokenizer not yet implemented - use V2")
@@ -461,7 +692,9 @@ def make_collate_steps_worker_safe(
     target_mode: str,
     binner: Optional[Binner],
     *,
-    ev_tokenizer: Optional[object] = None
+    ev_tokenizer: Optional[object] = None,
+    rotation_augment: Optional[object] = None,
+    flip_augment: Optional[object] = None,
 ) -> Callable:
     """Worker-safe collate for regular steps datasets."""
     from .shard_loader import ShardLoader
@@ -476,6 +709,21 @@ def make_collate_steps_worker_safe(
     if target_mode not in {"binned_ev", "hard_move"}:
         raise ValueError(f"Unknown target mode: {target_mode}")
 
+    rotation_mode, rotation_seed, rotation_allow_noop = _rotation_settings(rotation_augment)
+    flip_mode, flip_seed, flip_allow_noop = _flip_settings(flip_augment)
+    _rotation_rng_holder = [None]
+    _flip_rng_holder = [None]
+
+    def _get_rotation_rng():
+        if _rotation_rng_holder[0] is None:
+            _rotation_rng_holder[0] = make_rotation_rng(rotation_seed)
+        return _rotation_rng_holder[0]
+
+    def _get_flip_rng():
+        if _flip_rng_holder[0] is None:
+            _flip_rng_holder[0] = make_flip_rng(flip_seed)
+        return _flip_rng_holder[0]
+
     def _collate(batch_indices):
         import numpy as _np
 
@@ -487,7 +735,6 @@ def make_collate_steps_worker_safe(
             raise KeyError("'board' field required")
         mask65536 = batch['tile_65536_mask'] if 'tile_65536_mask' in batch.dtype.names else None
         exps_np = BoardCodec.decode_packed_board_to_exps_u8(batch['board'], mask65536=mask65536)
-        tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
 
         if 'branch_evs' in batch.dtype.names:
             evs = batch['branch_evs'].astype(_np.float32, copy=False)
@@ -496,7 +743,44 @@ def make_collate_steps_worker_safe(
         else:
             raise KeyError("'branch_evs' or 'ev_values' missing")
 
-        legal = BoardCodec.legal_mask_from_bits_udlr(batch['ev_legal']) if 'ev_legal' in batch.dtype.names else _np.isfinite(evs)
+        ev_legal_bits = batch['ev_legal'] if 'ev_legal' in batch.dtype.names else None
+        rotation_k = None
+        flip_axis = None
+
+        if rotation_mode != "none":
+            if rotation_mode != "random_k":
+                raise ValueError(f"Unknown rotation_augment mode: {rotation_mode}")
+            rotation_k = sample_rotation_k(
+                len(idxs),
+                rng=_get_rotation_rng(),
+                allow_noop=rotation_allow_noop,
+            )
+            if _np.any(rotation_k != 0):
+                exps_np = rotate_board_exps(exps_np, rotation_k)
+                evs = rotate_branch_udlr(evs, rotation_k)
+                if ev_legal_bits is not None:
+                    ev_legal_bits = rotate_legal_bits(ev_legal_bits, rotation_k)
+
+        if flip_mode != "none":
+            if flip_mode != "random_axis":
+                raise ValueError(f"Unknown flip_augment mode: {flip_mode}")
+            flip_axis = sample_flip_axis(
+                len(idxs),
+                rng=_get_flip_rng(),
+                allow_noop=flip_allow_noop,
+            )
+            if _np.any(flip_axis != 0):
+                exps_np = flip_board_exps(exps_np, flip_axis)
+                evs = flip_branch_udlr(evs, flip_axis)
+                if ev_legal_bits is not None:
+                    ev_legal_bits = flip_legal_bits(ev_legal_bits, flip_axis)
+
+        tokens = torch.from_numpy(exps_np.copy()).to(dtype=torch.int64)
+        legal = (
+            BoardCodec.legal_mask_from_bits_udlr(ev_legal_bits)
+            if ev_legal_bits is not None
+            else _np.isfinite(evs)
+        )
         branch_values = torch.from_numpy(evs.copy()).to(dtype=torch.float32)
         branch_mask = torch.from_numpy(legal.astype(_np.bool_, copy=False))
 
@@ -525,6 +809,12 @@ def make_collate_steps_worker_safe(
                 dirs_arr = batch['move'].astype(_np.int64, copy=False)
             else:
                 raise KeyError("move_dir/move missing")
+            if rotation_mode != "none" and rotation_k is not None:
+                if _np.any(rotation_k != 0):
+                    dirs_arr = rotate_move_dir(dirs_arr, rotation_k)
+            if flip_mode != "none" and flip_axis is not None:
+                if _np.any(flip_axis != 0):
+                    dirs_arr = flip_move_dir(dirs_arr, flip_axis)
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
 
         return out

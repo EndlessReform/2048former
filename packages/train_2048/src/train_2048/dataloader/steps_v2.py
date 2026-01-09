@@ -57,6 +57,8 @@ def build_steps_dataloaders(
     shard_locality_block_size: Optional[int] = None,
     shard_cache_in_memory: bool = True,
     shard_cache_keep_shards: int = 1,
+    rotation_augment: Optional[object] = None,
+    flip_augment: Optional[object] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], int, Dict[str, Any]]:
     """Build train/val dataloaders using efficient shard-based loading.
 
@@ -107,10 +109,22 @@ def build_steps_dataloaders(
             raise ValueError("tokenizer_path required for macroxue_tokens mode")
         # Create a worker-safe collate that doesn't capture dataset in closure
         from .collate import make_collate_macroxue_worker_safe
-        collate_fn = make_collate_macroxue_worker_safe(dataset_dir, tokenizer_path)
+        collate_fn = make_collate_macroxue_worker_safe(
+            dataset_dir,
+            tokenizer_path,
+            rotation_augment=rotation_augment,
+            flip_augment=flip_augment,
+        )
     else:
         from .collate import make_collate_steps_worker_safe
-        collate_fn = make_collate_steps_worker_safe(dataset_dir, target_mode, binner, ev_tokenizer=ev_tokenizer)
+        collate_fn = make_collate_steps_worker_safe(
+            dataset_dir,
+            target_mode,
+            binner,
+            ev_tokenizer=ev_tokenizer,
+            rotation_augment=rotation_augment,
+            flip_augment=flip_augment,
+        )
 
     # Build training dataloader
     effective_batch_size = int(batch_size)
