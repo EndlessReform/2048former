@@ -1,6 +1,7 @@
-# Ablation: attention sink + winner_weight=2.0
-# Mild WINNER upweighting - comparison point between ww1 and ww5
+# Ablation: attention sink + winner_weight=1.0 (muon)
+# Compare with ww5 variant to measure effect of WINNER upweighting
 
+# init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
 init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink"
 checkpoint_dir = "checkpoints"
 seed = 42
@@ -9,17 +10,18 @@ seed = 42
 enabled = true
 project = "train-2048-bin-v2"
 entity = ""
-run_name = "50m-100k-attn-sink-ww2"
-tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww2"]
+# run_name = "50m-100k-attn-sink-ww1"
+tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww1", "autocast", "muon"]
 mode = "online"
 report_every = 50
 
 [target]
 mode = "macroxue_tokens"
-winner_weight = 2.0
+winner_weight = 1.0
 
 [hyperparameters]
 learning_rate = 5e-4
+muon_lr = 2e-2
 grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
@@ -29,7 +31,7 @@ cooldown_pct = 0.1
 min_lr_ratio = 0.1
 
 [hyperparameters.optimizer]
-name = "adamw"
+name = "muon"
 weight_decay = 0.01
 beta1 = 0.9
 beta2 = 0.98
@@ -55,6 +57,14 @@ val_run_pct = 0.005
 val_num_steps = 200
 val_split_seed = 42
 val_every = 5_000
+
+[dataset.rotation_augment]
+mode = "random_k"
+allow_noop = true
+
+[dataset.flip_augment]
+mode = "random_axis"
+allow_noop = true
 
 [checkpoint]
 every_epochs = 1

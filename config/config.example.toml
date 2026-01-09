@@ -104,3 +104,5 @@ mode = "none"         # none | random_axis
 # Keep fp32 master weights while running bf16 autocast on CUDA.
 # Set false to store weights in bf16 instead.
 master_weights_fp32 = true
+# Optional: enable GradScaler for fp32 master weights on CUDA.
+# grad_scaler_enabled = false

@@ -383,6 +383,8 @@ class CheckpointConfig(BaseModel):
 class AmpConfig(BaseModel):
     # Keep master weights in fp32 while autocast runs bf16 kernels on CUDA.
     master_weights_fp32: bool = True
+    # Enable GradScaler explicitly when running with fp32 master weights on CUDA.
+    grad_scaler_enabled: bool = False
 
 
 class TrainingConfig(BaseModel):
