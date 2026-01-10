@@ -1,4 +1,4 @@
-num_seeds = 256
+num_seeds = 1024
 max_retries = 1
 max_concurrent_games = 256
 

@@ -1,7 +1,7 @@
 # Ablation: attention sink + winner_weight=1.0 (baseline)
 # 500k continuation run from checkpoint init
 
-init_dir = "checkpoints/20260108_115005/model-stable.pt"
+init_dir = "checkpoints/20260108_222640/model-stable.pt"
 checkpoint_dir = "checkpoints"
 seed = 42
 
@@ -10,7 +10,7 @@ enabled = true
 project = "train-2048-bin-v2"
 entity = ""
 # run_name = "50m-500k-attn-sink-ww1-resume"
-tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww1", "resume-500k"]
+tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "autocast", "resume-500k"]
 mode = "online"
 report_every = 50
 

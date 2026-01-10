@@ -103,7 +103,7 @@ def init_optimizer(model: torch.nn.Module, cfg: TrainingConfig) -> torch.optim.O
             weight_decay=opt_cfg.weight_decay,
         )
     if opt_cfg.name == "muon":
-        from muon import MuonWithAuxAdam  # type: ignore
+        from muon import SingleDeviceMuonWithAuxAdam  # type: ignore
 
         def _is_norm_param(name: str, p: torch.nn.Parameter) -> bool:
             lname = name.lower()
@@ -161,7 +161,7 @@ def init_optimizer(model: torch.nn.Module, cfg: TrainingConfig) -> torch.optim.O
                 weight_decay=0.0,
             ),
         ]
-        return MuonWithAuxAdam(param_groups)
+        return SingleDeviceMuonWithAuxAdam(param_groups)
     raise ValueError(f"Unknown optimizer: {opt_cfg.name}")
 
 
