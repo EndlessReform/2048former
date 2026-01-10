@@ -2375,6 +2375,11 @@ dependencies = [
     { name = "wandb" },
 ]
 
+[package.optional-dependencies]
+nvidia = [
+    { name = "transformer-engine", extra = ["pytorch"] },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "ipykernel" },
@@ -2391,8 +2396,10 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.6.2" },
     { name = "torch", specifier = ">=2.8.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'nvidia'", specifier = ">=2.11.0" },
     { name = "wandb", specifier = ">=0.21.3" },
 ]
+provides-extras = ["nvidia"]
 
 [package.metadata.requires-dev]
 dev = [
