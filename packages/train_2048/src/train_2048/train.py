@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler
 
 from .training_loop import run_training as train
 from .objectives import make_objective
@@ -18,10 +19,13 @@ def train_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     target_mode: str,
+    *,
+    cfg: TrainingConfig,
+    grad_scaler: Optional[GradScaler] = None,
 ):
     """Dispatcher that forwards to the concrete objective's train_step."""
     obj = make_objective(target_mode)
-    return obj.train_step(model, batch, optimizer, device)
+    return obj.train_step(model, batch, optimizer, device, cfg=cfg, grad_scaler=grad_scaler)
 
 
 @torch.no_grad()

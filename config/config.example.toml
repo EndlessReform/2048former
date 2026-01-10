@@ -78,6 +78,16 @@ val_split_seed = 42
 # Validate every N training steps (0 disables)
 val_every = 1000
 
+[dataset.rotation_augment]
+mode = "none"         # none | random_k
+# seed = 42             # optional: fixed seed for deterministic rotation
+# allow_noop = true     # if false, k=0 (no rotation) is excluded from random_k
+
+[dataset.flip_augment]
+mode = "none"         # none | random_axis
+# seed = 42             # optional: fixed seed for deterministic flip
+# allow_noop = true     # if false, axis=0 (no flip) is excluded from random_axis
+
 # Shard locality controls (optional). Enable to keep one shard in RAM and shuffle locally.
 # shard_locality = true
 # shard_locality_block_size = 500000    # Draw at most this many rows per shard before rotating
@@ -89,3 +99,10 @@ val_every = 1000
 # save_best_every_steps = 1000
 # best_min_delta = 0.0
 # save_pt_every_steps = 5000    # Persist model-step-XXXXXXXX.pt bundles for resume
+
+[amp]
+# Keep fp32 master weights while running bf16 autocast on CUDA.
+# Set false to store weights in bf16 instead.
+master_weights_fp32 = true
+# Optional: enable GradScaler for fp32 master weights on CUDA.
+# grad_scaler_enabled = false

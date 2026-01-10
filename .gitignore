@@ -18,6 +18,7 @@ out
 checkpoints
 profiles
 *.npy
+*.safetensors
 
 # inference
 bench_runs
@@ -29,3 +30,9 @@ annotations
 /target
 # gRPC stubs
 packages/infer_2048/src/infer_2048/proto
+
+# Profiling
+*.nsys-rep
+*.qdb
+*.nsys-rep.sqlite
+torch_compile_debug

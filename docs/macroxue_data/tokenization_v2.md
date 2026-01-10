@@ -34,6 +34,25 @@ Across all node types the vocabulary order is fixed and must be respected by any
 3. Bin edges in monotonically decreasing disadvantage order (higher indices are closer to the winner). **The count of these disadvantage bins must be identical for Search, tuple10, and tuple11 so that a single shared vocabulary works everywhere.**
 4. `WINNER`
 
+## Class Weighting
+
+By default, all token classes contribute equally to the cross-entropy loss. However, for policy quality, predicting `WINNER` correctly matters far more than distinguishing `BIN_15` from `BIN_16`.
+
+The `winner_weight` config option (in `[target]`) upweights the `WINNER` class in the loss:
+
+```toml
+[target]
+mode = "macroxue_tokens"
+winner_weight = 5.0  # 5x gradient pressure on WINNER predictions
+```
+
+**Rationale:**
+- With 35 classes (32 bins + ILLEGAL + FAILURE + WINNER), WINNER gets ~3% of effective gradient weight by default
+- Upweighting focuses learning on policy-critical predictions
+- Hypothesis: 5x weight improves `policy_agreement` by 5-10% at same step count
+
+**Ablation configs:** See `config/pretraining/v2/ablation/50m-100k-attn-sink-ww*.toml` for winner weight sweep (1, 2, 5, 10).
+
 ## Implementation goals
 
 > NOTE TO LLMs: feel free to extend, check off, or modify this section as long as the core todo items are still covered

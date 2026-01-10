@@ -168,5 +168,18 @@ def evaluate(board, options: dict) -> int:
     return int(score)
 
 
+def evaluate_board_batch(boards) -> "np.ndarray":
+    """Evaluate a batch of boards stored as row-major sequences."""
+    import numpy as np
+
+    arr = np.asarray(boards)
+    if arr.ndim != 2 or arr.shape[1] != N * N:
+        raise ValueError("boards must have shape [B, 16]")
+    scores = np.empty((arr.shape[0],), dtype=np.int64)
+    for i in range(arr.shape[0]):
+        scores[i] = evaluate(arr[i], options={"interactive": False})
+    return scores
+
+
 # Build tables once at import time, matching the C++ static initialiser.
 build_score_map()

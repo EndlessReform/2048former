@@ -9,6 +9,10 @@ dependencies = [
     "infer-2048",
     "numpy>=2.3.2",
     "grpcio>=1.74.0",
+    "rich>=14.2.0",
+    "textual>=7.0.1",
+    "textual-dev>=1.8.0",
+    "matplotlib>=3.10.8",
 ]
 
 [tool.uv.workspace]

@@ -1,9 +1,9 @@
-num_seeds = 256
+num_seeds = 1024
 max_retries = 1
 max_concurrent_games = 256
 
 [sampling]
-strategy = "Argmax"
+# strategy = "Argmax"
 
 ## Alternative strategies:
 # Softmax over p1 across heads
@@ -18,9 +18,11 @@ strategy = "Argmax"
 
 # Tail aggregation: score = p1 + alpha_p2 * p2 + beta_p3 * p3
 # p1=exact-1 bin, p2=second-to-last bin, p3=third-to-last bin.
-# strategy = "TailAgg"
+strategy = "TailAgg"
 # alpha_p2 = 0.25
 # beta_p3 = 0.025
+alpha_p2 = 0.01
+beta_p3 = 0.001
 
 # Advanced tail aggregation (takes precedence over alpha/beta if set):
 #tail_bins = 4    # number of extra bins to include below p1

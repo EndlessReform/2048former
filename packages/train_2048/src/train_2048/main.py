@@ -20,14 +20,33 @@ def main(argv: Optional[list[str]] = None):
         default=None,
         help="Device override (e.g., cuda, cpu). Defaults to CUDA if available.",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable torch profiler for a step window (torch.compile/inductor-friendly).",
+    )
+    parser.add_argument(
+        "--profile-start",
+        type=int,
+        default=2,
+        help="Global step to start torch profiling (inclusive).",
+    )
+    parser.add_argument(
+        "--profile-end",
+        type=int,
+        default=10,
+        help="Global step to stop torch profiling (inclusive).",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
 
     # Optional Weights & Biases setup
     wandb_run = None
+    if args.profile and getattr(cfg, "wandb", None):
+        print("[profile] W&B disabled for profiler run.")
     # Loud warnings if W&B isn't going to log online
-    if getattr(cfg, "wandb", None):
+    if getattr(cfg, "wandb", None) and not args.profile:
         if not getattr(cfg.wandb, "enabled", False):
             print("\n" + "=" * 88)
             print("[1;31mW&B DISABLED: [wandb].enabled=false — no metrics will be logged.[0m")
@@ -43,7 +62,7 @@ def main(argv: Optional[list[str]] = None):
             print("Use [wandb].mode=\"online\" (and run `wandb login`) to upload runs.")
             print("=" * 88 + "\n")
 
-    if getattr(cfg, "wandb", None) and cfg.wandb.enabled:
+    if getattr(cfg, "wandb", None) and cfg.wandb.enabled and not args.profile:
         try:
             import wandb  # type: ignore
 
@@ -79,7 +98,14 @@ def main(argv: Optional[list[str]] = None):
     )
     print(f"Config loaded from: {args.config}")
 
-    _ckpt_path, _global_step = run_training(cfg, device_str, wandb_run)
+    _ckpt_path, _global_step = run_training(
+        cfg,
+        device_str,
+        wandb_run,
+        profile=args.profile,
+        profile_start=args.profile_start,
+        profile_end=args.profile_end,
+    )
 
 
 if __name__ == "__main__":

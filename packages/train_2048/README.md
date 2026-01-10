@@ -10,6 +10,37 @@ Large datasets (100GB+) can cause OS page thrashing when randomising across shar
 - Optionally cap per-shard draws via `dataset.shard_locality_block_size` (default is the full shard).
 - Enable `dataset.shard_cache_in_memory = true` (with `dataset.shard_cache_keep_shards`) to materialise the active shard into RAM while keeping only a small number cached.
 
+## Augmentation
+
+Training-time board augmentation is configured under `dataset.rotation_augment` and `dataset.flip_augment`. It applies rotations and/or flips to boards and permutes targets (UDLR) to match.
+
+- **Order:** Rotation is applied first, then flip.
+- **Scope:** Applies to training collate only (no dataset expansion on disk).
+- **Macroxue Support:** Supported for v2 (recomputes `board_eval` for rotated/flipped boards). Not supported for v1 (will raise assertion).
+
+```toml
+[dataset.rotation_augment]
+mode = "random_k"     # Options: "none", "random_k" (0, 90, 180, 270 deg)
+allow_noop = true
+
+[dataset.flip_augment]
+mode = "random_axis"  # Options: "none", "random_axis" (UD, LR)
+allow_noop = true
+```
+
+### UDLR Permutation Reference
+
+UDLR indices: Up=0, Down=1, Left=2, Right=3.
+
+**Rotation:**
+- **90° CW:** `perm=[2, 3, 1, 0]`, `move_dir=[3, 2, 0, 1]`
+- **180°:** `perm=[1, 0, 3, 2]`, `move_dir=[1, 0, 3, 2]`
+- **270° CW:** `perm=[3, 2, 0, 1]`, `move_dir=[2, 3, 1, 0]`
+
+**Flip:**
+- **Left-Right:** `perm=[0, 1, 3, 2]`, `move_dir=[0, 1, 3, 2]`
+- **Up-Down:** `perm=[1, 0, 2, 3]`, `move_dir=[1, 0, 2, 3]`
+
 ## Tokenization
 
 The `train_2048.tokenization.macroxue` module provides a tokenizer for "Macroxue" game states. This tokenizer converts game states with expectimax-derived action values into a sequence of tokens that can be used to train a transformer model.
@@ -59,4 +90,5 @@ Notes and rationale:
 Quick usage:
 
 - Train (example): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml`
+- Profile steps 2-10 with torch profiler (trace saved under the run `profiles/` dir): `uv run python main.py --config config/pretraining/v2/10m-100k-ablation.toml --device cuda --profile --profile-start 2 --profile-end 10`
 - The tokenizer path is configured at `dataset.tokenizer_path` and must point to a `tokenizer.json` generated as above.

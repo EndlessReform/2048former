@@ -1,3 +1,5 @@
+import math
+
 from pydantic import BaseModel
 import torch
 import torch.nn as nn
@@ -13,10 +15,13 @@ class EncoderConfig(BaseModel):
     intermediate_size: int
     layer_norm_eps: float
     dropout_prob: float = 0.1
+    # Attention parameters
     # GQA: number of key/value heads. If None, defaults to num_attention_heads (MHA)
     num_key_value_heads: int | None = None
     # Attention dropout (used by scaled_dot_product_attention during training)
     attention_dropout_prob: float = 0.0
+    use_attention_sinks: bool = False
+    use_qk_norm: bool = False
     # Absolute positional embeddings length
     max_position_embeddings: int = 16
     # Output head type: default binned EV per direction; alternative single policy head over 4 moves
@@ -35,7 +40,7 @@ class EncoderConfig(BaseModel):
         return cfg
 
 
-class EncoderAttention(nn.Module):
+class LLaMA3Attention(nn.Module):
     """
     LLaMA 3-style self-attention with GQA using F.scaled_dot_product_attention.
 
@@ -81,6 +86,20 @@ class EncoderAttention(nn.Module):
             getattr(config, "attention_dropout_prob", 0.0) or 0.0
         )
         self.resid_dropout = nn.Dropout(config.dropout_prob)
+        self.use_attention_sinks = config.use_attention_sinks
+        if self.use_attention_sinks:
+            # One sink scalar per attention head (num_heads = num_kv_heads * groups).
+            self.sinks = nn.Parameter(torch.zeros(self.num_heads))
+            self.sm_scale = 1.0 / math.sqrt(self.head_dim)
+
+        self.use_qk_norm = config.use_qk_norm
+        if self.use_qk_norm:
+            self.q_norm = nn.RMSNorm(self.head_dim, eps=config.layer_norm_eps)
+            self.k_norm = nn.RMSNorm(self.head_dim, eps=config.layer_norm_eps)
+        else:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+
 
     def _shape_qkv(self, x: torch.Tensor):
         # x: (B, S, H)
@@ -95,6 +114,10 @@ class EncoderAttention(nn.Module):
         # Reshape to (B, S, n_kv_heads, head_dim) for k and v
         k = k.view(B, S, self.num_kv_heads, self.head_dim)
         v = v.view(B, S, self.num_kv_heads, self.head_dim)
+
+        # Apply QK norm BEFORE transpose (normalizes over head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Transpose to (B, n_*, S, head_dim)
         q = q.transpose(1, 2)
@@ -112,61 +135,45 @@ class EncoderAttention(nn.Module):
         is_causal: bool = False,
     ):
         # Expect x as (B, S, H) — assumed pre-normalized by caller
-        q, k, v = self._shape_qkv(x)
+        # Encoder uses full bidirectional attention only; no masks/causality.
+        q, k, v = self._shape_qkv(x)  # QK norm applied inside _shape_qkv
+        assert self.groups >= 1, "GQA requires num_attention_heads >= num_key_value_heads"
+        assert attn_mask is None and not is_causal, "Masks/causal attention not supported yet"
 
-        # Compute attention. If using GQA (groups > 1), avoid head-wise repeats by
-        # reshaping into (B * groups, n_kv_heads, S, D) and sharing K/V across groups.
-        if self.groups > 1:
-            B, n_h, S, D = q.shape
-            n_kv = k.shape[1]
-            g = self.groups
+        # Compute attention. Use a unified GQA path; groups==1 covers MHA.
+        B, n_h, S, D = q.shape
+        n_kv = k.shape[1]
+        g = self.groups
+        if self.use_attention_sinks:
+            # q -> (B, n_kv, g, S, D) for sink attention
+            q_g = q.view(B, g, n_kv, S, D).permute(0, 2, 1, 3, 4)
+            # QK: (B, n_kv, g, S, S)
+            qk = torch.einsum("bhmsd,bhtd->bhmst", q_g, k)
+            qk = qk * self.sm_scale
+
+            sinks = self.sinks.view(1, n_kv, g, 1, 1).expand(B, n_kv, g, S, 1)
+            qk = torch.cat([qk, sinks], dim=-1)
+            w = torch.softmax(qk, dim=-1)
+            w = w[..., :-1]
+
+            attn_out = torch.einsum("bhmst,bhtd->bhmsd", w, v)
+            attn_out = attn_out.permute(0, 2, 1, 3, 4).reshape(B, n_h, S, D)
+        else:
             # q -> (B, g, n_kv, S, D) -> (B*g, n_kv, S, D)
             q_g = q.view(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
             # k/v -> (B, 1, n_kv, S, D) expanded across groups, then merge batch
             k_g = k.unsqueeze(1).expand(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
             v_g = v.unsqueeze(1).expand(B, g, n_kv, S, D).reshape(B * g, n_kv, S, D)
 
-            # Adjust mask if provided: expect broadcastable to (B, n_heads, S, S).
-            # We reshape to (B*g, n_kv, S, S) by similar expansion when needed.
-            if attn_mask is not None:
-                # Try to broadcast by expanding along group dimension if possible.
-                # Accept masks shaped (B, 1, S, S) or (B, n_h, S, S).
-                if attn_mask.dim() == 4 and attn_mask.size(0) == B:
-                    if attn_mask.size(1) == 1:
-                        # (B, 1, S, S) -> (B, g, 1, S, S) -> (B*g, 1, S, S) -> (B*g, n_kv, S, S)
-                        m = attn_mask.unsqueeze(1).expand(B, g, 1, S, S)
-                        attn_mask_g = m.reshape(B * g, 1, S, S)
-                    else:
-                        # (B, n_heads, S, S) -> (B, g, n_kv, S, S) -> (B*g, n_kv, S, S)
-                        m = attn_mask.view(B, g, n_kv, S, S)
-                        attn_mask_g = m.reshape(B * g, n_kv, S, S)
-                else:
-                    # Fallback: let PyTorch attempt broadcasting
-                    attn_mask_g = attn_mask
-            else:
-                attn_mask_g = None
-
             attn_out_g = F.scaled_dot_product_attention(
                 q_g,
                 k_g,
                 v_g,
-                attn_mask=attn_mask_g,
                 dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=is_causal,
+                is_causal=False,
             )  # (B*g, n_kv, S, D)
 
-            # Reshape back to (B, n_heads, S, D)
             attn_out = attn_out_g.view(B, g, n_kv, S, D).reshape(B, n_h, S, D)
-        else:
-            # Standard MHA case: heads match
-            attn_out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=is_causal,
-            )  # (B, n_heads, S, D)
 
         # Merge heads back: (B, S, H)
         attn_out = (
@@ -206,7 +213,7 @@ class EncoderBlock(nn.Module):
 
     def __init__(self, config: EncoderConfig):
         super().__init__()
-        self.attn = EncoderAttention(config)
+        self.attn = LLaMA3Attention(config)
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -220,10 +227,9 @@ class EncoderBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ):
         # Encoder uses non-causal (bidirectional) self-attention.
-        x = x + self.attn(self.attn_norm(x), attn_mask=attn_mask, is_causal=False)
+        x = x + self.attn(self.attn_norm(x))
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -278,13 +284,10 @@ class Encoder(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        attn_mask: torch.Tensor | None = None,
     ):
         """
         Args:
             input_ids: Long tensor (batch, seq_len) with token IDs.
-            attn_mask: Optional mask broadcastable to (batch, num_heads, seq_len, seq_len).
-                Use bool (True=keep, False=mask) or additive float mask.
 
         Returns:
             hidden_states: Tensor (batch, seq_len, hidden_size)
@@ -302,7 +305,7 @@ class Encoder(nn.Module):
         # No embedding pre-norm; position added directly
 
         for blk in self.blocks:
-            x = blk(x, attn_mask=attn_mask)
+            x = blk(x)
 
         x = self.final_ln(x)
 

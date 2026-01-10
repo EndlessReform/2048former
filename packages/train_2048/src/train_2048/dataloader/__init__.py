@@ -55,6 +55,8 @@ def build_dataloaders(
         num_epochs=getattr(ds_cfg, "num_epochs", None),
         val_num_steps=getattr(ds_cfg, "val_num_steps", None),
         val_steps_pct=float(getattr(ds_cfg, "val_steps_pct", 0.0) or 0.0),
+        rotation_augment=getattr(ds_cfg, "rotation_augment", None),
+        flip_augment=getattr(ds_cfg, "flip_augment", None),
     )
 
 

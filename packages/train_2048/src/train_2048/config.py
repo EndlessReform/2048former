@@ -15,6 +15,51 @@ class TargetConfig(BaseModel):
     """Configure which supervision target to use during training."""
 
     mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
+    # Multiplier for the WINNER class loss in macroxue_tokens mode.
+    # Higher values increase gradient pressure on correctly predicting
+    # the teacher's chosen move. Default 1.0 = uniform weighting.
+    winner_weight: float = 1.0
+
+    @field_validator("winner_weight")
+    @classmethod
+    def _winner_weight_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("winner_weight must be > 0")
+        return v
+
+
+class RotationAugmentConfig(BaseModel):
+    """Configuration for training-time board rotation augmentation."""
+
+    mode: Literal["none", "random_k"] = "none"
+    # Optional: seed for deterministic rotation sampling.
+    seed: Optional[int] = None
+    # If False, k=0 (no rotation) is excluded from random sampling.
+    allow_noop: bool = True
+
+    @field_validator("seed")
+    @classmethod
+    def _seed_non_negative(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError("rotation_augment.seed must be >= 0")
+        return v
+
+
+class FlipAugmentConfig(BaseModel):
+    """Configuration for training-time board flip augmentation."""
+
+    mode: Literal["none", "random_axis"] = "none"
+    # Optional: seed for deterministic flip sampling.
+    seed: Optional[int] = None
+    # If False, axis=0 (no flip) is excluded from random sampling.
+    allow_noop: bool = True
+
+    @field_validator("seed")
+    @classmethod
+    def _seed_non_negative(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError("flip_augment.seed must be >= 0")
+        return v
 
 
 def _find_repo_root() -> Path:
@@ -73,9 +118,12 @@ class DatasetConfig(BaseModel):
     # Validation limits
     # Cap validation to a fixed number of steps (batches). When >0, overrides val_steps_pct.
     val_num_steps: Optional[int] = None
-    # Alternatively, derive validation steps as a fraction of training steps per epoch
+    # derive validation steps as a fraction of training steps per epoch
     # (e.g., 0.1 = 10% as many validation steps as training). Ignored if val_num_steps is set.
     val_steps_pct: float = 0.0
+
+    rotation_augment: RotationAugmentConfig = Field(default_factory=RotationAugmentConfig)
+    flip_augment: FlipAugmentConfig = Field(default_factory=FlipAugmentConfig)
 
     # Choose either fixed steps or epochs. If both provided, steps takes priority.
     num_steps: Optional[int] = None
@@ -332,6 +380,13 @@ class CheckpointConfig(BaseModel):
         return v
 
 
+class AmpConfig(BaseModel):
+    # Keep master weights in fp32 while autocast runs bf16 kernels on CUDA.
+    master_weights_fp32: bool = True
+    # Enable GradScaler explicitly when running with fp32 master weights on CUDA.
+    grad_scaler_enabled: bool = False
+
+
 class TrainingConfig(BaseModel):
     # IO
     init_dir: str  # directory with config/weights or path to a .pt bundle
@@ -349,6 +404,7 @@ class TrainingConfig(BaseModel):
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     # Checkpointing
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    amp: AmpConfig = Field(default_factory=AmpConfig)
 
     # Misc
     seed: int = 0
@@ -378,7 +434,10 @@ __all__ = [
     "BatchConfig",
     "DropoutConfig",
     "TargetConfig",
+    "RotationAugmentConfig",
+    "FlipAugmentConfig",
     "CheckpointConfig",
+    "AmpConfig",
     "TrainingConfig",
     "load_config",
     "load_encoder_from_init",

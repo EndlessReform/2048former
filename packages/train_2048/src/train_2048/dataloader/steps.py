@@ -528,6 +528,8 @@ def build_steps_dataloaders(
     mmap_mode: bool = False,
     step_index_min: Optional[int] = None,
     step_index_max: Optional[int] = None,
+    rotation_augment: Optional[object] = None,
+    flip_augment: Optional[object] = None,
 ) -> Tuple[DataLoader, Optional[DataLoader], int]:
     """Create train/val DataLoaders from steps.npy + metadata.db.
 
@@ -601,9 +603,21 @@ def build_steps_dataloaders(
     if target_mode == "macroxue_tokens":
         if tokenizer_path is None:
             raise ValueError("tokenizer_path is required for macroxue_tokens mode")
-        collate = make_collate_macroxue(ds_train, tokenizer_path)
+        collate = make_collate_macroxue(
+            ds_train,
+            tokenizer_path,
+            rotation_augment=rotation_augment,
+            flip_augment=flip_augment,
+        )
     else:
-        collate = make_collate_steps(target_mode, ds_train, binner, ev_tokenizer=ev_tokenizer)
+        collate = make_collate_steps(
+            target_mode,
+            ds_train,
+            binner,
+            ev_tokenizer=ev_tokenizer,
+            rotation_augment=rotation_augment,
+            flip_augment=flip_augment,
+        )
 
     effective_batch_size = int(batch_size)
     loader_batch_size = int(physical_batch_size or batch_size)
@@ -677,9 +691,21 @@ def build_steps_dataloaders(
         if target_mode == "macroxue_tokens":
             if tokenizer_path is None:
                 raise ValueError("tokenizer_path is required for macroxue_tokens mode")
-            collate_v = make_collate_macroxue(ds_val, tokenizer_path)
+            collate_v = make_collate_macroxue(
+                ds_val,
+                tokenizer_path,
+                rotation_augment=rotation_augment,
+                flip_augment=flip_augment,
+            )
         else:
-            collate_v = make_collate_steps(target_mode, ds_val, binner, ev_tokenizer=ev_tokenizer)
+            collate_v = make_collate_steps(
+                target_mode,
+                ds_val,
+                binner,
+                ev_tokenizer=ev_tokenizer,
+                rotation_augment=rotation_augment,
+                flip_augment=flip_augment,
+            )
         # Optionally cap validation steps via a sampler
         val_sampler = None
         max_val_steps = None

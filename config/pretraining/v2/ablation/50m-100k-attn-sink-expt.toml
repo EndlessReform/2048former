@@ -1,3 +1,7 @@
+# Ablation: attention sink + winner_weight=1.0 (baseline)
+# Compare with ww5 variant to measure effect of WINNER upweighting
+
+# init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
 init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink"
 checkpoint_dir = "checkpoints"
 seed = 42
@@ -6,28 +10,27 @@ seed = 42
 enabled = true
 project = "train-2048-bin-v2"
 entity = ""
-run_name = ""
-tags = ["v2", "macroxue-binned", "narrow_n1"]
-mode = "online"                               # online | offline | disabled
-report_every = 50                             # log to W&B every N steps (>=1)
+# run_name = "50m-100k-attn-sink-ww1"
+tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww1", "autocast"]
+mode = "online"
+report_every = 50
 
 [target]
 mode = "macroxue_tokens"
+winner_weight = 1.0
 
 [hyperparameters]
 learning_rate = 5e-4
 grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
-name = "warmup-stable-decay" # constant | warmup-stable-decay
+name = "warmup-stable-decay"
 warmup_steps = 2000
-# decay_steps = 0
-# Alternatively, specify a percentage of total steps for cooldown/decay
-cooldown_pct = 0.1 # e.g., last 10% of steps
+cooldown_pct = 0.1
 min_lr_ratio = 0.1
 
 [hyperparameters.optimizer]
-name = "adamw"      # adamw | muon
+name = "adamw"
 weight_decay = 0.01
 beta1 = 0.9
 beta2 = 0.98
@@ -54,11 +57,15 @@ val_num_steps = 200
 val_split_seed = 42
 val_every = 5_000
 
+[dataset.rotation_augment]
+mode = "random_k"
+allow_noop = true
+
+[dataset.flip_augment]
+mode = "random_axis"
+allow_noop = true
+
 [checkpoint]
-# Save every epoch (keep all). Epoch count is small.
 every_epochs = 1
-# Optionally save a best checkpoint every N steps based on validation loss.
-# This is a coarse interval to avoid frequent disk writes.
 save_best_every_steps = 10000
-# Require a small improvement to update the best to reduce churn.
 best_min_delta = 0.002
