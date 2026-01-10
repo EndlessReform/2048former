@@ -100,6 +100,12 @@ mode = "none"         # none | random_axis
 # best_min_delta = 0.0
 # save_pt_every_steps = 5000    # Persist model-step-XXXXXXXX.pt bundles for resume
 
+[grad_logging]
+# norm_every_steps = 1000
+# dump_every_steps = 50000
+# dump_param_names = ["tok_emb.weight", "blocks.0.attn.wq.weight"]
+# dump_dir = "grads"
+
 [amp]
 # Autocast precision: "bf16" (default), "fp32" (disable autocast), "mxfp8" (TransformerEngine).
 # autocast_type = "bf16"

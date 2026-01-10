@@ -217,7 +217,7 @@ class WandbConfig(BaseModel):
 
 
 class LRScheduleConfig(BaseModel):
-    name: Literal["constant", "warmup-stable-decay", "cosine"] = "constant"
+    name: Literal["constant", "warmup-stable-decay", "cosine", "linear-decay-then-cosine"] = "constant"
     # Only used for warmup-stable-decay
     warmup_steps: int = 0
     decay_steps: int = 0
@@ -226,6 +226,11 @@ class LRScheduleConfig(BaseModel):
     # once total training steps are known.
     cooldown_pct: float | None = None
     min_lr_ratio: float = 0.1  # final_lr = base_lr * min_lr_ratio
+
+    # For linear-decay-then-cosine
+    linear_steps: Optional[int] = None
+    linear_start_step: int = 0
+    intermediate_ratio: Optional[float] = None
 
     @field_validator("warmup_steps", "decay_steps")
     @classmethod
@@ -380,6 +385,24 @@ class CheckpointConfig(BaseModel):
         return v
 
 
+class GradLoggingConfig(BaseModel):
+    # Log gradient norm stats every N steps (disabled if None).
+    norm_every_steps: Optional[int] = None
+    # Dump named parameter gradients to disk every N steps (disabled if None).
+    dump_every_steps: Optional[int] = None
+    # Parameter names to dump when dump_every_steps is enabled.
+    dump_param_names: list[str] = Field(default_factory=list)
+    # Optional override for grad dump directory (defaults to run checkpoint dir / "grads").
+    dump_dir: Optional[str] = None
+
+    @field_validator("norm_every_steps", "dump_every_steps")
+    @classmethod
+    def _interval_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("grad logging intervals must be > 0 when provided")
+        return v
+
+
 class AmpConfig(BaseModel):
     # Autocast precision mode: "bf16" (default), "fp32" (disabled), or "mxfp8" (TransformerEngine).
     autocast_type: Literal["bf16", "fp32", "mxfp8"] = "bf16"
@@ -406,6 +429,8 @@ class TrainingConfig(BaseModel):
     dataset: DatasetConfig = Field(default_factory=DatasetConfig)
     # Checkpointing
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    # Gradient logging/dumps
+    grad_logging: GradLoggingConfig = Field(default_factory=GradLoggingConfig)
     amp: AmpConfig = Field(default_factory=AmpConfig)
 
     # Misc
@@ -439,6 +464,7 @@ __all__ = [
     "RotationAugmentConfig",
     "FlipAugmentConfig",
     "CheckpointConfig",
+    "GradLoggingConfig",
     "AmpConfig",
     "TrainingConfig",
     "load_config",
