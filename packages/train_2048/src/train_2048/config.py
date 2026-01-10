@@ -381,6 +381,8 @@ class CheckpointConfig(BaseModel):
 
 
 class AmpConfig(BaseModel):
+    # Autocast precision mode: "bf16" (default), "fp32" (disabled), or "mxfp8" (TransformerEngine).
+    autocast_type: Literal["bf16", "fp32", "mxfp8"] = "bf16"
     # Keep master weights in fp32 while autocast runs bf16 kernels on CUDA.
     master_weights_fp32: bool = True
     # Enable GradScaler explicitly when running with fp32 master weights on CUDA.

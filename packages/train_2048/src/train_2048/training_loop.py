@@ -17,7 +17,7 @@ from .checkpointing import (
     dangerous_dump_pt,
     maybe_save_pt_interval,
 )
-from .config import TrainingConfig, load_encoder_from_init
+from .config import TrainingConfig
 from .objectives import make_objective
 from .training_data import (
     collect_dataset_signature,
@@ -39,6 +39,8 @@ from .training_model import (
     init_grad_scaler,
     init_optimizer,
     make_scheduler,
+    load_training_encoder,
+    maybe_compile_model,
     move_model_to_device,
     use_fp32_master_weights,
 )
@@ -77,7 +79,7 @@ def run_training(
     dataset_signature = collect_dataset_signature(cfg)
     dataset_fingerprint = compute_dataset_fingerprint(dataset_signature)
 
-    model = load_encoder_from_init(cfg.init_dir)
+    model = load_training_encoder(cfg, device)
     apply_dropout_from_config(model, cfg.dropout)
     init_info = getattr(model, "_init_load_info", {})
     resume_payload_meta, resume_dataset_meta, resume_global_step_meta = extract_resume_metadata(init_info)
@@ -102,8 +104,7 @@ def run_training(
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
     apply_dropout_from_config(model, cfg.dropout)
     model = move_model_to_device(model, device, use_fp32_master_weights=use_fp32_master)
-    if getattr(cfg, "compile_enabled", True):
-        model = torch.compile(model, mode="reduce-overhead")
+    model = maybe_compile_model(model, cfg, device)
 
     try:
         n_params = sum(int(p.numel()) for p in model.parameters())

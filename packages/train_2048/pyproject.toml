@@ -11,9 +11,11 @@ dependencies = [
     "numpy>=2.3.2",
     "pydantic>=2.11.7",
     "safetensors>=0.6.2",
-    "torch>=2.8.0",
+    "torch>=2.9.0",
     "tqdm>=4.67.1",
     "wandb>=0.21.3",
+    "transformer-engine[pytorch]",
+    "ninja"
 ]
 
 [dependency-groups]
@@ -30,12 +32,16 @@ play = "train_2048.play_2048:main"
 train = "train_2048.main:main"
 tokenizer-macroxue = "train_2048.tokenization.cli:main"
 
-[project.optional-dependencies]
-nvidia = [
-    "transformer-engine[pytorch]>=2.11.0",
-]
-
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.uv.sources]
 ai-2048 = { git = "https://github.com/EndlessReform/2048_bench", subdirectory = "py-ai-2048" }
 core_2048 = { workspace = true }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", branch = "stable" }
+torch = { index = "pytorch-cu130" }
+
+[tool.uv]
+no-build-isolation-package = ["transformer-engine"]
