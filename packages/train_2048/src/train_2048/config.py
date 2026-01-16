@@ -217,7 +217,13 @@ class WandbConfig(BaseModel):
 
 
 class LRScheduleConfig(BaseModel):
-    name: Literal["constant", "warmup-stable-decay", "cosine", "linear-decay-then-cosine"] = "constant"
+    name: Literal[
+        "constant",
+        "warmup-stable-decay",
+        "cosine",
+        "linear-decay-then-cosine",
+        "linear-decay-then-stable",
+    ] = "constant"
     # Only used for warmup-stable-decay
     warmup_steps: int = 0
     decay_steps: int = 0
@@ -227,7 +233,7 @@ class LRScheduleConfig(BaseModel):
     cooldown_pct: float | None = None
     min_lr_ratio: float = 0.1  # final_lr = base_lr * min_lr_ratio
 
-    # For linear-decay-then-cosine
+    # For linear-decay-then-cosine / linear-decay-then-stable
     linear_steps: Optional[int] = None
     linear_start_step: int = 0
     intermediate_ratio: Optional[float] = None

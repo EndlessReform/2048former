@@ -394,6 +394,20 @@ def make_scheduler(
             frac = float(progress) / float(cosine_steps)
             cosine_val = 0.5 * (1.0 + math.cos(math.pi * frac))
             return lr_cfg.min_lr_ratio + (inter_ratio - lr_cfg.min_lr_ratio) * cosine_val
+        if lr_cfg.name == "linear-decay-then-stable":
+            linear_end = int(lr_cfg.linear_steps or 0)
+            linear_start = int(lr_cfg.linear_start_step)
+            inter_ratio = float(lr_cfg.intermediate_ratio if lr_cfg.intermediate_ratio is not None else 1.0)
+
+            if step_idx < linear_start:
+                return 1.0
+
+            if step_idx < linear_end:
+                # Linear decay: 1.0 -> inter_ratio, then hold.
+                duration = max(1, linear_end - linear_start)
+                frac = float(step_idx - linear_start) / float(duration)
+                return 1.0 - (1.0 - inter_ratio) * frac
+            return inter_ratio
 
         # warmup-stable-decay path
         if step_idx < (warmup_steps + stable_steps):

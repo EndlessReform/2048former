@@ -18,12 +18,16 @@ muon_lr = 2e-2
 grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
-name = "warmup-stable-decay" # constant | warmup-stable-decay | cosine
+name = "warmup-stable-decay" # constant | warmup-stable-decay | cosine | linear-decay-then-cosine | linear-decay-then-stable
 warmup_steps = 1000
 # decay_steps = 0
 # Alternatively, specify a percentage of total steps for cooldown/decay
 cooldown_pct = 0.10 # e.g., last 10% of steps
 min_lr_ratio = 0.1
+# For linear-decay-then-cosine / linear-decay-then-stable
+# linear_start_step = 0
+# linear_steps = 0
+# intermediate_ratio = 1.0
 
 [hyperparameters.optimizer]
 name = "adamw"      # adamw | muon

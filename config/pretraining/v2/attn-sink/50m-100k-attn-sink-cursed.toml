@@ -1,7 +1,5 @@
-# Experiment: attention sink + winner_weight=1.0 with TE mxfp8
-
-# init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
-init_dir = "inits/v2/150m/balanced_b1_binned"
+init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
+# init_dir = "inits/v2/150m/balanced_b1_binned"
 checkpoint_dir = "checkpoints"
 seed = 42
 
@@ -9,7 +7,6 @@ seed = 42
 enabled = true
 project = "train-2048-bin-v2"
 entity = ""
-# run_name = "50m-100k-attn-sink-mxfp8"
 tags = ["v2", "macroxue-binned", "attn-sink", "120M"]
 mode = "online"
 report_every = 50
@@ -19,14 +16,15 @@ mode = "macroxue_tokens"
 winner_weight = 1.0
 
 [hyperparameters]
-learning_rate = 5e-4
+learning_rate = 3e-4
 grad_clip_norm = 1.0
 
 [hyperparameters.lr_schedule]
-name = "warmup-stable-decay"
+name = "linear-decay-then-stable"
 warmup_steps = 2000
-cooldown_pct = 0.1
-min_lr_ratio = 0.1
+linear_start_step = 50_000
+linear_steps = 100_000
+intermediate_ratio = 0.5
 
 [hyperparameters.optimizer]
 name = "adamw"
@@ -36,7 +34,7 @@ beta2 = 0.98
 eps = 1e-8
 
 [batch]
-batch_size = 1024
+batch_size = 2048
 
 [dropout]
 dropout_prob = 0.03
@@ -46,7 +44,7 @@ attention_dropout_prob = 0.0
 dataset_dir = "datasets/d6_3b_v0"
 tokenizer_path = "out/macroxue_v2/tokenizer.json"
 mmap_mode = true
-num_steps = 100_000
+num_steps = 250_000
 shard_locality = true
 shard_cache_in_memory = true
 shard_cache_keep_shards = 1
