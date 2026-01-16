@@ -17,7 +17,7 @@ from .checkpointing import (
     dangerous_dump_pt,
     maybe_save_pt_interval,
 )
-from .config import TrainingConfig, load_encoder_from_init
+from .config import TrainingConfig
 from .objectives import make_objective
 from .training_data import (
     collect_dataset_signature,
@@ -26,6 +26,7 @@ from .training_data import (
     infer_batch_size,
     build_dataset_checkpoint_metadata,
 )
+from .grad_logging import compute_grad_norm_stats, dump_named_grads
 from .training_metrics import (
     format_postfix,
     wandb_log,
@@ -39,6 +40,8 @@ from .training_model import (
     init_grad_scaler,
     init_optimizer,
     make_scheduler,
+    load_training_encoder,
+    maybe_compile_model,
     move_model_to_device,
     use_fp32_master_weights,
 )
@@ -77,7 +80,7 @@ def run_training(
     dataset_signature = collect_dataset_signature(cfg)
     dataset_fingerprint = compute_dataset_fingerprint(dataset_signature)
 
-    model = load_encoder_from_init(cfg.init_dir)
+    model = load_training_encoder(cfg, device)
     apply_dropout_from_config(model, cfg.dropout)
     init_info = getattr(model, "_init_load_info", {})
     resume_payload_meta, resume_dataset_meta, resume_global_step_meta = extract_resume_metadata(init_info)
@@ -102,8 +105,7 @@ def run_training(
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
     apply_dropout_from_config(model, cfg.dropout)
     model = move_model_to_device(model, device, use_fp32_master_weights=use_fp32_master)
-    if getattr(cfg, "compile_enabled", True):
-        model = torch.compile(model, mode="reduce-overhead")
+    model = maybe_compile_model(model, cfg, device)
 
     try:
         n_params = sum(int(p.numel()) for p in model.parameters())
@@ -166,6 +168,16 @@ def run_training(
     pre_decay_flag = {"saved": False}
     best_tracker: dict[str, float] = {}
     wandb_report_every = max(1, int(getattr(getattr(cfg, "wandb", None), "report_every", 1)))
+    grad_norm_every = int(getattr(getattr(cfg, "grad_logging", None), "norm_every_steps", 0) or 0)
+    grad_dump_every = int(getattr(getattr(cfg, "grad_logging", None), "dump_every_steps", 0) or 0)
+    grad_dump_names = list(getattr(getattr(cfg, "grad_logging", None), "dump_param_names", []) or [])
+    grad_dump_dir_cfg = getattr(getattr(cfg, "grad_logging", None), "dump_dir", None)
+    grad_dump_dir: Optional[Path] = None
+    if grad_dump_dir_cfg:
+        dump_path = Path(str(grad_dump_dir_cfg))
+        grad_dump_dir = dump_path if dump_path.is_absolute() else (run_ckpt_dir / dump_path)
+    elif grad_dump_every > 0 and grad_dump_names:
+        grad_dump_dir = run_ckpt_dir / "grads"
     base_grad_accum_steps = max(1, cfg.batch.grad_accum_steps())
     adaptive_cfg = getattr(cfg.batch, "adaptive", None)
     lr_schedule_name = getattr(cfg.hyperparameters.lr_schedule, "name", "constant")
@@ -311,6 +323,35 @@ def run_training(
                     ),
                     step=global_step,
                 )
+            if grad_norm_every > 0 and global_step > 0 and (global_step % grad_norm_every) == 0:
+                grad_stats = compute_grad_norm_stats(model)
+                if grad_stats is not None:
+                    wandb_log(
+                        {
+                            "grad/norm_mean": grad_stats.mean,
+                            "grad/norm_std": grad_stats.std,
+                            "grad/norm_p95": grad_stats.p95,
+                            "grad/norm_max": grad_stats.max,
+                            "grad/norm_global": grad_stats.global_norm,
+                            "grad/norm_count": grad_stats.count,
+                        },
+                        step=global_step,
+                    )
+            if (
+                grad_dump_every > 0
+                and grad_dump_dir is not None
+                and grad_dump_names
+                and global_step > 0
+                and (global_step % grad_dump_every) == 0
+            ):
+                dump_path = dump_named_grads(
+                    model,
+                    grad_dump_names,
+                    step=global_step,
+                    out_dir=grad_dump_dir,
+                )
+                if dump_path is not None:
+                    print(f"[grad] Saved gradient dump: {dump_path}")
             maybe_log_val(
                 objective,
                 model,

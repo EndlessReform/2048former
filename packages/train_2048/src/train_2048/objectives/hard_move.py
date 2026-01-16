@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 
 from .base import Objective
+from train_2048.amp import autocast_context
 
 
 class HardMove(Objective):
@@ -38,17 +39,7 @@ class HardMove(Objective):
         if zero_grad:
             optimizer.zero_grad(set_to_none=True)
 
-        if device.type == "cuda":
-            autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            class _Null:
-                def __enter__(self):
-                    return None
-                def __exit__(self, *args):
-                    return False
-            autocast = _Null()
-
-        with autocast:
+        with autocast_context(cfg, device, model=model):
             _hs, head_out = model(tokens)
             if isinstance(head_out, (list, tuple)):
                 if not all(t.shape[-1] == 1 for t in head_out):
@@ -130,16 +121,6 @@ class HardMove(Objective):
         agree_sum = 0.0
         agree_cnt = 0
 
-        if device.type == "cuda":
-            autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            class _Null:
-                def __enter__(self):
-                    return None
-                def __exit__(self, *args):
-                    return False
-            autocast = _Null()
-
         for batch in dl_val:
             tokens = batch["tokens"].to(device, non_blocking=True)
             move_targets = batch["move_targets"].to(device, non_blocking=True)
@@ -147,7 +128,7 @@ class HardMove(Objective):
             if branch_mask is not None:
                 branch_mask = branch_mask.to(device, non_blocking=True)
 
-            with autocast:
+            with autocast_context(None, device, model=model):
                 _hs, head_out = model(tokens)
                 if isinstance(head_out, (list, tuple)):
                     if not all(t.shape[-1] == 1 for t in head_out):

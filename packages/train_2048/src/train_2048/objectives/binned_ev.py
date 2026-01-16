@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 
 from .base import Objective
+from train_2048.amp import autocast_context
 
 
 class BinnedEV(Objective):
@@ -36,17 +37,7 @@ class BinnedEV(Objective):
         if zero_grad:
             optimizer.zero_grad(set_to_none=True)
 
-        if device.type == "cuda":
-            autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            class _Null:
-                def __enter__(self):
-                    return None
-                def __exit__(self, *args):
-                    return False
-            autocast = _Null()
-
-        with autocast:
+        with autocast_context(cfg, device, model=model):
             _hs, head_out = model(tokens)
             per_head_losses: list[torch.Tensor] = []
             for h in range(4):
@@ -86,22 +77,11 @@ class BinnedEV(Objective):
         total_heads = torch.zeros(4, dtype=torch.float64)
         n_batches = 0
 
-        if device.type == "cuda":
-            autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            class _Null:
-                def __enter__(self):
-                    return None
-                def __exit__(self, *args):
-                    return False
-            autocast = _Null()
-
         for batch in dl_val:
             tokens = batch["tokens"].to(device, non_blocking=True)
             branch_mask = batch["branch_mask"].to(device, non_blocking=True)
             targets_bins = batch["branch_bin_targets"].to(device, non_blocking=True)
-
-            with autocast:
+            with autocast_context(None, device, model=model):
                 _hs, head_out = model(tokens)
                 per_head_losses: list[torch.Tensor] = []
                 for h in range(4):

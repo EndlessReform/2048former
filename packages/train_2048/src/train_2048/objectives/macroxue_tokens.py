@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler
 
 from .base import Objective
+from train_2048.amp import autocast_context
 
 
 class MacroxueTokens(Objective):
@@ -87,18 +88,6 @@ class MacroxueTokens(Objective):
         if zero_grad:
             optimizer.zero_grad(set_to_none=True)
 
-        if device.type == "cuda":
-            autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            class _Null:
-                def __enter__(self):
-                    return None
-
-                def __exit__(self, *args):
-                    return False
-
-            autocast = _Null()
-
         # Bounds check on tokens for clearer errors
         vocab = getattr(getattr(model, "tok_emb", None), "num_embeddings", None)
         if vocab is not None and tokens.numel():
@@ -110,7 +99,7 @@ class MacroxueTokens(Objective):
         # Get winner weight from config (default 1.0 = uniform)
         winner_weight = getattr(getattr(cfg, "target", None), "winner_weight", 1.0)
 
-        with autocast:
+        with autocast_context(cfg, device, model=model):
             _hs, head_out = model(tokens)
             per_head_losses: list[torch.Tensor] = []
             agree_sum = torch.zeros((), device=device, dtype=torch.float32)
@@ -176,22 +165,10 @@ class MacroxueTokens(Objective):
         agree_sum = 0.0
         agree_cnt = 0
 
-        if device.type == "cuda":
-            autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            class _Null:
-                def __enter__(self):
-                    return None
-
-                def __exit__(self, *args):
-                    return False
-
-            autocast = _Null()
-
         for batch in dl_val:
             tokens = batch["tokens"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
-            with autocast:
+            with autocast_context(None, device, model=model):
                 _hs, head_out = model(tokens)
                 per_head_losses: list[torch.Tensor] = []
                 for h in range(4):

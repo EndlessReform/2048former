@@ -3,7 +3,7 @@ name = "train-2048-workspace"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
     "train_2048",
     "infer-2048",

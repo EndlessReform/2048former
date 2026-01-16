@@ -37,6 +37,10 @@ def save_pt_bundle(
     """Persist a torch ``.pt`` bundle with weights, optimizer state, and metadata."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    autocast_type = getattr(getattr(training_cfg, "amp", None), "autocast_type", None)
+    model_backend = getattr(model, "_training_backend", None)
+    if model_backend is None and isinstance(autocast_type, str):
+        model_backend = "transformer_engine" if autocast_type == "mxfp8" else "torch"
     payload = {
         "global_step": (int(global_step) if global_step is not None else None),
         "model": normalize_state_dict_keys(model.state_dict()),
@@ -44,6 +48,8 @@ def save_pt_bundle(
         "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
         "training_config": training_cfg.model_dump() if training_cfg is not None and hasattr(training_cfg, "model_dump") else None,
         "metadata_version": int(metadata_version),
+        "model_backend": model_backend,
+        "autocast_type": autocast_type,
     }
     if dataset_metadata is not None:
         payload["dataset"] = dataset_metadata
@@ -152,7 +158,14 @@ def save_safetensors(model: torch.nn.Module, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     raw = {k: v.detach().to("cpu") for k, v in model.state_dict().items()}
     state = normalize_state_dict_keys(raw)
-    safe_save_file(state, str(path), metadata={"format": "pt"})
+    metadata = {"format": "pt"}
+    model_backend = getattr(model, "_training_backend", None)
+    autocast_type = getattr(model, "_autocast_type", None)
+    if model_backend is not None:
+        metadata["model_backend"] = str(model_backend)
+    if autocast_type is not None:
+        metadata["autocast_type"] = str(autocast_type)
+    safe_save_file(state, str(path), metadata=metadata)
     return path
 
 
@@ -287,6 +300,8 @@ def dangerous_dump_pt(*, cfg, run_dir: Path, model: torch.nn.Module, optimizer: 
             "encoder_config": getattr(model, "config", None).model_dump() if getattr(model, "config", None) is not None else None,
             "training_config": cfg.model_dump(),
             "metadata_version": CHECKPOINT_METADATA_VERSION,
+            "model_backend": getattr(model, "_training_backend", None),
+            "autocast_type": getattr(getattr(cfg, "amp", None), "autocast_type", None),
         }
         path = run_dir / f"dangerous-step-{step:08d}.pt"
         try:

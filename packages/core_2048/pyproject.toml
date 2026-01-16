@@ -12,9 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-nvidia = [
-    "transformer-engine[pytorch]>=2.11.0",
-]
+nvidia = []
 
 [tool.uv.build-backend]
 module-name = ["core_2048"]

@@ -1,6 +1,7 @@
 import math
 
 from pydantic import BaseModel
+from typing import Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,7 +26,7 @@ class EncoderConfig(BaseModel):
     # Absolute positional embeddings length
     max_position_embeddings: int = 16
     # Output head type: default binned EV per direction; alternative single policy head over 4 moves
-    head_type: str = "binned_ev"  # accepted: "binned_ev", "action_policy"
+    head_type: Literal["binned_ev", "action_policy"] = "binned_ev"  # accepted: "binned_ev", "action_policy"
 
     @classmethod
     def model_validate(cls, obj):

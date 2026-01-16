@@ -41,6 +41,13 @@ UDLR indices: Up=0, Down=1, Left=2, Right=3.
 - **Left-Right:** `perm=[0, 1, 3, 2]`, `move_dir=[0, 1, 3, 2]`
 - **Up-Down:** `perm=[1, 0, 2, 3]`, `move_dir=[1, 0, 2, 3]`
 
+## AMP / Precision
+
+Autocast configuration lives under `[amp]` in the training config:
+
+- `amp.autocast_type = "bf16"` (default), `"fp32"` (disable autocast), or `"mxfp8"` for TransformerEngine FP8.
+- `mxfp8` requires CUDA + TransformerEngine and only resumes from TE-tagged checkpoints.
+
 ## Tokenization
 
 The `train_2048.tokenization.macroxue` module provides a tokenizer for "Macroxue" game states. This tokenizer converts game states with expectimax-derived action values into a sequence of tokens that can be used to train a transformer model.
