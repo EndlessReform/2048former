@@ -60,7 +60,6 @@ def test_make_collate_steps_rotation(monkeypatch) -> None:
     collate = make_collate_steps(
         "hard_move",
         dataset,
-        binner=None,
         ev_tokenizer=None,
         rotation_augment=rotation_cfg,
     )

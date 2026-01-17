@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import Literal, Sequence
+from typing import Literal, Sequence, Dict
 
 import torch
 from pydantic import BaseModel, Field, field_validator
+
+from .base import EVTokenizer
 
 
 class BinningConfig(BaseModel):
@@ -58,26 +60,21 @@ class BinningConfig(BaseModel):
                 raise ValueError("'edges' strategy requires at least 2 edges")
             base = len(self.edges) - 1
             return base + 2 if self.special_zero_one else base
-        else:  # "upper_bounds"
-            return len(self.edges)
+        return len(self.edges)
 
 
-class Binner:
+class _Binner:
     """Applies binning to tensors of EVs in [0, 1]."""
 
     def __init__(self, config: BinningConfig):
         self.config = config
         self._edges = torch.tensor(list(config.edges), dtype=torch.float32)
 
-    @classmethod
-    def from_config(cls, config: BinningConfig) -> "Binner":
-        return cls(config)
-
     @property
     def n_bins(self) -> int:
         return self.config.n_bins
 
-    def to_device(self, device: torch.device) -> "Binner":
+    def to_device(self, device: torch.device) -> "_Binner":
         self._edges = self._edges.to(device)
         return self
 
@@ -107,16 +104,33 @@ class Binner:
                 out = torch.where(is_zero, torch.zeros_like(out), out)
                 out = torch.where(is_one, torch.full_like(out, self.n_bins - 1), out)
                 return out.long()
-            else:
-                # Standard edges: [e[i], e[i+1)) with last inclusive of right edge
-                bounds = self._edges[1:]
-                idx = torch.bucketize(x, bounds, right=False)
-                return idx.clamp(max=self.n_bins - 1).long()
-        else:  # upper_bounds
-            # edges length = n_bins, treat each as upper bound of bin
-            idx = torch.bucketize(x, self._edges, right=True)
+            # Standard edges: [e[i], e[i+1)) with last inclusive of right edge
+            bounds = self._edges[1:]
+            idx = torch.bucketize(x, bounds, right=False)
             return idx.clamp(max=self.n_bins - 1).long()
+        # upper_bounds: edges length = n_bins, treat each as upper bound of bin
+        idx = torch.bucketize(x, self._edges, right=True)
+        return idx.clamp(max=self.n_bins - 1).long()
 
 
-__all__ = ["BinningConfig", "Binner"]
+class AbsEVBinningTokenizer(EVTokenizer):
+    """Tokenize absolute EVs by binning to discrete classes."""
 
+    def __init__(self, config: BinningConfig) -> None:
+        self._binner = _Binner(config)
+
+    @property
+    def n_bins(self) -> int:
+        return self._binner.n_bins
+
+    def to(self, device: torch.device) -> "AbsEVBinningTokenizer":
+        self._binner.to_device(device)
+        return self
+
+    def build_targets(self, *, evs: torch.Tensor, legal_mask: torch.Tensor) -> Dict[str, object]:
+        # legal_mask is not applied here; downstream losses will mask
+        tgt = self._binner.bin_values(evs).long()
+        return {"branch_bin_targets": tgt, "n_bins": int(self.n_bins)}
+
+
+__all__ = ["BinningConfig", "AbsEVBinningTokenizer"]

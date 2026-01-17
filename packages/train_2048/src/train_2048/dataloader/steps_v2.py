@@ -21,13 +21,11 @@ from .metadata import MetadataDB
 from .samplers import ShardPoolSampler, BufferedShuffleSampler, SequentialSampler
 from .collate import make_collate_macroxue, make_collate_steps
 
-from ..binning import Binner
 from ..tokenization.base import BoardCodec
 
 
 def build_steps_dataloaders(
     dataset_dir: str,
-    binner: Optional[Binner],
     target_mode: str,
     batch_size: int,
     *,
@@ -120,7 +118,6 @@ def build_steps_dataloaders(
         collate_fn = make_collate_steps_worker_safe(
             dataset_dir,
             target_mode,
-            binner,
             ev_tokenizer=ev_tokenizer,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,

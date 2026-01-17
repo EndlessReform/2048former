@@ -18,6 +18,10 @@ Follow Python 3.12+, four-space indentation, and type hints for every public fun
 ## Testing Guidelines
 There is no formal test suite yet. Smoke-test gameplay with `bin/play_2048.py` and capture moves per second, score, and highest tile. Use `benchmarks/bench_client_server.py` for repeatable latency or quality comparisons. When proposing new checks, mirror existing benchmark patterns or add a `tests/` module with pytest-style names aligned to the corresponding package path.
 
+Notes on pytest in this repo:
+- Running `uv run pytest` hit missing deps (numpy/pytest) because it used a different env; `uv run --locked python -m pytest ...` worked once deps were present.
+- `uv sync --locked --dev` alone did not install pytest here; explicitly `uv add --group dev pytest` fixed it.
+
 ## Commit & Pull Request Guidelines
 Write commits in the imperative mood with subjects ≤72 characters (e.g., `Train: tune lr` or `Bench: add top-score`). PRs should summarize behavior changes, link related issues, state the config and device used, and include before/after metrics or logs. Attach artifacts only when they clarify results, and document any config or logging updates alongside the code.
 

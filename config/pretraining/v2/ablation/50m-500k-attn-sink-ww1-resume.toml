@@ -1,4 +1,4 @@
-# Ablation: attention sink + winner_weight=1.0 (baseline)
+# Ablation: attention sink (baseline)
 # 500k continuation run from checkpoint init
 
 init_dir = "checkpoints/20260110_014509/model-stable.pt"
@@ -16,7 +16,6 @@ report_every = 50
 
 [target]
 mode = "macroxue_tokens"
-winner_weight = 1.0
 
 [hyperparameters]
 learning_rate = 8e-4

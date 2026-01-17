@@ -1,5 +1,4 @@
-# Ablation: attention sink + winner_weight=1.0 (baseline)
-# Compare with ww5 variant to measure effect of WINNER upweighting
+# Ablation: attention sink (baseline)
 
 # init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
 init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink"
@@ -17,7 +16,6 @@ report_every = 50
 
 [target]
 mode = "macroxue_tokens"
-winner_weight = 1.0
 
 [hyperparameters]
 learning_rate = 5e-4

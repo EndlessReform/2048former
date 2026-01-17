@@ -13,7 +13,6 @@ report_every = 50
 
 [target]
 mode = "macroxue_tokens"
-winner_weight = 1.0
 
 [hyperparameters]
 learning_rate = 3e-4

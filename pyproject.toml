@@ -23,3 +23,8 @@ members = [
 [tool.uv.sources]
 train_2048 = { workspace = true }
 infer-2048 = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]

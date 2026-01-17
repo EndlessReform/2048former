@@ -8,24 +8,13 @@ from pathlib import Path
 import tomllib
 from pydantic import BaseModel, Field, field_validator
 from core_2048 import Encoder, EncoderConfig, load_encoder_from_init, normalize_state_dict_keys
-from .binning import BinningConfig
+from core_2048.tokenization.abs_ev_binning import BinningConfig
 
 
 class TargetConfig(BaseModel):
     """Configure which supervision target to use during training."""
 
     mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
-    # Multiplier for the WINNER class loss in macroxue_tokens mode.
-    # Higher values increase gradient pressure on correctly predicting
-    # the teacher's chosen move. Default 1.0 = uniform weighting.
-    winner_weight: float = 1.0
-
-    @field_validator("winner_weight")
-    @classmethod
-    def _winner_weight_positive(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("winner_weight must be > 0")
-        return v
 
 
 class RotationAugmentConfig(BaseModel):

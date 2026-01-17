@@ -13,8 +13,6 @@ from .collate import (
     make_collate_steps,
 )
 
-from ..binning import Binner
-from ..tokenization.macroxue import MacroxueTokenizerSpec
 from ..tokenization.base import BoardCodec
 
 
@@ -505,7 +503,6 @@ def _indices_excluding_run_ids(dataset: StepsDataset, exclude_run_ids: np.ndarra
 
 def build_steps_dataloaders(
     dataset_dir: str,
-    binner: Optional[Binner],
     target_mode: str,
     batch_size: int,
     *,
@@ -613,7 +610,6 @@ def build_steps_dataloaders(
         collate = make_collate_steps(
             target_mode,
             ds_train,
-            binner,
             ev_tokenizer=ev_tokenizer,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
@@ -701,7 +697,6 @@ def build_steps_dataloaders(
             collate_v = make_collate_steps(
                 target_mode,
                 ds_val,
-                binner,
                 ev_tokenizer=ev_tokenizer,
                 rotation_augment=rotation_augment,
                 flip_augment=flip_augment,

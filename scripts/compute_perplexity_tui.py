@@ -17,11 +17,10 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Footer, Header, Input, Static
 
 from core_2048 import load_encoder_from_init
-from train_2048.binning import BinningConfig
+from core_2048.tokenization.abs_ev_binning import BinningConfig, AbsEVBinningTokenizer
 from train_2048.dataloader.steps import StepsDataset
 from train_2048.tokenization.base import BoardCodec
-from train_2048.tokenization.ev_binning import EVBinnerTokenizer
-from train_2048.tokenization.macroxue import MacroxueTokenizerV2, MacroxueTokenizerV2Spec
+from core_2048.tokenization.macroxue import MacroxueTokenizerV2, MacroxueTokenizerV2Spec
 
 DIR_NAMES = ("Up", "Down", "Left", "Right")
 DIR_SHORT = ("U", "D", "L", "R")
@@ -620,7 +619,7 @@ class PerplexityApp(App):
                 self.mode = "macroxue_tokens"
             else:
                 cfg = _load_binning_config(self.init_path)
-                self.ev_tokenizer = EVBinnerTokenizer(cfg).to(self.device)
+                self.ev_tokenizer = AbsEVBinningTokenizer(cfg).to(self.device)
                 self.bin_centers = _bin_centers_from_config(cfg)
                 self.n_classes = int(self.ev_tokenizer.n_bins)
                 self.mode = "binned_ev"
@@ -676,7 +675,7 @@ class PerplexityApp(App):
             if "board_eval" in row.dtype.names:
                 board_eval = int(row["board_eval"])
             else:
-                from train_2048.tokenization.macroxue import board_eval as board_eval_mod
+                from core_2048.tokenization.macroxue import board_eval as board_eval_mod
 
                 mask65536 = row["tile_65536_mask"] if "tile_65536_mask" in row.dtype.names else None
                 board_exps = _decode_board_exps(row["board"], mask65536)

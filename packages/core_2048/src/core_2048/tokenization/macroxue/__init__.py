@@ -1,12 +1,12 @@
-"""Macroxue tokenization helpers (imported from core_2048)."""
+"""Macroxue tokenization helpers."""
 
-from core_2048.tokenization.macroxue import (
+from .tokenizer_v2 import (
     MacroxueTokenizerV2,
     MacroxueTokenizerV2Spec,
     MacroxueTokenizerV2TypeConfig,
     fit_macroxue_tokenizer_v2,
-    board_eval,
 )
+from . import board_eval
 
 __all__ = [
     "MacroxueTokenizerV2",

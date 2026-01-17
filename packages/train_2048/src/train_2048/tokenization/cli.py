@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .macroxue import fit_macroxue_tokenizer_v2
+from core_2048.tokenization.macroxue import fit_macroxue_tokenizer_v2
 
 
 def build_parser() -> argparse.ArgumentParser:

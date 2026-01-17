@@ -14,7 +14,7 @@ Solution: Learning to rank by advantage. For both Search valuations and tuple10/
 - Illegal moves go to ILLEGAL (first class index) token
 
 For Search nodes:
-- Board value is re-estimated using the macroxue valuation heuristic in `packages/train_2048/tokenization/macroxue/board_eval.py`. We multiply back the branch EV valuation (moves are now all legal) by 1000 and cast to int, to undo transform from original codebase. We then calculate the _advantage_ of each move (the values shown in the dataset are from terminal depth, e.g. d6) vs the current board value. Then:
+- Board value is re-estimated using the macroxue valuation heuristic in `packages/core_2048/src/core_2048/tokenization/macroxue/board_eval.py`. We multiply back the branch EV valuation (moves are now all legal) by 1000 and cast to int, to undo transform from original codebase. We then calculate the _advantage_ of each move (the values shown in the dataset are from terminal depth, e.g. d6) vs the current board value. Then:
     - for non-selected values, any value with _negative_ absolute advantage (vs current node) below a cutoff (e.g. -1500) is bucketed to the FAILURE token (second class index). This cutoff is a hyperparameter chosen when fitting the tokenizer and must be serialized with the resulting tokenizer artifact so that inference uses the same threshold.
     - For the other non-selected values, we take the absolute _disadvantage_ of that move vs the selected (e.g. -8, -150, etc). 
         - When creating the tokenizer, we use `pd.qcut` to distribute this into `n` bin edges (e.g. 32 bins) of roughly equal # of items. Search nodes learn their own set of bin edges.
@@ -33,25 +33,6 @@ Across all node types the vocabulary order is fixed and must be respected by any
 2. `FAILURE`
 3. Bin edges in monotonically decreasing disadvantage order (higher indices are closer to the winner). **The count of these disadvantage bins must be identical for Search, tuple10, and tuple11 so that a single shared vocabulary works everywhere.**
 4. `WINNER`
-
-## Class Weighting
-
-By default, all token classes contribute equally to the cross-entropy loss. However, for policy quality, predicting `WINNER` correctly matters far more than distinguishing `BIN_15` from `BIN_16`.
-
-The `winner_weight` config option (in `[target]`) upweights the `WINNER` class in the loss:
-
-```toml
-[target]
-mode = "macroxue_tokens"
-winner_weight = 5.0  # 5x gradient pressure on WINNER predictions
-```
-
-**Rationale:**
-- With 35 classes (32 bins + ILLEGAL + FAILURE + WINNER), WINNER gets ~3% of effective gradient weight by default
-- Upweighting focuses learning on policy-critical predictions
-- Hypothesis: 5x weight improves `policy_agreement` by 5-10% at same step count
-
-**Ablation configs:** See `config/pretraining/v2/ablation/50m-100k-attn-sink-ww*.toml` for winner weight sweep (1, 2, 5, 10).
 
 ## Implementation goals
 

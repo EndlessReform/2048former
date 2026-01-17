@@ -17,7 +17,10 @@ import numpy as np
 import torch
 
 from train_2048.dataloader.steps import StepsDataset, make_collate_macroxue
-from train_2048.tokenization.macroxue import MacroxueTokenizerSpec
+from core_2048.tokenization.macroxue import (
+    MacroxueTokenizerV2Spec,
+    MacroxueTokenizerV2TypeConfig,
+)
 from core_2048.model import Encoder, EncoderConfig
 from core_2048.infer import forward_distributions
 
@@ -37,9 +40,9 @@ def _pack_board_from_exponents(exps: np.ndarray) -> tuple[np.uint64, np.uint16]:
     return acc, mask
 
 
-def test_e2e_macroxue(tmpdir: Path) -> None:
+def test_e2e_macroxue(tmp_path: Path) -> None:
     # 1) Build a tiny synthetic dataset folder with steps.npy (1 row)
-    ds_dir = tmpdir / "dataset"
+    ds_dir = tmp_path / "dataset"
     ds_dir.mkdir(parents=True, exist_ok=True)
 
     # Synthetic board exponents 0..15
@@ -51,7 +54,7 @@ def test_e2e_macroxue(tmpdir: Path) -> None:
     # Branch EVs aligned to UDLR (floats in [0,1] to match our knots)
     branch = np.array([0.9, 0.7, 0.3, 0.2], dtype=np.float32)
 
-    # NumPy dtype matching crates/dataset-packer StepRow::dtype
+    # NumPy dtype matching crates/dataset-packer StepRow::dtype (plus board_eval)
     dtype = np.dtype([
         ("run_id", "<u4"),
         ("step_index", "<u4"),
@@ -63,6 +66,7 @@ def test_e2e_macroxue(tmpdir: Path) -> None:
         ("max_rank", "<u1"),
         ("seed", "<u4"),
         ("branch_evs", ("<f4", 4)),
+        ("board_eval", "<i8"),
     ])
 
     row = np.zeros((), dtype=dtype)
@@ -76,23 +80,31 @@ def test_e2e_macroxue(tmpdir: Path) -> None:
     row["max_rank"] = np.uint8(0)
     row["seed"] = np.uint32(123)
     row["branch_evs"] = branch
+    row["board_eval"] = np.int64(0)
 
     steps = np.empty((1,), dtype=dtype)
     steps[0] = row
     np.save(ds_dir / "steps.npy", steps)
 
-    # 2) Create a minimal tokenizer spec (percentile ~ identity on [0,1])
-    #    and simple margin bins
-    spec = MacroxueTokenizerSpec(
-        version=1,
-        quantile_count=5,
-        actions=("up", "left", "right", "down"),  # actions are unused in collate
-        valuation_types=["val"],
-        ecdf_knots={"val": [0.0, 0.25, 0.5, 0.75, 1.0]},
-        delta_edges=[0.0, 0.25, 0.5, 0.75, 1.0],
-        notes="e2e synthetic",
+    # 2) Create a minimal v2 tokenizer spec with 3 disadvantage bins
+    num_bins = 3
+    edges = [-1000.0, -500.0, -100.0, 0.0]
+    vocab_order = ["ILLEGAL", "FAILURE"] + [f"BIN_{i}" for i in range(num_bins)] + ["WINNER"]
+    spec = MacroxueTokenizerV2Spec(
+        tokenizer_type="macroxue_ev_advantage_v2",
+        version=2,
+        num_bins=num_bins,
+        vocab_order=vocab_order,
+        valuation_types=["search", "tuple10", "tuple11"],
+        search=MacroxueTokenizerV2TypeConfig(
+            bin_edges=edges,
+            failure_cutoff=-1500,
+        ),
+        tuple10=MacroxueTokenizerV2TypeConfig(bin_edges=edges),
+        tuple11=MacroxueTokenizerV2TypeConfig(bin_edges=edges),
+        metadata={"notes": "e2e synthetic"},
     )
-    tok_path = tmpdir / "tokenizer.json"
+    tok_path = tmp_path / "tokenizer.json"
     spec.to_json(tok_path)
 
     # 3) Collate one batch using Macroxue path
@@ -107,15 +119,14 @@ def test_e2e_macroxue(tmpdir: Path) -> None:
     assert tokens.shape == (1, 16)
     assert tokens.dtype == torch.int64
     assert targets.shape == (1, 4)
-    assert n_classes == len(spec.delta_edges) - 1 + 2
+    assert n_classes == len(spec.vocab_order)
 
-    # Winner should be Up (index 0) with UDLR and our EVs; Down illegal only
-    n_bins = len(spec.delta_edges) - 1
-    ILLEGAL = n_bins
-    WINNER = n_bins + 1
+    # Winner should be Up (index 0) with UDLR and our EVs; Down legal only
+    ILLEGAL = 0
+    WINNER = 2 + num_bins
     t = targets[0].tolist()
     assert t[0] == WINNER, f"expected winner@Up; got {t}"
-    assert t[2] == ILLEGAL and t[3] == ILLEGAL, f"expected illegal@Down/Left; got {t}"
+    assert t[2] == ILLEGAL and t[3] == ILLEGAL, f"expected illegal@Left/Right; got {t}"
 
     # 4) Build a tiny model with heads sized to n_classes and bias Up head to pick WINNER
     enc_cfg = EncoderConfig(

@@ -286,17 +286,21 @@ version = "0.1.0"
 source = { editable = "packages/core_2048" }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "numpy" },
     { name = "pydantic" },
     { name = "safetensors" },
     { name = "torch" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.1.5" },
+    { name = "numpy", specifier = ">=2.3.2" },
     { name = "pydantic", specifier = ">=2.11.7" },
     { name = "safetensors", specifier = ">=0.6.2" },
     { name = "torch", specifier = ">=2.8.0" },
+    { name = "tqdm", specifier = ">=4.67.1" },
 ]
 provides-extras = ["nvidia"]
 
@@ -2012,6 +2016,11 @@ dependencies = [
     { name = "train-2048" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "grpcio", specifier = ">=1.74.0" },
@@ -2023,6 +2032,9 @@ requires-dist = [
     { name = "textual-dev", specifier = ">=1.8.0" },
     { name = "train-2048", editable = "packages/train_2048" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.4.2" }]
 
 [[package]]
 name = "traitlets"
