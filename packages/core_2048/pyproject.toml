@@ -16,6 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 nvidia = []
 
+[project.scripts]
+tokenizer-macroxue = "core_2048.tokenization.cli:main"
+
 [tool.uv.build-backend]
 module-name = ["core_2048"]
 

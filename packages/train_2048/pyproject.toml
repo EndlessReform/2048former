@@ -29,7 +29,6 @@ module-name = ["train_2048"]
 
 [project.scripts]
 train = "train_2048.main:main"
-tokenizer-macroxue = "train_2048.tokenization.cli:main"
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
