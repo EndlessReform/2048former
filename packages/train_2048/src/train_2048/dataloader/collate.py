@@ -226,9 +226,13 @@ def make_collate_macroxue(
                 board_eval=board_evals[i],
             )
 
+        branch_targets = torch.from_numpy(targets.copy()).long()
+        branch_mask = torch.from_numpy(legal_mask.astype(_np.bool_, copy=False))
         return {
             "tokens": tokens,
-            "targets": torch.from_numpy(targets.copy()).long(),
+            "branch_targets": branch_targets,
+            "branch_mask": branch_mask,
+            "targets": branch_targets,
             "n_classes": n_classes,
         }
 
@@ -338,6 +342,13 @@ def make_collate_steps(
             except Exception:
                 pass
             targets = ev_tokenizer.build_targets(evs=branch_values, legal_mask=branch_mask)  # type: ignore[call-arg]
+            branch_targets = targets.get("branch_bin_targets")
+            if branch_targets is None:
+                raise KeyError("Expected 'branch_bin_targets' from EV tokenizer")
+            out["branch_targets"] = branch_targets
+            out["branch_mask"] = branch_mask
+            if "n_bins" in targets:
+                out["n_classes"] = int(targets["n_bins"])
             out.update(targets)
         else:
             # Support both new ('move_dir') and old ('move') label fields
@@ -530,9 +541,13 @@ def make_collate_macroxue_worker_safe(
                 board_eval=board_evals[i],
             )
 
+        branch_targets = torch.from_numpy(targets.copy()).long()
+        branch_mask = torch.from_numpy(legal_mask.astype(_np.bool_, copy=False))
         return {
             "tokens": tokens,
-            "targets": torch.from_numpy(targets.copy()).long(),
+            "branch_targets": branch_targets,
+            "branch_mask": branch_mask,
+            "targets": branch_targets,
             "n_classes": n_classes,
         }
 
@@ -648,6 +663,13 @@ def make_collate_steps_worker_safe(
             except Exception:
                 pass
             targets = ev_tokenizer.build_targets(evs=branch_values, legal_mask=branch_mask)
+            branch_targets = targets.get("branch_bin_targets")
+            if branch_targets is None:
+                raise KeyError("Expected 'branch_bin_targets' from EV tokenizer")
+            out["branch_targets"] = branch_targets
+            out["branch_mask"] = branch_mask
+            if "n_bins" in targets:
+                out["n_classes"] = int(targets["n_bins"])
             out.update(targets)
         else:
             if 'move_dir' in batch.dtype.names:
