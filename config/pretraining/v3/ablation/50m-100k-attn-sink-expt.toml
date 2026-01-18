@@ -5,16 +5,24 @@ checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
-enabled = false
-project = "train-2048-bin-v2"
+enabled = true
+project = "train-2048-bin-v3-value"
 entity = ""
 # run_name = "50m-100k-attn-sink-ww1"
-tags = ["v2", "macroxue-binned", "attn-sink", "ablation"]
+tags = ["v3", "macroxue-binned", "attn-sink", "ablation", "value-head"]
 mode = "online"
 report_every = 50
 
 [target]
 mode = "macroxue_tokens"
+
+[target.value_head]
+enabled = true
+tiles = [1024, 2048, 4096, 8192, 16384, 32768]
+include_underflow = true
+policy_weight = 1.0
+value_weight = 1.0
+pooling = "mean"
 
 [hyperparameters]
 learning_rate = 5e-4

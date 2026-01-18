@@ -27,6 +27,13 @@ Output head configuration (choose one)
    - head_type = "action_policy"
    - output_n_bins must be omitted or null
 
+Optional value head configuration (independent of policy head)
+- value_head_type (string, default "none") — currently "none" or "coral"
+- value_head_num_classes (int) — number of ordinal classes (e.g., tile exponents)
+  - CORAL logits output = value_head_num_classes - 1
+- value_head_pooling (string, default "mean") — "mean" (reuse pooled trunk) or "mean_proj"
+- value_head_proj_dim (int|null) — required only if value_head_pooling="mean_proj"
+
 Optional
 - dropout_prob (float, default 0.1)
 - attention_dropout_prob (float, default 0.0)
@@ -37,6 +44,9 @@ Weights layout (model.safetensors)
 The loader infers the head type if `head_type` is missing by inspecting keys:
 - If keys start with `policy_head.` → action_policy
 - If keys start with `ev_heads.0.` → binned_ev
+It also infers the optional value head when present:
+- If keys start with `value_head.` → value_head_type = "coral"
+- If keys start with `value_head_proj.` → value_head_pooling = "mean_proj"
 
 Additional notes
 - Token order is the board’s 16 exponents in row‑major cell order using MSB‑first nibble packing in a u64.
@@ -71,4 +81,21 @@ Binned EV (macroxue tokens, 32 loser bins → 34 classes)
   "max_position_embeddings": 16,
   "head_type": "binned_ev",
   "output_n_bins": 34
+}
+
+Binned EV + CORAL value head (highest-tile ordinal classes)
+{
+  "input_vocab_size": 17,
+  "hidden_size": 512,
+  "num_hidden_layers": 12,
+  "num_attention_heads": 8,
+  "intermediate_size": 2048,
+  "layer_norm_eps": 1e-6,
+  "dropout_prob": 0.1,
+  "max_position_embeddings": 16,
+  "head_type": "binned_ev",
+  "output_n_bins": 34,
+  "value_head_type": "coral",
+  "value_head_num_classes": 6,
+  "value_head_pooling": "mean"
 }

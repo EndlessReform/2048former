@@ -11,10 +11,57 @@ from core_2048 import Encoder, EncoderConfig, load_encoder_from_init, normalize_
 from core_2048.tokenization.abs_ev_binning import BinningConfig
 
 
+class ValueHeadConfig(BaseModel):
+    """Configuration for value head supervision (CORAL ordinal loss)."""
+
+    enabled: bool = False
+    # Tile values used as ordinal thresholds, e.g. [1024, 2048, 4096, ...]
+    tiles: list[int] = Field(default_factory=list)
+    # When True, add an underflow class for values below tiles[0].
+    include_underflow: bool = True
+    # Loss weights (policy/value) combined as total = policy + value.
+    policy_weight: float = 1.0
+    value_weight: float = 1.0
+    # Pooling configuration for value head (mirrors core_2048 config)
+    pooling: Literal["mean", "mean_proj"] = "mean"
+    proj_dim: Optional[int] = None
+
+    @field_validator("tiles")
+    @classmethod
+    def _tiles_positive(cls, v: list[int]) -> list[int]:
+        if any(int(x) <= 0 for x in v):
+            raise ValueError("value_head.tiles must be positive tile values")
+        return v
+
+    @field_validator("policy_weight", "value_weight")
+    @classmethod
+    def _weights_non_negative(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError("value_head weights must be >= 0")
+        return v
+
+    @field_validator("proj_dim")
+    @classmethod
+    def _proj_positive(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("value_head.proj_dim must be > 0 when provided")
+        return v
+
+
 class TargetConfig(BaseModel):
     """Configure which supervision target to use during training."""
 
     mode: Literal["binned_ev", "hard_move", "macroxue_tokens"] = "binned_ev"
+    # Include run-level highest_tile labels in each batch (required for value head).
+    include_highest_tile: bool = False
+    value_head: ValueHeadConfig = Field(default_factory=ValueHeadConfig)
+
+    @field_validator("value_head")
+    @classmethod
+    def _value_head_requires_tiles(cls, v: ValueHeadConfig) -> ValueHeadConfig:
+        if v.enabled and not v.tiles:
+            raise ValueError("value_head.enabled requires non-empty value_head.tiles")
+        return v
 
 
 class RotationAugmentConfig(BaseModel):
@@ -455,6 +502,7 @@ __all__ = [
     "AdaptiveBatchConfig",
     "BatchConfig",
     "DropoutConfig",
+    "ValueHeadConfig",
     "TargetConfig",
     "RotationAugmentConfig",
     "FlipAugmentConfig",

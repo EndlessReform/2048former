@@ -77,6 +77,10 @@ def build_train_payload(
         "train/data_time_ms": float(dt_data_ms),
         "train/compute_time_ms": float(dt_comp_ms),
     }
+    if "policy_loss" in metrics:
+        payload["train/policy_loss"] = float(metrics["policy_loss"])
+    if "value_loss" in metrics:
+        payload["train/value_loss"] = float(metrics["value_loss"])
     if epoch is not None:
         payload["train/epoch"] = int(epoch)
     if target_mode in ("binned_ev", "macroxue_tokens"):
@@ -116,6 +120,10 @@ def build_val_payload(
 ) -> dict[str, float | int]:
     """Build the wandb payload for a validation step."""
     payload: dict[str, float | int] = {"val/loss": float(metrics["loss"])}
+    if "policy_loss" in metrics:
+        payload["val/policy_loss"] = float(metrics["policy_loss"])
+    if "value_loss" in metrics:
+        payload["val/value_loss"] = float(metrics["value_loss"])
     if epoch is not None:
         payload["train/epoch"] = int(epoch)
     if target_mode in ("binned_ev", "macroxue_tokens"):

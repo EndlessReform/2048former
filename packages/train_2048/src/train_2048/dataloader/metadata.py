@@ -112,5 +112,31 @@ class MetadataDB:
         with self._connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
 
+    def get_highest_tile_lut(self) -> np.ndarray:
+        """Return a dense lookup table mapping run_id -> highest_tile.
+
+        Missing or NULL values are filled with -1.
+        """
+        with self._connect() as conn:
+            try:
+                conn.execute("SELECT highest_tile FROM runs LIMIT 1")
+            except sqlite3.OperationalError as exc:
+                raise RuntimeError("metadata.db runs table missing highest_tile column") from exc
+            rows = conn.execute("SELECT id, highest_tile FROM runs").fetchall()
+
+        if not rows:
+            return np.zeros((0,), dtype=np.int64)
+
+        run_ids = np.fromiter((int(r[0]) for r in rows), dtype=np.int64, count=len(rows))
+        tiles = np.fromiter(
+            ((-1 if r[1] is None else int(r[1])) for r in rows),
+            dtype=np.int64,
+            count=len(rows),
+        )
+        max_id = int(run_ids.max())
+        lut = np.full(max_id + 1, -1, dtype=np.int64)
+        lut[run_ids] = tiles
+        return lut
+
     def __repr__(self) -> str:
         return f"MetadataDB({self.db_path})"

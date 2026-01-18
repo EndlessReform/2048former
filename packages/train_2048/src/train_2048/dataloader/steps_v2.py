@@ -58,6 +58,7 @@ def build_steps_dataloaders(
     shard_cache_keep_shards: int = 1,
     rotation_augment: Optional[object] = None,
     flip_augment: Optional[object] = None,
+    include_highest_tile: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader], int, Dict[str, Any]]:
     """Build train/val dataloaders using efficient shard-based loading.
 
@@ -206,6 +207,7 @@ def build_steps_dataloaders(
             flip_augment=flip_augment,
             shard_loader=pass_loader,
             shard_loader_kwargs=loader_kwargs,
+            include_highest_tile=include_highest_tile,
         )
     else:
         from .collate import make_collate_steps_worker_safe
@@ -217,6 +219,7 @@ def build_steps_dataloaders(
             flip_augment=flip_augment,
             shard_loader=pass_loader,
             shard_loader_kwargs=loader_kwargs,
+            include_highest_tile=include_highest_tile,
         )
 
     # Build training dataloader
@@ -490,6 +493,7 @@ def build_steps_dataloaders(
                     rotation_augment=rotation_augment,
                     flip_augment=flip_augment,
                     shard_loader=val_loader,
+                    include_highest_tile=include_highest_tile,
                 )
             else:
                 from .collate import make_collate_steps_worker_safe
@@ -500,6 +504,7 @@ def build_steps_dataloaders(
                     rotation_augment=rotation_augment,
                     flip_augment=flip_augment,
                     shard_loader=val_loader,
+                    include_highest_tile=include_highest_tile,
                 )
         dl_val = DataLoader(
             val_dataset,

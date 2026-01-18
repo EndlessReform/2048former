@@ -226,7 +226,9 @@ def init_model(
     model = load_training_encoder(cfg, device)
     apply_dropout_from_config(model, cfg.dropout)
     objective = make_objective(
-        target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path()
+        target_mode,
+        tokenizer_path=cfg.dataset.resolved_tokenizer_path(),
+        cfg=cfg,
     )
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
     apply_dropout_from_config(model, cfg.dropout)

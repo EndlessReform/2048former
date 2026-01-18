@@ -101,7 +101,11 @@ def run_training(
         resume_skip_samples=resume_skip_samples,
     )
 
-    objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
+    objective = make_objective(
+        target_mode,
+        tokenizer_path=cfg.dataset.resolved_tokenizer_path(),
+        cfg=cfg,
+    )
     model = objective.prepare_model(model, device, cfg=cfg, dl_train=dl_train)
     apply_dropout_from_config(model, cfg.dropout)
     model = move_model_to_device(model, device, use_fp32_master_weights=use_fp32_master)

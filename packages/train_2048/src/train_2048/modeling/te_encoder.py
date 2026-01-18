@@ -12,7 +12,7 @@ from safetensors.torch import load_file as safe_load_file
 
 from core_2048 import EncoderConfig
 from core_2048.init_io import _load_pt_bundle, _resolve_init_path, normalize_state_dict_keys
-from core_2048.model import AbsolutePositionalEmbedding
+from core_2048.model import AbsolutePositionalEmbedding, CoralHead
 
 
 class TEEncoderBlock(nn.Module):
@@ -85,7 +85,24 @@ class TEEncoder(nn.Module):
             self.policy_head = nn.Linear(config.hidden_size, 4)
             self.ev_heads = None
 
-    def forward(self, input_ids: torch.Tensor):
+        self.value_head_type = getattr(config, "value_head_type", "none")
+        self.value_head_pooling = getattr(config, "value_head_pooling", "mean")
+        self.value_head_proj = None
+        self.value_head_act = None
+        self.value_head = None
+        if self.value_head_type != "none":
+            value_in_dim = config.hidden_size
+            if self.value_head_pooling == "mean_proj":
+                proj_dim = int(config.value_head_proj_dim or config.hidden_size)
+                self.value_head_proj = nn.Linear(config.hidden_size, proj_dim, bias=False)
+                self.value_head_act = nn.SiLU()
+                value_in_dim = proj_dim
+            if self.value_head_type == "coral":
+                self.value_head = CoralHead(value_in_dim, int(config.value_head_num_classes))
+            else:
+                raise ValueError(f"Unknown value head type: {self.value_head_type}")
+
+    def forward(self, input_ids: torch.Tensor, *, return_value: bool = False):
         _b, S = input_ids.shape
         device = input_ids.device
 
@@ -102,13 +119,26 @@ class TEEncoder(nn.Module):
 
         # Final mean pool
         board_repr = x.mean(dim=1) # (bsz, hidden_dim)
+        value_logits = None
+        if return_value:
+            if self.value_head is None:
+                raise RuntimeError("return_value=True but value head is not configured")
+            value_in = board_repr
+            if self.value_head_pooling == "mean_proj":
+                assert self.value_head_proj is not None and self.value_head_act is not None
+                value_in = self.value_head_act(self.value_head_proj(value_in))
+            value_logits = self.value_head(value_in)
         if self.head_type == "binned_ev":
             assert self.ev_heads is not None, "ev_heads must be specified for binned_ev head"
             ev_preds = [head(board_repr) for head in self.ev_heads]
+            if return_value:
+                return x, ev_preds, value_logits
             return x, ev_preds
         elif self.head_type == "action_policy":
             assert self.policy_head is not None, "policy_head must be specified for policy head"
             policy_pred = self.policy_head(board_repr)
+            if return_value:
+                return x, policy_pred, value_logits
             return x, policy_pred
         else:
             raise ValueError(f"Unknown head type: {self.head_type}")
@@ -235,6 +265,19 @@ def load_te_encoder_from_init(init_dir: str) -> TEEncoder:
             w0 = state.get("ev_heads.0.weight")
             if w0 is not None and hasattr(w0, "shape") and len(w0.shape) == 2:
                 enc_cfg_dict["output_n_bins"] = int(w0.shape[0])
+
+        if any(k.startswith("value_head.") for k in state.keys()):
+            enc_cfg_dict["value_head_type"] = "coral"
+            biases = state.get("value_head.biases")
+            if biases is not None and hasattr(biases, "shape") and len(biases.shape) == 1:
+                enc_cfg_dict["value_head_num_classes"] = int(biases.shape[0]) + 1
+        if any(k.startswith("value_head_proj.") for k in state.keys()):
+            enc_cfg_dict["value_head_pooling"] = "mean_proj"
+            wproj = state.get("value_head_proj.weight")
+            if wproj is not None and hasattr(wproj, "shape") and len(wproj.shape) == 2:
+                enc_cfg_dict["value_head_proj_dim"] = int(wproj.shape[0])
+        elif enc_cfg_dict.get("value_head_type", "none") != "none":
+            enc_cfg_dict.setdefault("value_head_pooling", "mean")
 
         tok = state.get("tok_emb.weight")
         if tok is not None and hasattr(tok, "shape") and len(tok.shape) == 2:

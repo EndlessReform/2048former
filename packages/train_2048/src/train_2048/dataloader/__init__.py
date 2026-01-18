@@ -27,6 +27,10 @@ def build_dataloaders(
         ev_tokenizer = AbsEVBinningTokenizer(BinningConfig(**cfg.binning.model_dump()))
 
     ds_cfg = cfg.dataset
+    value_head_cfg = getattr(cfg.target, "value_head", None)
+    include_highest_tile = bool(getattr(cfg.target, "include_highest_tile", False)) or bool(
+        getattr(value_head_cfg, "enabled", False)
+    )
     return build_steps_dataloaders(
         dataset_dir=ds_cfg.resolved_dataset_dir(),
         target_mode=target_mode,
@@ -56,6 +60,7 @@ def build_dataloaders(
         val_steps_pct=float(getattr(ds_cfg, "val_steps_pct", 0.0) or 0.0),
         rotation_augment=getattr(ds_cfg, "rotation_augment", None),
         flip_augment=getattr(ds_cfg, "flip_augment", None),
+        include_highest_tile=include_highest_tile,
     )
 
 

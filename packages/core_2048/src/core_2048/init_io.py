@@ -170,7 +170,7 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
                 state = None
 
     # If we loaded any state, infer additional config from it
-    if isinstance(state, dict):
+    if isinstance(state, dict) and enc_cfg_dict is not None:
         # Infer head type and dimensions
         head_type = enc_cfg_dict.get("head_type", "binned_ev")
         if any(k.startswith("policy_head.") for k in state.keys()):
@@ -185,6 +185,20 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
             if w0 is not None and hasattr(w0, "shape") and len(w0.shape) == 2:
                 out_dim = int(w0.shape[0])
                 enc_cfg_dict["output_n_bins"] = out_dim
+
+        # Infer value head configuration if present
+        if any(k.startswith("value_head.") for k in state.keys()):
+            enc_cfg_dict["value_head_type"] = "coral"
+            biases = state.get("value_head.biases")
+            if biases is not None and hasattr(biases, "shape") and len(biases.shape) == 1:
+                enc_cfg_dict["value_head_num_classes"] = int(biases.shape[0]) + 1
+        if any(k.startswith("value_head_proj.") for k in state.keys()):
+            enc_cfg_dict["value_head_pooling"] = "mean_proj"
+            wproj = state.get("value_head_proj.weight")
+            if wproj is not None and hasattr(wproj, "shape") and len(wproj.shape) == 2:
+                enc_cfg_dict["value_head_proj_dim"] = int(wproj.shape[0])
+        elif enc_cfg_dict.get("value_head_type", "none") != "none":
+            enc_cfg_dict.setdefault("value_head_pooling", "mean")
 
         # Infer vocab size from embedding if present (ensure >= current)
         tok = state.get("tok_emb.weight")

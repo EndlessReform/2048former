@@ -27,6 +27,12 @@ class EncoderConfig(BaseModel):
     max_position_embeddings: int = 16
     # Output head type: default binned EV per direction; alternative single policy head over 4 moves
     head_type: Literal["binned_ev", "action_policy"] = "binned_ev"  # accepted: "binned_ev", "action_policy"
+    # Optional value head configuration (for critic/value training)
+    value_head_type: Literal["none", "coral"] = "none"
+    value_head_num_classes: int | None = None
+    # Pooling strategy for value head input
+    value_head_pooling: Literal["mean", "mean_proj"] = "mean"
+    value_head_proj_dim: int | None = None
 
     @classmethod
     def model_validate(cls, obj):
@@ -38,6 +44,12 @@ class EncoderConfig(BaseModel):
         else:
             # action_policy: output_n_bins is unused; allow None
             pass
+        if cfg.value_head_type != "none":
+            if cfg.value_head_num_classes is None or int(cfg.value_head_num_classes) <= 1:
+                raise ValueError("value_head_num_classes must be set (>1) when value_head_type != 'none'")
+            if cfg.value_head_pooling == "mean_proj":
+                if cfg.value_head_proj_dim is not None and int(cfg.value_head_proj_dim) <= 0:
+                    raise ValueError("value_head_proj_dim must be > 0 when value_head_pooling='mean_proj'")
         return cfg
 
 
@@ -188,6 +200,21 @@ class LLaMA3Attention(nn.Module):
         return out
 
 
+class CoralHead(nn.Module):
+    """CORAL-style ordinal regression head with shared weights + per-threshold biases."""
+
+    def __init__(self, input_dim: int, num_classes: int):
+        super().__init__()
+        if int(num_classes) <= 1:
+            raise ValueError("num_classes must be > 1 for CoralHead")
+        self.fc = nn.Linear(input_dim, 1, bias=False)
+        self.biases = nn.Parameter(torch.zeros(int(num_classes) - 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        score = self.fc(x)  # (B, 1)
+        return score + self.biases  # (B, num_classes - 1)
+
+
 class SwiGLU(nn.Module):
     """SwiGLU feed-forward: silu(Wg x) * (Wu x) -> Wd (no residual/norm)."""
 
@@ -281,18 +308,39 @@ class Encoder(nn.Module):
             self.ev_heads = None
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
+        # Optional value head
+        self.value_head_type = getattr(config, "value_head_type", "none")
+        self.value_head_pooling = getattr(config, "value_head_pooling", "mean")
+        self.value_head_proj = None
+        self.value_head_act = None
+        self.value_head = None
+        if self.value_head_type != "none":
+            value_in_dim = config.hidden_size
+            if self.value_head_pooling == "mean_proj":
+                proj_dim = int(config.value_head_proj_dim or config.hidden_size)
+                self.value_head_proj = nn.Linear(config.hidden_size, proj_dim, bias=False)
+                self.value_head_act = nn.SiLU()
+                value_in_dim = proj_dim
+            if self.value_head_type == "coral":
+                self.value_head = CoralHead(value_in_dim, int(config.value_head_num_classes))
+            else:
+                raise ValueError(f"Unknown value_head_type: {self.value_head_type}")
 
     def forward(
         self,
         input_ids: torch.Tensor,
+        *,
+        return_value: bool = False,
     ):
         """
         Args:
             input_ids: Long tensor (batch, seq_len) with token IDs.
+            return_value: If True, also return value head logits.
 
         Returns:
             hidden_states: Tensor (batch, seq_len, hidden_size)
             ev_logits: List[Tensor] of length 4, each (batch, output_n_bins)
+            value_logits: (optional) Tensor (batch, value_head_num_classes - 1) when return_value=True
         """
         # input_ids: (B, S)
         B, S = input_ids.shape
@@ -312,9 +360,22 @@ class Encoder(nn.Module):
 
         # Final mean pooling
         board_repr = x.mean(dim=1)  # (B, H)
+        value_logits = None
+        if return_value:
+            if self.value_head is None:
+                raise RuntimeError("return_value=True but value head is not configured")
+            value_in = board_repr
+            if self.value_head_pooling == "mean_proj":
+                assert self.value_head_proj is not None and self.value_head_act is not None
+                value_in = self.value_head_act(self.value_head_proj(value_in))
+            value_logits = self.value_head(value_in)
         if self.head_type == "binned_ev":
             ev_logits = [head(board_repr) for head in self.ev_heads]  # List of (B, n_bins)
+            if return_value:
+                return x, ev_logits, value_logits
             return x, ev_logits
         else:  # action_policy
             policy_logits = self.policy_head(board_repr)  # (B, 4)
+            if return_value:
+                return x, policy_logits, value_logits
             return x, policy_logits

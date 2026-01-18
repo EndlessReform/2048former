@@ -51,6 +51,7 @@ def make_collate_macroxue(
     *,
     rotation_augment: Optional[object] = None,
     flip_augment: Optional[object] = None,
+    include_highest_tile: bool = False,
 ) -> Callable:
     """Collate function for macroxue advantage tokenization (v2 spec)."""
     import json
@@ -77,6 +78,14 @@ def make_collate_macroxue(
     spec = MacroxueTokenizerV2Spec.from_dict(payload)
     tokenizer = MacroxueTokenizerV2(spec)
     n_classes = len(spec.vocab_order)
+
+    highest_tile_lut = None
+    if include_highest_tile:
+        dataset_dir = getattr(dataset, "dataset_dir", None)
+        if dataset_dir is None:
+            raise ValueError("include_highest_tile=True requires dataset.dataset_dir")
+        from .metadata import MetadataDB
+        highest_tile_lut = MetadataDB(dataset_dir).get_highest_tile_lut()
 
     # Get valuation type mapping from dataset string name -> tokenizer integer id
     ds = dataset
@@ -139,6 +148,7 @@ def make_collate_macroxue(
         valuation_types_ds = batch["valuation_type"].astype(_np.int64, copy=False)
         ev_legal = batch["ev_legal"]
         move_dirs = batch["move_dir"]
+        run_ids = batch["run_id"] if include_highest_tile else None
 
         rotation_k = None
         flip_axis = None
@@ -228,13 +238,27 @@ def make_collate_macroxue(
 
         branch_targets = torch.from_numpy(targets.copy()).long()
         branch_mask = torch.from_numpy(legal_mask.astype(_np.bool_, copy=False))
-        return {
+        out = {
             "tokens": tokens,
             "branch_targets": branch_targets,
             "branch_mask": branch_mask,
             "targets": branch_targets,
             "n_classes": n_classes,
         }
+        if include_highest_tile:
+            if run_ids is None:
+                raise KeyError("run_id field missing from steps.npy")
+            run_ids_np = run_ids.astype(_np.int64, copy=False)
+            if highest_tile_lut is None:
+                raise RuntimeError("highest_tile LUT not initialized")
+            if run_ids_np.size > 0 and int(run_ids_np.max()) >= highest_tile_lut.shape[0]:
+                raise KeyError("run_id exceeds highest_tile LUT size")
+            highest_tiles = highest_tile_lut[run_ids_np]
+            missing = highest_tiles < 0
+            if _np.any(missing):
+                raise KeyError(f"Missing highest_tile for run_id(s): {run_ids_np[missing][:10].tolist()}")
+            out["highest_tile"] = torch.from_numpy(highest_tiles.astype(_np.int64, copy=False))
+        return out
 
     return _collate_v2
 
@@ -246,6 +270,7 @@ def make_collate_steps(
     ev_tokenizer: Optional[object] = None,
     rotation_augment: Optional[object] = None,
     flip_augment: Optional[object] = None,
+    include_highest_tile: bool = False,
 ) -> Callable:
     """Collate function for regular steps datasets (binned_ev or hard_move)."""
     import numpy as _np
@@ -259,6 +284,13 @@ def make_collate_steps(
     flip_mode, flip_seed, flip_allow_noop = _flip_settings(flip_augment)
     _rotation_rng_holder = [None]
     _flip_rng_holder = [None]
+    highest_tile_lut = None
+    if include_highest_tile:
+        dataset_dir = getattr(dataset, "dataset_dir", None)
+        if dataset_dir is None:
+            raise ValueError("include_highest_tile=True requires dataset.dataset_dir")
+        from .metadata import MetadataDB
+        highest_tile_lut = MetadataDB(dataset_dir).get_highest_tile_lut()
 
     def _get_rotation_rng():
         if _rotation_rng_holder[0] is None:
@@ -273,6 +305,7 @@ def make_collate_steps(
     def _collate(batch_indices):
         idxs = _np.asarray(batch_indices, dtype=_np.int64)
         batch = dataset.get_rows(idxs)
+        run_ids = batch["run_id"] if include_highest_tile else None
 
         # Decode board exponents (dataset packs MSB-first into uint64 + optional 65536 mask)
         if 'board' not in batch.dtype.names:
@@ -365,6 +398,19 @@ def make_collate_steps(
                 if _np.any(flip_axis != 0):
                     dirs_arr = flip_move_dir(dirs_arr, flip_axis)
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
+        if include_highest_tile:
+            if run_ids is None:
+                raise KeyError("run_id field missing from steps.npy")
+            run_ids_np = run_ids.astype(_np.int64, copy=False)
+            if highest_tile_lut is None:
+                raise RuntimeError("highest_tile LUT not initialized")
+            if run_ids_np.size > 0 and int(run_ids_np.max()) >= highest_tile_lut.shape[0]:
+                raise KeyError("run_id exceeds highest_tile LUT size")
+            highest_tiles = highest_tile_lut[run_ids_np]
+            missing = highest_tiles < 0
+            if _np.any(missing):
+                raise KeyError(f"Missing highest_tile for run_id(s): {run_ids_np[missing][:10].tolist()}")
+            out["highest_tile"] = torch.from_numpy(highest_tiles.astype(_np.int64, copy=False))
         return out
 
     return _collate
@@ -378,6 +424,7 @@ def make_collate_macroxue_worker_safe(
     flip_augment: Optional[object] = None,
     shard_loader: Optional[object] = None,
     shard_loader_kwargs: Optional[dict] = None,
+    include_highest_tile: bool = False,
 ) -> Callable:
     """Worker-safe collate that creates its own shard loader per worker.
 
@@ -437,6 +484,10 @@ def make_collate_macroxue_worker_safe(
     spec = MacroxueTokenizerV2Spec.from_dict(payload)
     tokenizer = MacroxueTokenizerV2(spec)
     n_classes = len(spec.vocab_order)
+    highest_tile_lut = None
+    if include_highest_tile:
+        from .metadata import MetadataDB
+        highest_tile_lut = MetadataDB(dataset_dir).get_highest_tile_lut()
 
     # Load valuation type mapping
     try:
@@ -484,6 +535,7 @@ def make_collate_macroxue_worker_safe(
         valuation_types_ds = batch["valuation_type"].astype(_np.int64, copy=False)
         ev_legal = batch["ev_legal"]
         move_dirs = batch["move_dir"]
+        run_ids = batch["run_id"] if include_highest_tile else None
 
         rotation_k = None
         flip_axis = None
@@ -567,13 +619,27 @@ def make_collate_macroxue_worker_safe(
 
         branch_targets = torch.from_numpy(targets.copy()).long()
         branch_mask = torch.from_numpy(legal_mask.astype(_np.bool_, copy=False))
-        return {
+        out = {
             "tokens": tokens,
             "branch_targets": branch_targets,
             "branch_mask": branch_mask,
             "targets": branch_targets,
             "n_classes": n_classes,
         }
+        if include_highest_tile:
+            if run_ids is None:
+                raise KeyError("run_id field missing from steps.npy")
+            run_ids_np = run_ids.astype(_np.int64, copy=False)
+            if highest_tile_lut is None:
+                raise RuntimeError("highest_tile LUT not initialized")
+            if run_ids_np.size > 0 and int(run_ids_np.max()) >= highest_tile_lut.shape[0]:
+                raise KeyError("run_id exceeds highest_tile LUT size")
+            highest_tiles = highest_tile_lut[run_ids_np]
+            missing = highest_tiles < 0
+            if _np.any(missing):
+                raise KeyError(f"Missing highest_tile for run_id(s): {run_ids_np[missing][:10].tolist()}")
+            out["highest_tile"] = torch.from_numpy(highest_tiles.astype(_np.int64, copy=False))
+        return out
 
     return _collate
 
@@ -587,6 +653,7 @@ def make_collate_steps_worker_safe(
     flip_augment: Optional[object] = None,
     shard_loader: Optional[object] = None,
     shard_loader_kwargs: Optional[dict] = None,
+    include_highest_tile: bool = False,
 ) -> Callable:
     """Worker-safe collate for regular steps datasets.
 
@@ -629,6 +696,10 @@ def make_collate_steps_worker_safe(
     flip_mode, flip_seed, flip_allow_noop = _flip_settings(flip_augment)
     _rotation_rng_holder = [None]
     _flip_rng_holder = [None]
+    highest_tile_lut = None
+    if include_highest_tile:
+        from .metadata import MetadataDB
+        highest_tile_lut = MetadataDB(dataset_dir).get_highest_tile_lut()
 
     def _get_rotation_rng():
         if _rotation_rng_holder[0] is None:
@@ -646,6 +717,7 @@ def make_collate_steps_worker_safe(
         loader = _get_loader()
         idxs = _np.asarray(batch_indices, dtype=_np.int64)
         batch = loader.get_rows(idxs)
+        run_ids = batch["run_id"] if include_highest_tile else None
 
         if 'board' not in batch.dtype.names:
             raise KeyError("'board' field required")
@@ -734,6 +806,19 @@ def make_collate_steps_worker_safe(
                     dirs_arr = flip_move_dir(dirs_arr, flip_axis)
             out["move_targets"] = torch.from_numpy(dirs_arr.copy()).to(dtype=torch.long)
 
+        if include_highest_tile:
+            if run_ids is None:
+                raise KeyError("run_id field missing from steps.npy")
+            run_ids_np = run_ids.astype(_np.int64, copy=False)
+            if highest_tile_lut is None:
+                raise RuntimeError("highest_tile LUT not initialized")
+            if run_ids_np.size > 0 and int(run_ids_np.max()) >= highest_tile_lut.shape[0]:
+                raise KeyError("run_id exceeds highest_tile LUT size")
+            highest_tiles = highest_tile_lut[run_ids_np]
+            missing = highest_tiles < 0
+            if _np.any(missing):
+                raise KeyError(f"Missing highest_tile for run_id(s): {run_ids_np[missing][:10].tolist()}")
+            out["highest_tile"] = torch.from_numpy(highest_tiles.astype(_np.int64, copy=False))
         return out
 
     return _collate

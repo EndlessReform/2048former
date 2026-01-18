@@ -534,6 +534,7 @@ def build_steps_dataloaders(
     step_index_max: Optional[int] = None,
     rotation_augment: Optional[object] = None,
     flip_augment: Optional[object] = None,
+    include_highest_tile: bool = False,
 ) -> Tuple[DataLoader, Optional[DataLoader], int]:
     """Create train/val DataLoaders from steps.npy + metadata.db.
 
@@ -612,6 +613,7 @@ def build_steps_dataloaders(
             tokenizer_path,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
+            include_highest_tile=include_highest_tile,
         )
     else:
         collate = make_collate_steps(
@@ -620,6 +622,7 @@ def build_steps_dataloaders(
             ev_tokenizer=ev_tokenizer,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
+            include_highest_tile=include_highest_tile,
         )
 
     effective_batch_size = int(batch_size)
@@ -699,6 +702,7 @@ def build_steps_dataloaders(
                 tokenizer_path,
                 rotation_augment=rotation_augment,
                 flip_augment=flip_augment,
+                include_highest_tile=include_highest_tile,
             )
         else:
             collate_v = make_collate_steps(
@@ -707,6 +711,7 @@ def build_steps_dataloaders(
                 ev_tokenizer=ev_tokenizer,
                 rotation_augment=rotation_augment,
                 flip_augment=flip_augment,
+                include_highest_tile=include_highest_tile,
             )
         # Optionally cap validation steps via a sampler
         val_sampler = None

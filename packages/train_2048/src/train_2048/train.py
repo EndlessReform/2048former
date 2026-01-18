@@ -24,7 +24,7 @@ def train_step(
     grad_scaler: Optional[GradScaler] = None,
 ):
     """Dispatcher that forwards to the concrete objective's train_step."""
-    obj = make_objective(target_mode)
+    obj = make_objective(target_mode, cfg=cfg)
     return obj.train_step(model, batch, optimizer, device, cfg=cfg, grad_scaler=grad_scaler)
 
 
@@ -34,8 +34,10 @@ def evaluate(
     dl_val: DataLoader,
     device: torch.device,
     target_mode: str,
+    *,
+    cfg: Optional[TrainingConfig] = None,
 ):
-    obj = make_objective(target_mode)
+    obj = make_objective(target_mode, cfg=cfg)
     return obj.evaluate(model, dl_val, device)
 
 

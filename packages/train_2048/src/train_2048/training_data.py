@@ -132,6 +132,10 @@ def init_datasets(
     if target_mode == "binned_ev":
         # Standardize EV tokenization via EVTokenizer wrapper.
         ev_tok = AbsEVBinningTokenizer(BinningConfig(**cfg.binning.model_dump()))
+    value_head_cfg = getattr(cfg.target, "value_head", None)
+    include_highest_tile = bool(getattr(cfg.target, "include_highest_tile", False)) or bool(
+        getattr(value_head_cfg, "enabled", False)
+    )
     return build_steps_dataloaders(
         dataset_dir=cfg.dataset.resolved_dataset_dir(),
         target_mode=target_mode,
@@ -159,6 +163,7 @@ def init_datasets(
         mmap_mode=cfg.dataset.mmap_mode,
         rotation_augment=getattr(cfg.dataset, "rotation_augment", None),
         flip_augment=getattr(cfg.dataset, "flip_augment", None),
+        include_highest_tile=include_highest_tile,
     )
 
 
