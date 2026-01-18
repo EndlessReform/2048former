@@ -425,6 +425,13 @@ def build_steps_dataloaders(
     dl_val: Optional[DataLoader] = None
     if val_run_ids is not None and len(val_run_ids) > 0:
         num_workers_val = max(2, num_workers_train // 3)
+        val_first_shard_only = False
+        if has_decompress_cache and shard_locality and val_num_steps is not None and val_num_steps > 0:
+            val_first_shard_only = True
+            num_workers_val = 0
+            print(
+                "[data] Validation: using first shard only to avoid tmpfs overcommit"
+            )
 
         # Determine validation sample count
         max_val_steps = None
@@ -440,12 +447,32 @@ def build_steps_dataloaders(
 
             # Simple random sampling for validation
             from .steps import StreamingRandomSampler
-            val_sampler = StreamingRandomSampler(
-                dataset_len=total_dataset_len,
-                total_samples=total_val_samples,
-                seed=seed + 1,
-            )
-            val_dataset = ShardDataset(shard_loader, total_val_samples)
+            if val_first_shard_only:
+                shard0_len = shard_loader.shards[0].num_steps
+                rng = np.random.default_rng(seed + 1)
+                replace = total_val_samples > shard0_len
+                pick = rng.choice(shard0_len, size=total_val_samples, replace=replace)
+                shard0 = shard_loader.load_shard(0)
+                val_rows = shard0[pick].copy()
+                shard_loader.unload_shard(0)
+
+                class _ArrayLoader:
+                    def __init__(self, rows: np.ndarray):
+                        self.rows = rows
+
+                    def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
+                        return self.rows[global_indices]
+
+                val_loader = _ArrayLoader(val_rows)
+                val_dataset = ShardDataset(val_loader, len(val_rows))
+                val_sampler = SequentialSampler(len(val_rows))
+            else:
+                val_sampler = StreamingRandomSampler(
+                    dataset_len=total_dataset_len,
+                    total_samples=total_val_samples,
+                    seed=seed + 1,
+                )
+                val_dataset = ShardDataset(shard_loader, total_val_samples)
         else:
             # Use all val data
             val_sampler = None
@@ -453,13 +480,34 @@ def build_steps_dataloaders(
 
         # Use same collate function
         prefetch_val = 4 if num_workers_val > 0 else None
+        val_collate = collate_fn
+        if val_first_shard_only:
+            if target_mode == "macroxue_tokens":
+                from .collate import make_collate_macroxue_worker_safe
+                val_collate = make_collate_macroxue_worker_safe(
+                    dataset_dir,
+                    tokenizer_path,
+                    rotation_augment=rotation_augment,
+                    flip_augment=flip_augment,
+                    shard_loader=val_loader,
+                )
+            else:
+                from .collate import make_collate_steps_worker_safe
+                val_collate = make_collate_steps_worker_safe(
+                    dataset_dir,
+                    target_mode,
+                    ev_tokenizer=ev_tokenizer,
+                    rotation_augment=rotation_augment,
+                    flip_augment=flip_augment,
+                    shard_loader=val_loader,
+                )
         dl_val = DataLoader(
             val_dataset,
             batch_size=loader_batch_size,
             shuffle=(val_sampler is None),
             sampler=val_sampler,
             num_workers=num_workers_val,
-            collate_fn=collate_fn,
+            collate_fn=val_collate,
             pin_memory=True,
             persistent_workers=True if num_workers_val > 0 else False,
             prefetch_factor=prefetch_val,

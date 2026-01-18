@@ -9,6 +9,8 @@ Large datasets (100GB+) can cause OS page thrashing when randomising across shar
 - Set `dataset.shard_locality = true` to traverse shards sequentially while still sampling randomly within each shard.
 - Optionally cap per-shard draws via `dataset.shard_locality_block_size` (default is the full shard).
 - Enable `dataset.shard_cache_in_memory = true` (with `dataset.shard_cache_keep_shards`) to materialise the active shard into RAM while keeping only a small number cached.
+- For compressed `.npy.zst` shards with `dataset.mmap_mode = true`, the loader will decompress into tmpfs (`/dev/shm` or `/tmp`) and mmap the decompressed file so multiple workers share the same pages.
+- When shard-locality + tmpfs-mmap are active and `dataset.val_num_steps` is set, validation samples are taken from the first shard only and cached in RAM. This avoids tmpfs overcommit during val (no extra shard decompressions).
 
 ## Augmentation
 

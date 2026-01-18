@@ -1,15 +1,15 @@
 # Ablation: attention sink (baseline)
 
-init_dir = "inits/v2/50m_ablations/n1_binned_16bin"
+init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
 checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
 enabled = false
-project = "train-2048-binsize_expt"
+project = "train-2048-bin-v2"
 entity = ""
 # run_name = "50m-100k-attn-sink-ww1"
-tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "64bin"]
+tags = ["v2", "macroxue-binned", "attn-sink", "ablation"]
 mode = "online"
 report_every = 50
 
