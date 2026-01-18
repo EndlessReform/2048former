@@ -15,7 +15,8 @@ dependencies = [
     "tqdm>=4.67.1",
     "wandb>=0.21.3",
     "transformer-engine[pytorch]",
-    "ninja"
+    "ninja",
+    "zstandard>=0.25.0",
 ]
 
 [dependency-groups]

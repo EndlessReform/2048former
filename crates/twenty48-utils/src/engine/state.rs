@@ -19,6 +19,19 @@ pub enum Move {
     Right,
 }
 
+impl Move {
+    /// Convert a UDLR-encoded move (0=up, 1=down, 2=left, 3=right) into `Move`.
+    pub fn from_udlr(code: u8) -> Self {
+        match code {
+            0 => Move::Up,
+            1 => Move::Down,
+            2 => Move::Left,
+            3 => Move::Right,
+            _ => panic!("invalid UDLR move code {code}"),
+        }
+    }
+}
+
 /// Packed 4x4 2048 board as 16 4-bit nibbles in a `u64`.
 ///
 /// Public methods provide ergonomic, safe operations while preserving

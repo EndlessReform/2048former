@@ -28,3 +28,4 @@ tempfile = "3.22.0"
 walkdir = "2.5.0"
 half = { version = "2.4.1", features = ["serde"] }
 twenty48-utils = { path = "../twenty48-utils" }
+zstd = "0.13.3"

@@ -5,7 +5,7 @@ checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
-enabled = true
+enabled = false
 project = "train-2048-binsize_expt"
 entity = ""
 # run_name = "50m-100k-attn-sink-ww1"
@@ -41,12 +41,12 @@ dropout_prob = 0.03
 attention_dropout_prob = 0.0
 
 [dataset]
-dataset_dir = "datasets/d6_3b_v0"
+dataset_dir = "datasets/d6_3b_v1"
 tokenizer_path = "out/macroxue_v2/tokenizer_16.json"
 mmap_mode = true
 num_steps = 100_000
 shard_locality = true
-shard_cache_in_memory = true
+shard_cache_in_memory = false
 shard_cache_keep_shards = 1
 
 val_run_pct = 0.005

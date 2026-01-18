@@ -376,8 +376,15 @@ def make_collate_macroxue_worker_safe(
     *,
     rotation_augment: Optional[object] = None,
     flip_augment: Optional[object] = None,
+    shard_loader: Optional[object] = None,
+    shard_loader_kwargs: Optional[dict] = None,
 ) -> Callable:
-    """Worker-safe collate that creates its own shard loader per worker."""
+    """Worker-safe collate that creates its own shard loader per worker.
+
+    Args:
+        shard_loader: If provided (num_workers=0), use this loader instead of creating new one.
+                      CRITICAL for compressed shards to avoid double-loading into RAM.
+    """
     # Import here to avoid circular deps
     from .shard_loader import ShardLoader
 
@@ -385,8 +392,25 @@ def make_collate_macroxue_worker_safe(
     _worker_loader = [None]  # Mutable container to cache per-worker
 
     def _get_loader():
+        # If shard_loader provided (num_workers=0), use it directly - NO COPY!
+        if shard_loader is not None:
+            return shard_loader
+
         if _worker_loader[0] is None:
-            _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=True)
+            # Auto-detect if shards are compressed - can't use mmap for .zst files
+            from pathlib import Path
+            ds_path = Path(dataset_dir)
+            has_zst = (
+                any(ds_path.glob("steps-*.npy.zst"))
+                or (ds_path / "steps.npy.zst").exists()
+            )
+            use_mmap = False if has_zst else True
+            # Disable caching in workers for compressed shards unless overridden.
+            cache_shards = False if has_zst else True
+            if shard_loader_kwargs:
+                _worker_loader[0] = ShardLoader(dataset_dir, **shard_loader_kwargs)
+            else:
+                _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=use_mmap, cache_shards=cache_shards)
         return _worker_loader[0]
 
     # Load tokenizer config once
@@ -561,15 +585,39 @@ def make_collate_steps_worker_safe(
     ev_tokenizer: Optional[object] = None,
     rotation_augment: Optional[object] = None,
     flip_augment: Optional[object] = None,
+    shard_loader: Optional[object] = None,
+    shard_loader_kwargs: Optional[dict] = None,
 ) -> Callable:
-    """Worker-safe collate for regular steps datasets."""
+    """Worker-safe collate for regular steps datasets.
+
+    Args:
+        shard_loader: If provided (num_workers=0), use this loader instead of creating new one.
+                      CRITICAL for compressed shards to avoid double-loading into RAM.
+    """
     from .shard_loader import ShardLoader
 
     _worker_loader = [None]
 
     def _get_loader():
+        # If shard_loader provided (num_workers=0), use it directly - NO COPY!
+        if shard_loader is not None:
+            return shard_loader
+
         if _worker_loader[0] is None:
-            _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=True)
+            # Auto-detect if shards are compressed - can't use mmap for .zst files
+            from pathlib import Path
+            ds_path = Path(dataset_dir)
+            has_zst = (
+                any(ds_path.glob("steps-*.npy.zst"))
+                or (ds_path / "steps.npy.zst").exists()
+            )
+            use_mmap = False if has_zst else True
+            # Disable caching in workers for compressed shards unless overridden.
+            cache_shards = False if has_zst else True
+            if shard_loader_kwargs:
+                _worker_loader[0] = ShardLoader(dataset_dir, **shard_loader_kwargs)
+            else:
+                _worker_loader[0] = ShardLoader(dataset_dir, mmap_mode=use_mmap, cache_shards=cache_shards)
         return _worker_loader[0]
 
     if target_mode not in {"binned_ev", "hard_move"}:

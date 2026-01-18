@@ -13,7 +13,7 @@ pub use state::{Board, Move};
 
 pub use ops::{
     count_empty, get_highest_tile_val, get_score, get_tile_val, insert_random_tile, is_game_over,
-    line_to_vec, make_move, shift,
+    line_to_vec, make_move, merge_reward_exps, shift,
 };
 
 /// Initialize internal precomputed tables on first use.

@@ -35,19 +35,26 @@ class StepsDataset(Dataset):
         self.dataset_dir = str(dataset_dir)
         root = Path(self.dataset_dir)
         shard_paths = sorted(root.glob("steps-*.npy"))
+        if any(root.glob("steps-*.npy.zst")):
+            raise ValueError("Compressed shards are only supported by shard-local loading")
 
         # Load shards lazily (memmap when requested). Build cumulative counts.
         if shard_paths:
+            if mmap_mode and any(_is_zst(p) for p in shard_paths):
+                raise ValueError("mmap_mode is not supported for compressed shards")
             self.shards = [
-                _np.load(str(p), mmap_mode="r" if mmap_mode else None)
+                _load_npy(p, mmap_mode="r" if mmap_mode else None)
                 for p in shard_paths
             ]
             self.cum_counts = np.cumsum([0] + [s.shape[0] for s in self.shards])
         else:
             steps_path = root / "steps.npy"
-            if not steps_path.is_file():
+            if steps_path.is_file():
+                self.shards = [_np.load(str(steps_path), mmap_mode="r" if mmap_mode else None)]
+            else:
+                if (root / "steps.npy.zst").is_file():
+                    raise ValueError("Compressed steps.npy.zst is only supported by shard-local loading")
                 raise FileNotFoundError(f"Missing steps.npy or steps-*.npy at {root}")
-            self.shards = [_np.load(str(steps_path), mmap_mode="r" if mmap_mode else None)]
             self.cum_counts = np.array([0, self.shards[0].shape[0]])
 
         # Resolve the indices to iterate over. Avoid constructing a giant

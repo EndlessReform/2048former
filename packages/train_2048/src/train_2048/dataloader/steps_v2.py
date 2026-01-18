@@ -11,11 +11,12 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
+import os
 
 import numpy as np
 from torch.utils.data import DataLoader
 
-from .shard_loader import ShardLoader
+from .shard_loader import ShardLoader, _read_npy_header
 from .dataset import ShardDataset
 from .metadata import MetadataDB
 from .samplers import ShardPoolSampler, BufferedShuffleSampler, SequentialSampler
@@ -75,7 +76,88 @@ def build_steps_dataloaders(
     # Use mmap_mode=False when shard_cache_in_memory=True for better performance
     # (we're loading shards fully anyway)
     use_mmap = mmap_mode and not shard_cache_in_memory
-    shard_loader = ShardLoader(dataset_dir, mmap_mode=use_mmap)
+
+    # Detect if shards are compressed (before creating loader)
+    ds_path = Path(dataset_dir)
+    has_compressed_shards = (
+        any(ds_path.glob("steps-*.npy.zst"))
+        or (ds_path / "steps.npy.zst").exists()
+    )
+
+    decompress_dir: Optional[str] = None
+    has_decompress_cache = False
+    if has_compressed_shards and mmap_mode:
+        max_shard_bytes = 0
+        shard_paths = sorted(
+            list(ds_path.glob("steps-*.npy.zst")) or ([ds_path / "steps.npy.zst"] if (ds_path / "steps.npy.zst").exists() else [])
+        )
+        for shard_path in shard_paths:
+            shape, dtype = _read_npy_header(shard_path)
+            num_bytes = int(np.prod(shape)) * int(dtype.itemsize)
+            max_shard_bytes = max(max_shard_bytes, num_bytes)
+
+        def _is_tmpfs(path: str) -> bool:
+            try:
+                with open("/proc/mounts", "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[1] == path:
+                            return parts[2] == "tmpfs"
+            except OSError:
+                return False
+            return False
+
+        def _free_bytes(path: str) -> int:
+            try:
+                stat = os.statvfs(path)
+                return stat.f_bavail * stat.f_frsize
+            except OSError:
+                return 0
+
+        for candidate in ("/dev/shm", "/tmp"):
+            if _is_tmpfs(candidate) and _free_bytes(candidate) >= max_shard_bytes:
+                decompress_dir = candidate
+                has_decompress_cache = True
+                break
+
+        if has_decompress_cache:
+            use_mmap = True
+            if shard_cache_in_memory:
+                print(
+                    f"[data] INFO: Using tmpfs mmap cache for compressed shards; "
+                    f"overriding shard_cache_in_memory=True to mmap"
+                )
+        else:
+            if use_mmap:
+                print(
+                    f"[data] WARNING: Compressed shards without tmpfs cache; "
+                    f"disabling mmap_mode and falling back to in-memory loading"
+                )
+            use_mmap = False
+
+    # CRITICAL: Force num_workers=0 when shard-local in-memory caching is active.
+    # Each worker is a separate process and would load/copy full shards independently.
+    if num_workers_train > 0 and (
+        (has_compressed_shards and not has_decompress_cache) or (shard_locality and not use_mmap)
+    ):
+        if has_compressed_shards and not has_decompress_cache:
+            print(f"[data] WARNING: Compressed shards detected (.zst files) without tmpfs cache")
+        else:
+            print(f"[data] WARNING: shard_locality with in-memory shards requires num_workers=0")
+        print(f"[data] Forcing num_workers=0 to prevent shard duplication across workers")
+        num_workers_train = 0
+
+    # Cache shards when shard-locality is enabled so the sampler and collate share
+    # a single in-memory shard (evicted on shard rotation).
+    cache_shards = bool(shard_locality or shard_cache_in_memory or use_mmap)
+    shard_loader = ShardLoader(
+        dataset_dir,
+        mmap_mode=use_mmap,
+        cache_shards=cache_shards,
+        cache_keep_shards=shard_cache_keep_shards,
+        decompress_dir=decompress_dir,
+        decompress_cleanup=True,
+    )
 
     print(f"[data] Dataset: {shard_loader}")
     print(f"[data] Metadata: {metadata.get_run_count()} runs")
@@ -101,17 +183,29 @@ def build_steps_dataloaders(
 
     print(f"[data] Steps (from metadata): train={meta_train_steps:,} val={meta_val_steps:,}")
 
-    # Setup collate function - pass shard_loader directly to avoid pickling issues
+    # Setup collate function
+    # CRITICAL: For compressed shards with num_workers=0, pass shard_loader to avoid double-loading
+    # The collate would otherwise create its own loader and decompress shards again!
+    pass_loader = shard_loader if num_workers_train == 0 else None
+    loader_kwargs = None if pass_loader is not None else {
+        "mmap_mode": use_mmap,
+        "cache_shards": cache_shards,
+        "cache_keep_shards": shard_cache_keep_shards,
+        "decompress_dir": decompress_dir,
+        "decompress_cleanup": True,
+    }
+
     if target_mode == "macroxue_tokens":
         if tokenizer_path is None:
             raise ValueError("tokenizer_path required for macroxue_tokens mode")
-        # Create a worker-safe collate that doesn't capture dataset in closure
         from .collate import make_collate_macroxue_worker_safe
         collate_fn = make_collate_macroxue_worker_safe(
             dataset_dir,
             tokenizer_path,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
+            shard_loader=pass_loader,
+            shard_loader_kwargs=loader_kwargs,
         )
     else:
         from .collate import make_collate_steps_worker_safe
@@ -121,6 +215,8 @@ def build_steps_dataloaders(
             ev_tokenizer=ev_tokenizer,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
+            shard_loader=pass_loader,
+            shard_loader_kwargs=loader_kwargs,
         )
 
     # Build training dataloader

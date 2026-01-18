@@ -11,6 +11,7 @@ The core training library lives in `src/train_2048/`, covering configuration, da
 
 ## Build, Test, and Development Commands
 Sync the environment with `uv sync`; the project pins dependencies through `pyproject.toml` and `uv.lock`. Launch training with `uv run --locked train --config config/config.example.toml` (set `--device cpu|cuda` as needed). Validate gameplay with the Rust orchestrator: `cargo run -p game-engine -- --config config/inference/top-score.toml`. Benchmark client/server inference via `uv run benchmarks/bench_client_server.py --init inits/v1_pretrained_50m --uds /tmp/2048_infer.sock --device cuda --compile-mode default --config config/inference/top-score.toml --release`.
+For Rust commands, use `--locked` when running `cargo` to avoid lockfile/network churn (e.g. `cargo test -p dataset-packer --locked`).
 
 ## Coding Style & Naming Conventions
 Follow Python 3.12+, four-space indentation, and type hints for every public function. Adhere to PEP 8 and PEP 257; keep functions small and pure where feasible. Modules use snake_case, classes PascalCase, functions and variables snake_case. Prefer explicit `from train_2048 import …` imports over relative wildcards, and add short comments only when clarifying non-obvious logic.

@@ -85,6 +85,56 @@ pub fn get_score(board: Board) -> Score {
     })
 }
 
+/// Compute merge reward for a move from a board of tile exponents.
+///
+/// The board is in row-major order with exponents (0=empty, 1=2, 2=4, ...).
+/// This operates on full exponents (no 4-bit clamping), so it stays correct for
+/// tiles beyond 2^15.
+pub fn merge_reward_exps(board: &[u8; 16], direction: Move) -> u64 {
+    let mut reward = 0u64;
+    for line_idx in 0..4 {
+        let mut line = match direction {
+            Move::Left | Move::Right => {
+                let base = line_idx * 4;
+                [board[base], board[base + 1], board[base + 2], board[base + 3]]
+            }
+            Move::Up | Move::Down => [
+                board[line_idx],
+                board[line_idx + 4],
+                board[line_idx + 8],
+                board[line_idx + 12],
+            ],
+        };
+        if matches!(direction, Move::Right | Move::Down) {
+            line.reverse();
+        }
+        reward = reward.saturating_add(merge_reward_line(line));
+    }
+    reward
+}
+
+fn merge_reward_line(line: [u8; 4]) -> u64 {
+    let mut tiles: Vec<u8> = line.into_iter().filter(|&exp| exp != 0).collect();
+    let mut reward = 0u64;
+    let mut idx = 0usize;
+    while idx + 1 < tiles.len() {
+        if tiles[idx] == tiles[idx + 1] {
+            let merged_exp = tiles[idx].saturating_add(1);
+            if merged_exp < 64 {
+                reward = reward.saturating_add(1u64 << merged_exp);
+            } else {
+                reward = u64::MAX;
+            }
+            tiles[idx] = merged_exp;
+            tiles.remove(idx + 1);
+            idx += 1;
+        } else {
+            idx += 1;
+        }
+    }
+    reward
+}
+
 fn shift_rows(board: Board, move_dir: Move) -> Board {
     let s = stores();
     let table: &[u64] = match move_dir {
@@ -222,6 +272,15 @@ fn get_tile(board: Board, idx: usize) -> Tile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pack_exps(exps: &[u8; 16]) -> Board {
+        let mut acc = 0u64;
+        for (idx, &exp) in exps.iter().enumerate() {
+            let shift = (15 - idx) * 4;
+            acc |= (exp as u64 & 0xF) << shift;
+        }
+        Board::from_raw(acc)
+    }
 
     #[test]
     fn it_shift_vec_left() {
@@ -375,5 +434,33 @@ mod tests {
         assert_eq!(get_tile_val(empty_board, 0), 0);
         assert_eq!(get_tile_val(empty_board, 8), 0);
         assert_eq!(get_tile_val(empty_board, 15), 0);
+    }
+
+    #[test]
+    fn merge_reward_matches_shift_score_for_safe_exps() {
+        crate::engine::new();
+        let exps: [u8; 16] = [
+            1, 1, 0, 0, // 2+2 -> 4 (reward 4)
+            2, 0, 2, 0, // 4+4 -> 8 (reward 8)
+            3, 3, 3, 3, // 8+8 -> 16, 8+8 -> 16 (reward 16+16)
+            0, 0, 0, 0,
+        ];
+        let board = pack_exps(&exps);
+        let move_dir = Move::Left;
+        let reward = merge_reward_exps(&exps, move_dir) as i64;
+        let score_delta = board.shift(move_dir).score() as i64 - board.score() as i64;
+        assert_eq!(reward, score_delta);
+    }
+
+    #[test]
+    fn merge_reward_handles_large_exps() {
+        let exps: [u8; 16] = [
+            16, 16, 0, 0, // 2^16 + 2^16 -> 2^17 (reward 131072)
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        let reward = merge_reward_exps(&exps, Move::Left);
+        assert_eq!(reward, 1u64 << 17);
     }
 }
