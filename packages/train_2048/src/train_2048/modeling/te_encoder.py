@@ -11,7 +11,12 @@ from safetensors import safe_open
 from safetensors.torch import load_file as safe_load_file
 
 from core_2048 import EncoderConfig
-from core_2048.init_io import _load_pt_bundle, _resolve_init_path, normalize_state_dict_keys
+from core_2048.init_io import (
+    _apply_value_head_from_target,
+    _load_pt_bundle,
+    _resolve_init_path,
+    normalize_state_dict_keys,
+)
 from core_2048.model import AbsolutePositionalEmbedding, CoralHead
 
 
@@ -252,6 +257,9 @@ def load_te_encoder_from_init(init_dir: str) -> TEEncoder:
             _assert_te_backend(backend, str(pt_path))
             init_info["weights_path"] = str(pt_path)
             init_info["weights_type"] = "pt"
+
+    if enc_cfg_dict is not None:
+        _apply_value_head_from_target(enc_cfg_dict)
 
     if isinstance(state, dict) and enc_cfg_dict is not None:
         head_type = enc_cfg_dict.get("head_type", "binned_ev")

@@ -14,6 +14,34 @@ from .model import Encoder, EncoderConfig
 _HF_PREFIX = "hf://"
 
 
+def _apply_value_head_from_target(enc_cfg_dict: Dict[str, Any]) -> None:
+    value_cfg = enc_cfg_dict.get("value_head")
+    if not isinstance(value_cfg, dict):
+        return
+    if "value_head_type" in enc_cfg_dict:
+        return
+    enabled = value_cfg.get("enabled")
+    if enabled is False:
+        return
+    tiles = value_cfg.get("tiles")
+    if not tiles:
+        return
+    try:
+        tiles_list = [int(x) for x in tiles]
+    except Exception:
+        return
+    include_underflow = value_cfg.get("include_underflow", True)
+    num_classes = len(tiles_list) + (1 if include_underflow else 0)
+    enc_cfg_dict["value_head_type"] = "coral"
+    enc_cfg_dict["value_head_num_classes"] = int(num_classes)
+    pooling = value_cfg.get("pooling")
+    if pooling is not None:
+        enc_cfg_dict["value_head_pooling"] = pooling
+    proj_dim = value_cfg.get("proj_dim")
+    if proj_dim is not None:
+        enc_cfg_dict["value_head_proj_dim"] = proj_dim
+
+
 def _resolve_init_path(init_dir: str, init_info: Dict[str, Any]) -> Path:
     """Return a local filesystem path, downloading from HuggingFace if needed."""
     if not init_dir.startswith(_HF_PREFIX):
@@ -168,6 +196,9 @@ def load_encoder_from_init(init_dir: str) -> Encoder:
                 init_info["weights_type"] = "pt"
             except Exception:
                 state = None
+
+    if enc_cfg_dict is not None:
+        _apply_value_head_from_target(enc_cfg_dict)
 
     # If we loaded any state, infer additional config from it
     if isinstance(state, dict) and enc_cfg_dict is not None:

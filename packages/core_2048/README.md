@@ -33,6 +33,10 @@ Optional value head configuration (independent of policy head)
   - CORAL logits output = value_head_num_classes - 1
 - value_head_pooling (string, default "mean") — "mean" (reuse pooled trunk) or "mean_proj"
 - value_head_proj_dim (int|null) — required only if value_head_pooling="mean_proj"
+Alternatively, you may supply a training-style value head section:
+- value_head (object) — same fields as `target.value_head` in training configs
+  - When present with a non-empty `tiles` list (and `value_head_type` is absent),
+    the loader converts it to `value_head_type/value_head_num_classes/...`.
 
 Optional
 - dropout_prob (float, default 0.1)

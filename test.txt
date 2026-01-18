@@ -1,0 +1,60 @@
+Base rate p(reach 32768 | 16384) = 0.804693 (p(die | 16384) = 0.195307, steps=1971051)
+Wrote plot to value_adv_32768.png
+Knowledge cutoff: 0.2
+run 16 (die): knows at -2 steps before outcome
+run 17 (die): knows at -163 steps before outcome
+run 21 (die): knows at 0 steps before outcome
+run 29 (die): never exceeds cutoff
+run 35 (die): knows at -4873 steps before outcome
+run 43 (die): never exceeds cutoff
+run 48 (die): never exceeds cutoff
+run 59 (die): knows at -7 steps before outcome
+run 60 (die): knows at 0 steps before outcome
+run 61 (die): knows at -1 steps before outcome
+run 63 (die): never exceeds cutoff
+run 67 (die): knows at -11 steps before outcome
+run 68 (die): knows at 0 steps before outcome
+run 74 (die): never exceeds cutoff
+run 80 (die): never exceeds cutoff
+run 97 (die): knows at -9 steps before outcome
+run 106 (die): knows at -3 steps before outcome
+run 121 (die): never exceeds cutoff
+run 125 (die): never exceeds cutoff
+run 129 (die): knows at -6602 steps before outcome
+run 133 (die): never exceeds cutoff
+run 141 (die): knows at 0 steps before outcome
+run 145 (die): knows at -2 steps before outcome
+run 147 (die): knows at -2 steps before outcome
+run 149 (die): knows at -161 steps before outcome
+run 150 (die): knows at -2 steps before outcome
+run 158 (die): knows at -8 steps before outcome
+run 159 (die): knows at 0 steps before outcome
+run 163 (die): knows at -1 steps before outcome
+run 164 (die): never exceeds cutoff
+run 178 (die): knows at -1 steps before outcome
+run 180 (die): never exceeds cutoff
+run 182 (die): never exceeds cutoff
+run 185 (die): never exceeds cutoff
+run 187 (die): knows at -60 steps before outcome
+run 194 (die): knows at 0 steps before outcome
+run 195 (die): never exceeds cutoff
+run 197 (die): knows at -1 steps before outcome
+run 203 (die): never exceeds cutoff
+run 221 (die): knows at -2 steps before outcome
+run 223 (die): knows at 0 steps before outcome
+run 229 (die): knows at 0 steps before outcome
+run 230 (die): knows at -5 steps before outcome
+run 241 (die): knows at -5 steps before outcome
+run 242 (die): knows at -2 steps before outcome
+run 243 (die): never exceeds cutoff
+run 244 (die): knows at 0 steps before outcome
+run 249 (die): knows at -5 steps before outcome
+run 252 (die): never exceeds cutoff
+run 256 (die): knows at 0 steps before outcome
+run 257 (die): knows at -2 steps before outcome
+run 258 (die): never exceeds cutoff
+run 260 (die): knows at -4 steps before outcome
+run 264 (die): knows at 0 steps before outcome
+run 265 (die): knows at -2 steps before outcome
+run 271 (die): never exceeds cutoff
+run 273 (die): knows at -1 steps before outcome

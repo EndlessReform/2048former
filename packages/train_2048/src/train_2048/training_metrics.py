@@ -26,6 +26,8 @@ def format_postfix(
     if global_step is not None:
         parts.append(f"step={global_step}")
     base = f"loss={loss:.4f}"
+    if "value_loss" in metrics and metrics.get("value_loss") is not None:
+        base += f"  vloss={float(metrics['value_loss']):.4f}"
     if target_mode in ("binned_ev", "macroxue_tokens"):
         if target_mode == "macroxue_tokens":
             pa = metrics.get("policy_agreement")
@@ -41,8 +43,10 @@ def format_postfix(
             base += f"  policy_acc={float(acc):.3f}"
     base += f"  lr={lr:.2e}"
     if accum_steps is not None and micro_batch_size is not None:
-        effective = int(accum_steps) * int(micro_batch_size)
-        parts.append(f"mb={int(micro_batch_size)} eff={effective}")
+        micro = int(micro_batch_size)
+        effective = int(accum_steps) * micro
+        if effective != micro:
+            parts.append(f"mb={micro} eff={effective}")
     if dt_data_ms is not None and dt_comp_ms is not None:
         base += f"  data={dt_data_ms:.1f}ms  comp={dt_comp_ms:.1f}ms"
     if parts:
