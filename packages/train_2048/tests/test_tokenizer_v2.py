@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from train_2048.tokenization.macroxue import (
+from core_2048.tokenization.macroxue import (
     MacroxueTokenizerV2,
     MacroxueTokenizerV2Spec,
     fit_macroxue_tokenizer_v2,

@@ -14,11 +14,10 @@ import torch
 import torch.nn.functional as F
 
 from core_2048 import load_encoder_from_init
-from train_2048.binning import BinningConfig
+from core_2048.tokenization.abs_ev_binning import BinningConfig, AbsEVBinningTokenizer
 from train_2048.dataloader.steps import StepsDataset
 from train_2048.tokenization.base import BoardCodec
-from train_2048.tokenization.ev_binning import EVBinnerTokenizer
-from train_2048.tokenization.macroxue import MacroxueTokenizerV2, MacroxueTokenizerV2Spec
+from core_2048.tokenization.macroxue import MacroxueTokenizerV2, MacroxueTokenizerV2Spec
 
 
 def parse_args() -> argparse.Namespace:
@@ -261,7 +260,7 @@ def main() -> None:
     else:
         mode = "binned_ev"
         binning_cfg = _load_binning_config(args.init)
-        ev_tokenizer = EVBinnerTokenizer(binning_cfg).to(device)
+        ev_tokenizer = AbsEVBinningTokenizer(binning_cfg).to(device)
         n_classes = int(ev_tokenizer.n_bins)
 
     ds = StepsDataset(args.dataset, mmap_mode=True)
@@ -315,7 +314,7 @@ def main() -> None:
                 if "board_eval" in rows.dtype.names:
                     board_evals = rows["board_eval"].astype(np.int32, copy=False)
                 else:
-                    from train_2048.tokenization.macroxue.board_eval import evaluate_board_batch
+                    from core_2048.tokenization.macroxue.board_eval import evaluate_board_batch
 
                     board_evals = evaluate_board_batch(boards)
 

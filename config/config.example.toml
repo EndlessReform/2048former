@@ -81,6 +81,10 @@ val_split_seed = 42
 
 # Validate every N training steps (0 disables)
 val_every = 1000
+# Optional: cap validation to a fixed number of steps (batches).
+# NOTE: With shard_locality + compressed shards + mmap_mode=true, validation will
+# sample from the first shard only to avoid tmpfs overcommit.
+# val_num_steps = 200
 
 [dataset.rotation_augment]
 mode = "none"         # none | random_k
@@ -97,6 +101,8 @@ mode = "none"         # none | random_axis
 # shard_locality_block_size = 500000    # Draw at most this many rows per shard before rotating
 # shard_cache_in_memory = true          # Materialise the active shard into RAM
 # shard_cache_keep_shards = 1           # Number of cached shards to retain simultaneously
+# NOTE: For compressed shards + mmap_mode=true, decompression happens into tmpfs
+# and the mmap is shared across workers. Ensure tmpfs has room for one shard.
 
 [checkpoint]
 # every_epochs = 1

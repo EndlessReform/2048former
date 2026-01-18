@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use dataset_packer::evaluate;
 use dataset_packer::macroxue::{self, RunSummary};
-use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, annotation_kinds};
+use dataset_packer::schema::{AnnotationRow, MacroxueStepRow, MacroxueStepRowV1, annotation_kinds};
 use npyz::NpyFile;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -372,13 +372,25 @@ fn load_macro_steps(dir: &Path) -> Result<HashMap<u32, Vec<MacroxueStepRow>>> {
         let mut reader = std::io::BufReader::new(file);
         let npy = NpyFile::new(&mut reader)
             .with_context(|| format!("failed to read {}", shard.display()))?;
-        let mut data = npy
-            .data::<MacroxueStepRow>()
-            .map_err(|err| anyhow!("{}: {err}", shard.display()))?;
-        while let Some(row) = data.next() {
-            let row =
-                row.with_context(|| format!("failed to decode row in {}", shard.display()))?;
-            map.entry(row.run_id).or_default().push(row);
+        match npy.try_data::<MacroxueStepRow>() {
+            Ok(mut data) => {
+                while let Some(row) = data.next() {
+                    let row =
+                        row.with_context(|| format!("failed to decode row in {}", shard.display()))?;
+                    map.entry(row.run_id).or_default().push(row);
+                }
+            }
+            Err(npy) => {
+                let mut data = npy
+                    .data::<MacroxueStepRowV1>()
+                    .map_err(|err| anyhow!("{}: {err}", shard.display()))?;
+                while let Some(row) = data.next() {
+                    let row =
+                        row.with_context(|| format!("failed to decode row in {}", shard.display()))?;
+                    let row: MacroxueStepRow = row.into();
+                    map.entry(row.run_id).or_default().push(row);
+                }
+            }
         }
     }
     Ok(map)

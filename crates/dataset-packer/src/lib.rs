@@ -19,7 +19,7 @@ pub use crate::macroxue::tokenizer::{
 };
 pub use crate::macroxue::{PackOptions, pack_dataset, tokenizer};
 pub use crate::merge::{MergeOptions, merge_datasets};
-pub use crate::schema::{MacroxueStepRow, SelfplayStepRow, StepRow};
+pub use crate::schema::{MacroxueStepRow, MacroxueStepRowV1, SelfplayStepRow, StepRow};
 pub use crate::selfplay::{collect_selfplay_step_files, load_selfplay_shard, write_selfplay_steps};
 pub use crate::valuation::evaluate;
 pub use crate::writer::{StepsWriter, write_single_shard};

@@ -31,6 +31,8 @@ pub struct MacroxueStepRow {
     pub step_index: u32,
     pub board: u64,
     pub board_eval: i32,
+    /// Sum of merge rewards from this step to game end (undiscounted).
+    pub cumulative_reward: i32,
     pub tile_65536_mask: u16,
     pub move_dir: u8,
     pub valuation_type: u8,
@@ -41,6 +43,86 @@ pub struct MacroxueStepRow {
 }
 
 impl StructuredRow for MacroxueStepRow {
+    fn dtype() -> DType {
+        let u1: TypeStr = "<u1".parse().unwrap();
+        let u2: TypeStr = "<u2".parse().unwrap();
+        let u4: TypeStr = "<u4".parse().unwrap();
+        let u8: TypeStr = "<u8".parse().unwrap();
+        let f4: TypeStr = "<f4".parse().unwrap();
+        let i4: TypeStr = "<i4".parse().unwrap();
+        DType::Record(vec![
+            Field {
+                name: "run_id".into(),
+                dtype: DType::Plain(u4.clone()),
+            },
+            Field {
+                name: "step_index".into(),
+                dtype: DType::Plain(u4.clone()),
+            },
+            Field {
+                name: "board".into(),
+                dtype: DType::Plain(u8),
+            },
+            Field {
+                name: "board_eval".into(),
+                dtype: DType::Plain(i4.clone()),
+            },
+            Field {
+                name: "cumulative_reward".into(),
+                dtype: DType::Plain(i4),
+            },
+            Field {
+                name: "tile_65536_mask".into(),
+                dtype: DType::Plain(u2.clone()),
+            },
+            Field {
+                name: "move_dir".into(),
+                dtype: DType::Plain(u1.clone()),
+            },
+            Field {
+                name: "valuation_type".into(),
+                dtype: DType::Plain(u1.clone()),
+            },
+            Field {
+                name: "ev_legal".into(),
+                dtype: DType::Plain(u1.clone()),
+            },
+            Field {
+                name: "max_rank".into(),
+                dtype: DType::Plain(u1),
+            },
+            Field {
+                name: "seed".into(),
+                dtype: DType::Plain(u4),
+            },
+            Field {
+                name: "branch_evs".into(),
+                dtype: DType::Array(4, Box::new(DType::Plain(f4))),
+            },
+        ])
+    }
+}
+
+/// Legacy row layout for Macroxue packs that predate `cumulative_reward`.
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, npyz::Serialize, npyz::Deserialize, npyz::AutoSerialize,
+)]
+pub struct MacroxueStepRowV1 {
+    pub run_id: u32,
+    pub step_index: u32,
+    pub board: u64,
+    pub board_eval: i32,
+    pub tile_65536_mask: u16,
+    pub move_dir: u8,
+    pub valuation_type: u8,
+    pub ev_legal: u8,
+    pub max_rank: u8,
+    pub seed: u32,
+    pub branch_evs: [f32; 4],
+}
+
+impl StructuredRow for MacroxueStepRowV1 {
     fn dtype() -> DType {
         let u1: TypeStr = "<u1".parse().unwrap();
         let u2: TypeStr = "<u2".parse().unwrap();
@@ -94,6 +176,25 @@ impl StructuredRow for MacroxueStepRow {
                 dtype: DType::Array(4, Box::new(DType::Plain(f4))),
             },
         ])
+    }
+}
+
+impl From<MacroxueStepRowV1> for MacroxueStepRow {
+    fn from(row: MacroxueStepRowV1) -> Self {
+        MacroxueStepRow {
+            run_id: row.run_id,
+            step_index: row.step_index,
+            board: row.board,
+            board_eval: row.board_eval,
+            cumulative_reward: 0,
+            tile_65536_mask: row.tile_65536_mask,
+            move_dir: row.move_dir,
+            valuation_type: row.valuation_type,
+            ev_legal: row.ev_legal,
+            max_rank: row.max_rank,
+            seed: row.seed,
+            branch_evs: row.branch_evs,
+        }
     }
 }
 

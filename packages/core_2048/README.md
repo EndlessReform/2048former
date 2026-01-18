@@ -1,4 +1,4 @@
-Core 2048 Model Init Spec
+## Core 2048 Model Init Spec
 
 This document defines the minimal JSON schema for an init directory that `core_2048` can load via `load_encoder_from_init(<init_dir>)`. An init directory contains:
 

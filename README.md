@@ -57,33 +57,11 @@ while not board.is_game_over():
 print("final score:", board.score(), "highest:", board.highest_tile())
 ```
 
-## CLI script to run a game
+## Running games
 
-A standalone script lives in `bin/play_2048.py` (kept outside the package).
-It runs a single game with the default policy, auto-selects device (mps > cuda > cpu), and supports an optional seed.
-
-```
-python bin/play_2048.py --init ./init --seed 123
-# or let it pick a random seed
-python bin/play_2048.py --init ./init
-# optionally override device
-python bin/play_2048.py --init ./init --device cpu
-# adjust progress logging (prints every N moves)
-python bin/play_2048.py --init ./init --log-interval 25
-```
-
-The CLI prints periodic status lines like:
-
-```
-Starting game: device=cuda dtype=torch.bfloat16 seed=123 initial score=0 highest=2
-[    50] last=Left  score=   544 highest=  16 mps(window)= 1200.50 mps(avg)= 1180.23
-...
-Done: device=cuda seed=123 moves=732 time=0.89s avg_mps=823.74 final score=37640 highest=1024
-```
-
-Notes
-- Dtype: the model runs in its native dtype; no implicit conversion.
-- Device: defaults to mps on macOS if available, then cuda, else cpu.
+The single-game Python CLI has been removed. Use the Rust orchestrator in
+`crates/game-engine` for self-play or annotation runs (see
+`crates/game-engine/README.md`).
 
 ## Dataset (NPY + SQLite)
 

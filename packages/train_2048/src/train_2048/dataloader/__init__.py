@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from torch.utils.data import DataLoader
 
+from core_2048.tokenization.abs_ev_binning import BinningConfig, AbsEVBinningTokenizer
 from ..config import TrainingConfig
 
 # Use new shard-based implementation by default
@@ -21,20 +22,18 @@ def build_dataloaders(
     """
 
     target_mode = getattr(cfg.target, "mode", "binned_ev")
-    binner = None
+    ev_tokenizer = None
     if target_mode == "binned_ev":
-        from ..binning import Binner
-
-        binner = Binner.from_config(cfg.binning)
+        ev_tokenizer = AbsEVBinningTokenizer(BinningConfig(**cfg.binning.model_dump()))
 
     ds_cfg = cfg.dataset
     return build_steps_dataloaders(
         dataset_dir=ds_cfg.resolved_dataset_dir(),
-        binner=binner,
         target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
         physical_batch_size=cfg.batch.physical_batch_size(),
         tokenizer_path=ds_cfg.resolved_tokenizer_path(),
+        ev_tokenizer=ev_tokenizer,
         run_sql=getattr(ds_cfg, "run_sql", None),
         sql_params=getattr(ds_cfg, "sql_params", None),
         val_run_sql=getattr(ds_cfg, "val_run_sql", None),

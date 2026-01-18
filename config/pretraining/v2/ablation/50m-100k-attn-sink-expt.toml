@@ -1,23 +1,20 @@
-# Ablation: attention sink + winner_weight=1.0 (baseline)
-# Compare with ww5 variant to measure effect of WINNER upweighting
+# Ablation: attention sink (baseline)
 
-# init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
-init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink"
+init_dir = "inits/v2/50m_ablations/n1_binned_attn_sink_qk"
 checkpoint_dir = "checkpoints"
 seed = 42
 
 [wandb]
-enabled = true
+enabled = false
 project = "train-2048-bin-v2"
 entity = ""
 # run_name = "50m-100k-attn-sink-ww1"
-tags = ["v2", "macroxue-binned", "attn-sink", "ablation", "ww1", "autocast"]
+tags = ["v2", "macroxue-binned", "attn-sink", "ablation"]
 mode = "online"
 report_every = 50
 
 [target]
 mode = "macroxue_tokens"
-winner_weight = 1.0
 
 [hyperparameters]
 learning_rate = 5e-4
@@ -44,12 +41,12 @@ dropout_prob = 0.03
 attention_dropout_prob = 0.0
 
 [dataset]
-dataset_dir = "datasets/d6_3b_v0"
-tokenizer_path = "out/macroxue_v2/tokenizer.json"
+dataset_dir = "datasets/d6_3b_v1"
+tokenizer_path = "out/macroxue_v2/tokenizer_16.json"
 mmap_mode = true
 num_steps = 100_000
 shard_locality = true
-shard_cache_in_memory = true
+shard_cache_in_memory = false
 shard_cache_keep_shards = 1
 
 val_run_pct = 0.005

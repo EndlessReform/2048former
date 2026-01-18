@@ -6,13 +6,18 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "huggingface-hub>=1.1.5",
+    "numpy>=2.3.2",
     "pydantic>=2.11.7",
     "safetensors>=0.6.2",
     "torch>=2.8.0",
+    "tqdm>=4.67.1",
 ]
 
 [project.optional-dependencies]
 nvidia = []
+
+[project.scripts]
+tokenizer-macroxue = "core_2048.tokenization.cli:main"
 
 [tool.uv.build-backend]
 module-name = ["core_2048"]

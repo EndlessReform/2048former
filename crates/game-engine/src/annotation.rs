@@ -3,7 +3,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use dataset_packer;
 use dataset_packer::macroxue;
 use dataset_packer::schema::{
-    AnnotationRow, MAX_STUDENT_BINS, MacroxueStepRow, SelfplayStepRow, annotation_kinds,
+    AnnotationRow, MAX_STUDENT_BINS, MacroxueStepRow, MacroxueStepRowV1, SelfplayStepRow,
+    annotation_kinds,
 };
 use dataset_packer::writer::StepsWriter;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -73,6 +74,7 @@ pub async fn run(job: JobConfig) -> Result<()> {
         "annotations",
         Some(shard_max),
         job.overwrite,
+        false,
     )?;
     let mut student_writer =
         StudentBinsWriter::new(&job.output_dir, Some(shard_max), job.overwrite)?;
@@ -607,10 +609,19 @@ fn load_macro_shard(path: &Path) -> Result<Vec<MacroxueStepRow>> {
     let mut reader = std::io::BufReader::new(file);
     let npy = npyz::NpyFile::new(&mut reader)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let rows: Vec<MacroxueStepRow> = npy
-        .into_vec()
-        .map_err(|err| anyhow!("{}: {err}", path.display()))?;
-    Ok(rows)
+    match npy.try_data::<MacroxueStepRow>() {
+        Ok(data) => Ok(data
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|err| anyhow!("{}: {err}", path.display()))?),
+        Err(npy) => {
+            let rows = npy
+                .data::<MacroxueStepRowV1>()
+                .map_err(|err| anyhow!("{}: {err}", path.display()))?
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|err| anyhow!("{}: {err}", path.display()))?;
+            Ok(rows.into_iter().map(Into::into).collect())
+        }
+    }
 }
 
 fn detect_kind(step_files: &[PathBuf]) -> Result<DatasetKind> {
@@ -633,11 +644,22 @@ fn try_read_macro(path: &Path) -> Result<()> {
     let file = std::fs::File::open(path)?;
     let mut reader = std::io::BufReader::new(file);
     let npy = npyz::NpyFile::new(&mut reader)?;
-    let mut data = npy.data::<MacroxueStepRow>()?;
-    if data.next().is_some() {
-        Ok(())
-    } else {
-        Err(anyhow!("empty shard"))
+    match npy.try_data::<MacroxueStepRow>() {
+        Ok(mut data) => {
+            if data.next().is_some() {
+                Ok(())
+            } else {
+                Err(anyhow!("empty shard"))
+            }
+        }
+        Err(npy) => {
+            let mut data = npy.data::<MacroxueStepRowV1>()?;
+            if data.next().is_some() {
+                Ok(())
+            } else {
+                Err(anyhow!("empty shard"))
+            }
+        }
     }
 }
 

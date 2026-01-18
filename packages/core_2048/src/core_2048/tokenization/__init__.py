@@ -1,6 +1,8 @@
-"""Macroxue tokenization helpers (imported from core_2048)."""
+"""Tokenization utilities shared across 2048 packages."""
 
-from core_2048.tokenization.macroxue import (
+from .base import EVTokenizer
+from .abs_ev_binning import BinningConfig, AbsEVBinningTokenizer
+from .macroxue import (
     MacroxueTokenizerV2,
     MacroxueTokenizerV2Spec,
     MacroxueTokenizerV2TypeConfig,
@@ -9,6 +11,9 @@ from core_2048.tokenization.macroxue import (
 )
 
 __all__ = [
+    "EVTokenizer",
+    "BinningConfig",
+    "AbsEVBinningTokenizer",
     "MacroxueTokenizerV2",
     "MacroxueTokenizerV2Spec",
     "MacroxueTokenizerV2TypeConfig",

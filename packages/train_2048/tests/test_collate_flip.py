@@ -70,7 +70,6 @@ def test_make_collate_steps_flip(monkeypatch) -> None:
     collate = make_collate_steps(
         "hard_move",
         dataset,
-        binner=None,
         ev_tokenizer=None,
         flip_augment=flip_cfg,
     )
@@ -116,7 +115,6 @@ def test_make_collate_steps_rotation_flip(monkeypatch) -> None:
     collate = make_collate_steps(
         "hard_move",
         dataset,
-        binner=None,
         ev_tokenizer=None,
         rotation_augment=rotation_cfg,
         flip_augment=flip_cfg,

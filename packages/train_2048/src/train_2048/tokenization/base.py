@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, Protocol, Optional
+from typing import Optional
 
 import numpy as np
-import torch
-
+from core_2048.tokenization.base import EVTokenizer
 
 # Canonical branch order everywhere: UDLR (Up, Down, Left, Right)
 BRANCH_ORDER_UDLR = (0, 1, 2, 3)
@@ -35,13 +34,6 @@ class BoardCodec:
         # UDLR bit order: Up=1, Down=2, Left=4, Right=8
         b = bits.astype(np.uint8, copy=False)
         return np.stack([(b & 1) != 0, (b & 2) != 0, (b & 4) != 0, (b & 8) != 0], axis=1)
-
-
-class EVTokenizer(Protocol):
-    """Protocol for EV tokenizers that produce training targets from EVs."""
-
-    def build_targets(self, *, evs: torch.Tensor, legal_mask: torch.Tensor) -> Dict[str, object]:
-        """Return targets for training given branch EVs [B,4] and legality mask [B,4]."""
 
 
 __all__ = [

@@ -1,8 +1,10 @@
 use std::fs;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use npyz::NpyFile;
+use zstd::stream::read::Decoder;
 
 use crate::macroxue::RunSummary;
 use crate::schema::SelfplayStepRow;
@@ -15,9 +17,7 @@ pub fn write_selfplay_steps(rows: &[SelfplayStepRow], out_path: &Path) -> Result
 
 /// Load all rows from a single self-play shard.
 pub fn load_selfplay_shard(path: &Path) -> Result<Vec<SelfplayStepRow>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("failed to open shard {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
+    let mut reader = open_npy_reader(path)?;
     let npy =
         NpyFile::new(&mut reader).with_context(|| format!("failed to read {}", path.display()))?;
     npy.into_vec()
@@ -28,8 +28,17 @@ pub fn load_selfplay_shard(path: &Path) -> Result<Vec<SelfplayStepRow>> {
 pub fn collect_selfplay_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let single = dir.join("steps.npy");
-    if single.exists() {
-        files.push(single);
+    let single_zst = dir.join("steps.npy.zst");
+    match (single.exists(), single_zst.exists()) {
+        (true, true) => {
+            bail!(
+                "both steps.npy and steps.npy.zst exist in {}",
+                dir.display()
+            );
+        }
+        (true, false) => files.push(single),
+        (false, true) => files.push(single_zst),
+        _ => {}
     }
     let mut shards: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("failed to read {}", dir.display()))?
@@ -37,7 +46,8 @@ pub fn collect_selfplay_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
         .filter_map(|entry| {
             let name = entry.file_name();
             let name = name.to_str()?;
-            if name.starts_with("steps-") && name.ends_with(".npy") {
+            if name.starts_with("steps-") && (name.ends_with(".npy") || name.ends_with(".npy.zst"))
+            {
                 Some(entry.path())
             } else {
                 None
@@ -45,7 +55,20 @@ pub fn collect_selfplay_step_files(dir: &Path) -> Result<Vec<PathBuf>> {
         })
         .collect();
     shards.sort();
-    files.extend(shards);
+    for path in shards {
+        if path.extension().and_then(|s| s.to_str()) == Some("zst") {
+            let raw = path.with_extension("npy");
+            if raw.exists() {
+                bail!(
+                    "both {} and {} exist in {}",
+                    raw.file_name().unwrap_or_default().to_string_lossy(),
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    dir.display()
+                );
+            }
+        }
+        files.push(path);
+    }
     Ok(files)
 }
 
@@ -58,10 +81,23 @@ pub fn load_selfplay_runs(dir: &Path) -> Result<Vec<RunSummary>> {
 pub fn validate_selfplay_dataset(dir: &Path) -> Result<()> {
     let steps = collect_selfplay_step_files(dir)?;
     if steps.is_empty() {
-        bail!("no steps.npy files found in {}", dir.display());
+        bail!("no steps.npy[.zst] files found in {}", dir.display());
     }
     if crate::macroxue::load_runs(dir)?.is_empty() {
         bail!("metadata.db in {} has no runs", dir.display());
     }
     Ok(())
+}
+
+fn open_npy_reader(path: &Path) -> Result<Box<dyn Read>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open shard {}", path.display()))?;
+    let reader = BufReader::new(file);
+    if path.extension().and_then(|s| s.to_str()) == Some("zst") {
+        let decoder = Decoder::new(reader)
+            .with_context(|| format!("failed to decode zstd shard {}", path.display()))?;
+        Ok(Box::new(decoder))
+    } else {
+        Ok(Box::new(reader))
+    }
 }

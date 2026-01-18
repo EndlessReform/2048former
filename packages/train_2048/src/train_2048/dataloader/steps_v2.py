@@ -11,23 +11,22 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
+import os
 
 import numpy as np
 from torch.utils.data import DataLoader
 
-from .shard_loader import ShardLoader
+from .shard_loader import ShardLoader, _read_npy_header
 from .dataset import ShardDataset
 from .metadata import MetadataDB
 from .samplers import ShardPoolSampler, BufferedShuffleSampler, SequentialSampler
 from .collate import make_collate_macroxue, make_collate_steps
 
-from ..binning import Binner
 from ..tokenization.base import BoardCodec
 
 
 def build_steps_dataloaders(
     dataset_dir: str,
-    binner: Optional[Binner],
     target_mode: str,
     batch_size: int,
     *,
@@ -77,7 +76,88 @@ def build_steps_dataloaders(
     # Use mmap_mode=False when shard_cache_in_memory=True for better performance
     # (we're loading shards fully anyway)
     use_mmap = mmap_mode and not shard_cache_in_memory
-    shard_loader = ShardLoader(dataset_dir, mmap_mode=use_mmap)
+
+    # Detect if shards are compressed (before creating loader)
+    ds_path = Path(dataset_dir)
+    has_compressed_shards = (
+        any(ds_path.glob("steps-*.npy.zst"))
+        or (ds_path / "steps.npy.zst").exists()
+    )
+
+    decompress_dir: Optional[str] = None
+    has_decompress_cache = False
+    if has_compressed_shards and mmap_mode:
+        max_shard_bytes = 0
+        shard_paths = sorted(
+            list(ds_path.glob("steps-*.npy.zst")) or ([ds_path / "steps.npy.zst"] if (ds_path / "steps.npy.zst").exists() else [])
+        )
+        for shard_path in shard_paths:
+            shape, dtype = _read_npy_header(shard_path)
+            num_bytes = int(np.prod(shape)) * int(dtype.itemsize)
+            max_shard_bytes = max(max_shard_bytes, num_bytes)
+
+        def _is_tmpfs(path: str) -> bool:
+            try:
+                with open("/proc/mounts", "r", encoding="utf-8") as handle:
+                    for line in handle:
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[1] == path:
+                            return parts[2] == "tmpfs"
+            except OSError:
+                return False
+            return False
+
+        def _free_bytes(path: str) -> int:
+            try:
+                stat = os.statvfs(path)
+                return stat.f_bavail * stat.f_frsize
+            except OSError:
+                return 0
+
+        for candidate in ("/dev/shm", "/tmp"):
+            if _is_tmpfs(candidate) and _free_bytes(candidate) >= max_shard_bytes:
+                decompress_dir = candidate
+                has_decompress_cache = True
+                break
+
+        if has_decompress_cache:
+            use_mmap = True
+            if shard_cache_in_memory:
+                print(
+                    f"[data] INFO: Using tmpfs mmap cache for compressed shards; "
+                    f"overriding shard_cache_in_memory=True to mmap"
+                )
+        else:
+            if use_mmap:
+                print(
+                    f"[data] WARNING: Compressed shards without tmpfs cache; "
+                    f"disabling mmap_mode and falling back to in-memory loading"
+                )
+            use_mmap = False
+
+    # CRITICAL: Force num_workers=0 when shard-local in-memory caching is active.
+    # Each worker is a separate process and would load/copy full shards independently.
+    if num_workers_train > 0 and (
+        (has_compressed_shards and not has_decompress_cache) or (shard_locality and not use_mmap)
+    ):
+        if has_compressed_shards and not has_decompress_cache:
+            print(f"[data] WARNING: Compressed shards detected (.zst files) without tmpfs cache")
+        else:
+            print(f"[data] WARNING: shard_locality with in-memory shards requires num_workers=0")
+        print(f"[data] Forcing num_workers=0 to prevent shard duplication across workers")
+        num_workers_train = 0
+
+    # Cache shards when shard-locality is enabled so the sampler and collate share
+    # a single in-memory shard (evicted on shard rotation).
+    cache_shards = bool(shard_locality or shard_cache_in_memory or use_mmap)
+    shard_loader = ShardLoader(
+        dataset_dir,
+        mmap_mode=use_mmap,
+        cache_shards=cache_shards,
+        cache_keep_shards=shard_cache_keep_shards,
+        decompress_dir=decompress_dir,
+        decompress_cleanup=True,
+    )
 
     print(f"[data] Dataset: {shard_loader}")
     print(f"[data] Metadata: {metadata.get_run_count()} runs")
@@ -103,27 +183,40 @@ def build_steps_dataloaders(
 
     print(f"[data] Steps (from metadata): train={meta_train_steps:,} val={meta_val_steps:,}")
 
-    # Setup collate function - pass shard_loader directly to avoid pickling issues
+    # Setup collate function
+    # CRITICAL: For compressed shards with num_workers=0, pass shard_loader to avoid double-loading
+    # The collate would otherwise create its own loader and decompress shards again!
+    pass_loader = shard_loader if num_workers_train == 0 else None
+    loader_kwargs = None if pass_loader is not None else {
+        "mmap_mode": use_mmap,
+        "cache_shards": cache_shards,
+        "cache_keep_shards": shard_cache_keep_shards,
+        "decompress_dir": decompress_dir,
+        "decompress_cleanup": True,
+    }
+
     if target_mode == "macroxue_tokens":
         if tokenizer_path is None:
             raise ValueError("tokenizer_path required for macroxue_tokens mode")
-        # Create a worker-safe collate that doesn't capture dataset in closure
         from .collate import make_collate_macroxue_worker_safe
         collate_fn = make_collate_macroxue_worker_safe(
             dataset_dir,
             tokenizer_path,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
+            shard_loader=pass_loader,
+            shard_loader_kwargs=loader_kwargs,
         )
     else:
         from .collate import make_collate_steps_worker_safe
         collate_fn = make_collate_steps_worker_safe(
             dataset_dir,
             target_mode,
-            binner,
             ev_tokenizer=ev_tokenizer,
             rotation_augment=rotation_augment,
             flip_augment=flip_augment,
+            shard_loader=pass_loader,
+            shard_loader_kwargs=loader_kwargs,
         )
 
     # Build training dataloader
@@ -332,6 +425,13 @@ def build_steps_dataloaders(
     dl_val: Optional[DataLoader] = None
     if val_run_ids is not None and len(val_run_ids) > 0:
         num_workers_val = max(2, num_workers_train // 3)
+        val_first_shard_only = False
+        if has_decompress_cache and shard_locality and val_num_steps is not None and val_num_steps > 0:
+            val_first_shard_only = True
+            num_workers_val = 0
+            print(
+                "[data] Validation: using first shard only to avoid tmpfs overcommit"
+            )
 
         # Determine validation sample count
         max_val_steps = None
@@ -347,12 +447,32 @@ def build_steps_dataloaders(
 
             # Simple random sampling for validation
             from .steps import StreamingRandomSampler
-            val_sampler = StreamingRandomSampler(
-                dataset_len=total_dataset_len,
-                total_samples=total_val_samples,
-                seed=seed + 1,
-            )
-            val_dataset = ShardDataset(shard_loader, total_val_samples)
+            if val_first_shard_only:
+                shard0_len = shard_loader.shards[0].num_steps
+                rng = np.random.default_rng(seed + 1)
+                replace = total_val_samples > shard0_len
+                pick = rng.choice(shard0_len, size=total_val_samples, replace=replace)
+                shard0 = shard_loader.load_shard(0)
+                val_rows = shard0[pick].copy()
+                shard_loader.unload_shard(0)
+
+                class _ArrayLoader:
+                    def __init__(self, rows: np.ndarray):
+                        self.rows = rows
+
+                    def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
+                        return self.rows[global_indices]
+
+                val_loader = _ArrayLoader(val_rows)
+                val_dataset = ShardDataset(val_loader, len(val_rows))
+                val_sampler = SequentialSampler(len(val_rows))
+            else:
+                val_sampler = StreamingRandomSampler(
+                    dataset_len=total_dataset_len,
+                    total_samples=total_val_samples,
+                    seed=seed + 1,
+                )
+                val_dataset = ShardDataset(shard_loader, total_val_samples)
         else:
             # Use all val data
             val_sampler = None
@@ -360,13 +480,34 @@ def build_steps_dataloaders(
 
         # Use same collate function
         prefetch_val = 4 if num_workers_val > 0 else None
+        val_collate = collate_fn
+        if val_first_shard_only:
+            if target_mode == "macroxue_tokens":
+                from .collate import make_collate_macroxue_worker_safe
+                val_collate = make_collate_macroxue_worker_safe(
+                    dataset_dir,
+                    tokenizer_path,
+                    rotation_augment=rotation_augment,
+                    flip_augment=flip_augment,
+                    shard_loader=val_loader,
+                )
+            else:
+                from .collate import make_collate_steps_worker_safe
+                val_collate = make_collate_steps_worker_safe(
+                    dataset_dir,
+                    target_mode,
+                    ev_tokenizer=ev_tokenizer,
+                    rotation_augment=rotation_augment,
+                    flip_augment=flip_augment,
+                    shard_loader=val_loader,
+                )
         dl_val = DataLoader(
             val_dataset,
             batch_size=loader_batch_size,
             shuffle=(val_sampler is None),
             sampler=val_sampler,
             num_workers=num_workers_val,
-            collate_fn=collate_fn,
+            collate_fn=val_collate,
             pin_memory=True,
             persistent_workers=True if num_workers_val > 0 else False,
             prefetch_factor=prefetch_val,

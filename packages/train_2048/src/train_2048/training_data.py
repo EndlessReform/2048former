@@ -8,11 +8,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .binning import BinningConfig
+from core_2048.tokenization.abs_ev_binning import BinningConfig, AbsEVBinningTokenizer
 from .config import TrainingConfig
 from .dataloader import build_steps_dataloaders
 from .dataloader.metadata import MetadataDB
-from .tokenization.ev_binning import EVBinnerTokenizer
 
 
 def _extract_batch_dim(value: Any) -> Optional[int]:
@@ -132,10 +131,9 @@ def init_datasets(
     ev_tok = None
     if target_mode == "binned_ev":
         # Standardize EV tokenization via EVTokenizer wrapper.
-        ev_tok = EVBinnerTokenizer(BinningConfig(**cfg.binning.model_dump()))
+        ev_tok = AbsEVBinningTokenizer(BinningConfig(**cfg.binning.model_dump()))
     return build_steps_dataloaders(
         dataset_dir=cfg.dataset.resolved_dataset_dir(),
-        binner=None,
         target_mode=target_mode,
         batch_size=cfg.batch.batch_size,
         physical_batch_size=cfg.batch.physical_batch_size(),

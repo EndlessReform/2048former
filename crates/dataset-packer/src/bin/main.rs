@@ -47,6 +47,14 @@ struct PackArgs {
     /// Overwrite existing outputs if present
     #[arg(long)]
     overwrite: bool,
+
+    /// Compress shards with zstd (outputs .npy.zst)
+    #[arg(long)]
+    compress: bool,
+
+    /// Include cumulative reward in the packed step schema
+    #[arg(long)]
+    include_cumulative_reward: bool,
 }
 
 #[derive(Debug, Args)]
@@ -74,6 +82,10 @@ struct MergeArgs {
     /// Delete the source dataset directories after a successful merge
     #[arg(long)]
     delete_inputs: bool,
+
+    /// Compress shards with zstd (outputs .npy.zst)
+    #[arg(long)]
+    compress: bool,
 }
 
 fn main() -> Result<()> {
@@ -88,6 +100,8 @@ fn main() -> Result<()> {
                 rows_per_shard: args.shard_rows.filter(|&n| n > 0),
                 max_workers: args.workers,
                 overwrite: args.overwrite,
+                compress: args.compress,
+                include_cumulative_reward: args.include_cumulative_reward,
             };
             let summary = pack_dataset(options)?;
             info!(
@@ -103,6 +117,7 @@ fn main() -> Result<()> {
                 rows_per_shard: args.shard_rows.filter(|&n| n > 0),
                 overwrite: args.overwrite,
                 delete_inputs: args.delete_inputs,
+                compress: args.compress,
             };
             let summary = merge_datasets(options)?;
             info!(

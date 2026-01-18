@@ -1,4 +1,4 @@
-num_seeds = 256
+num_seeds = 1024
 max_retries = 1
 max_concurrent_games = 256
 
@@ -7,7 +7,7 @@ max_concurrent_games = 256
 # p1 is always the last bin; p2/p3 are next lower bins.
 strategy = "TailAggConf"
 conf_alpha = 0.30  # max p2 weight when margin ~ 0
-conf_beta = 12.0   # slope: larger -> faster decay as margin grows
+conf_beta = 16.0   # slope: larger -> faster decay as margin grows
 conf_gamma = 1.0   # curvature (1.0=rational)
 
 # Optional gates to restrict non-argmax to a move-window (disabled by default)

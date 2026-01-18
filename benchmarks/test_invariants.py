@@ -66,18 +66,23 @@ def test_board_codec() -> None:
 def test_make_collate_steps_udlr_canonicalization() -> None:
     rows = _mk_rows_basic(n=3, include_move=True)
     ds = _DummyDS(rows)
-    collate = make_collate_steps("binned_ev", ds, binner=None, ev_tokenizer=None)
+
+    class _DummyEVTokenizer:
+        def build_targets(self, *, evs: torch.Tensor, legal_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
+            return {"branch_mask": legal_mask}
+
+    collate = make_collate_steps("binned_ev", ds, ev_tokenizer=_DummyEVTokenizer())
     out = collate(np.array([0, 1, 2], dtype=np.int64))
     # tokens
     assert out["tokens"].shape == (3, 16)
     # branch_values/mask are UDLR and unchanged
     evs = out["branch_values"].numpy()[0].tolist()
     mask = out["branch_mask"].numpy()[0].tolist()
-    assert evs == [0.9, 0.2, 0.3, 0.4], f"Expected UDLR values, got {evs}"
+    assert np.allclose(evs, [0.9, 0.2, 0.3, 0.4], atol=1e-6), f"Expected UDLR values, got {evs}"
     assert mask == [True, True, True, True], "Legal mask should be all True"
 
     # Hard-move labels are already UDLR
-    collate_h = make_collate_steps("hard_move", ds, binner=None, ev_tokenizer=None)
+    collate_h = make_collate_steps("hard_move", ds, ev_tokenizer=None)
     out_h = collate_h(np.array([0], dtype=np.int64))
     assert int(out_h["move_targets"][0].item()) == 3, "Expected Right→class 3 under UDLR"
 
@@ -129,9 +134,9 @@ def test_legacy_steps_fields_equivalence() -> None:
     ds_new = _DummyDS(rows_new)
     ds_legacy = _DummyDS(rows_legacy)
 
-    collate = make_collate_steps("hard_move", ds_new, binner=None, ev_tokenizer=None)
+    collate = make_collate_steps("hard_move", ds_new, ev_tokenizer=None)
     out_new = collate(np.array([0, 1], dtype=np.int64))
-    collate2 = make_collate_steps("hard_move", ds_legacy, binner=None, ev_tokenizer=None)
+    collate2 = make_collate_steps("hard_move", ds_legacy, ev_tokenizer=None)
     out_legacy = collate2(np.array([0, 1], dtype=np.int64))
 
     assert torch.equal(out_new["move_targets"], out_legacy["move_targets"])  # exact match
@@ -140,15 +145,18 @@ def test_legacy_steps_fields_equivalence() -> None:
 
 
 def test_macroxue_collate_targets(tmp_path: Path) -> None:
-    # Minimal tokenizer spec with simple edges and one valuation type
+    # Minimal v2 tokenizer spec with simple edges
+    num_bins = 3
+    edges = [-1000.0, -500.0, -100.0, 0.0]
     spec = {
-        "version": 1,
-        "quantile_count": 5,
-        "actions": ["up", "left", "right", "down"],
-        "valuation_types": ["top_score"],
-        "ecdf_knots": {"top_score": [0.0, 0.5, 1.0]},
-        "delta_edges": [0.0, 0.25, 0.5, 0.75, 1.0],
-        "percentile_grid": "uniform_0_1",
+        "tokenizer_type": "macroxue_ev_advantage_v2",
+        "version": 2,
+        "num_bins": num_bins,
+        "vocab_order": ["ILLEGAL", "FAILURE"] + [f"BIN_{i}" for i in range(num_bins)] + ["WINNER"],
+        "valuation_types": ["search", "tuple10", "tuple11"],
+        "search": {"bin_edges": edges, "failure_cutoff": -1500},
+        "tuple10": {"bin_edges": edges},
+        "tuple11": {"bin_edges": edges},
     }
     spec_path = tmp_path / "tok.json"
     spec_path.write_text(json.dumps(spec))
@@ -159,25 +167,30 @@ def test_macroxue_collate_targets(tmp_path: Path) -> None:
         ("branch_evs", (np.float32, (4,))),
         ("ev_legal", np.uint8),
         ("valuation_type", np.int64),
+        ("move_dir", np.uint8),
+        ("board_eval", np.int64),
     ])
     rows = np.zeros((2,), dtype=rows_dt)
     rows["board"] = 0
     rows["tile_65536_mask"] = 0
-    rows["valuation_type"] = 0  # top_score
+    rows["valuation_type"] = 0  # search
+    rows["board_eval"] = 0
     # UDLR EVs -> Up best, others smaller
     rows["branch_evs"][0] = np.array([1.0, 0.5, 0.25, 0.0], dtype=np.float32)
     rows["ev_legal"][0] = np.uint8(0xF)
+    rows["move_dir"][0] = np.uint8(0)
     # One illegal branch: Right -> bit 1<<3 zeroed
     rows["branch_evs"][1] = np.array([0.6, 0.4, 0.3, 0.2], dtype=np.float32)
     rows["ev_legal"][1] = np.uint8(0x7)  # 0111b = U,D,L legal; Right illegal
+    rows["move_dir"][1] = np.uint8(0)
 
     ds = _DummyDS(rows, dataset_dir=str(tmp_path))
     collate = make_collate_macroxue(ds, str(spec_path))
     out = collate(np.array([0, 1], dtype=np.int64))
     targets = out["targets"].numpy()
-    n_classes = int(out["n_classes"])  # bins + 2
-    winner = n_classes - 1
-    illegal = n_classes - 2
+    n_classes = int(out["n_classes"])
+    winner = 2 + num_bins
+    illegal = 0
 
     # Row 0: Up best → winner in col 0 (UDLR)
     assert int(targets[0, 0]) == winner

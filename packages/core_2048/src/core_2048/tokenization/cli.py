@@ -1,4 +1,14 @@
-"""CLI entrypoint for fitting the Macroxue v2 tokenizer on packed datasets."""
+"""CLI entrypoint for fitting the Macroxue v2 tokenizer on packed datasets.
+
+This module provides a command-line interface to train the Macroxue advantage tokenizer
+from packed 2048 game datasets. The tokenizer bins continuous heuristic values into
+discrete tokens for transformer training.
+
+Example usage:
+    uv run --locked tokenizer-macroxue data/packed --output tokenizer.json --num-bins 32
+
+The output tokenizer.json can then be used during training to encode advantage values.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +17,15 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .macroxue import fit_macroxue_tokenizer_v2
+from core_2048.tokenization.macroxue import fit_macroxue_tokenizer_v2
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser for the tokenizer CLI.
+
+    Returns:
+        argparse.ArgumentParser: Configured parser with all tokenizer options.
+    """
     parser = argparse.ArgumentParser(
         description="Fit the Macroxue advantage tokenizer (v2) from a packed dataset"
     )
@@ -69,6 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
+    """Main entry point for the tokenizer CLI.
+
+    Args:
+        argv: Optional argument list. If None, uses sys.argv.
+    """
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -90,6 +110,15 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     meta_summary["search_failure_cutoff"] = spec.search.failure_cutoff
 
     def _fmt_stats(name: str, stats: dict) -> str:
+        """Format statistics dictionary for console output.
+
+        Args:
+            name: Name of the statistics group.
+            stats: Dictionary containing statistics.
+
+        Returns:
+            Formatted string for display.
+        """
         return (
             f"{name}: rows={stats.get('rows', 'n/a')}, legal={stats.get('legal_branches', 'n/a')}, "
             f"failure={stats.get('failure_branches', 'n/a')}, zero={stats.get('zero_disadvantage', 'n/a')}"
