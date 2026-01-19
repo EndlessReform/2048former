@@ -19,6 +19,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 import json
 import grpc  # type: ignore
+from rich.console import Console
+from rich.table import Table
 
 
 @dataclass
@@ -160,7 +162,7 @@ def _collect_run_metrics(results_file: Path) -> dict:
     import statistics
     if not scores:
         return {"games": 0}
-    thresholds = [1024, 2048, 4096, 8192, 16384, 32768]
+    thresholds = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
     reached_counts = {thr: sum(1 for t in tops if t >= thr) for thr in thresholds}
     return {
         "games": len(scores),
@@ -176,28 +178,38 @@ def _collect_run_metrics(results_file: Path) -> dict:
     }
 
 
+def _build_summary_table(metrics: dict, title: str) -> Table:
+    table = Table(title=title, show_header=False)
+    table.add_column("Metric", style="bold")
+    table.add_column("Value")
+    games = int(metrics.get("games", 0) or 0)
+    if games == 0:
+        table.add_row("games", "0")
+        return table
+    table.add_row("games", str(games))
+    table.add_row(
+        "scores",
+        f"mean {metrics['score_mean']:.2f}  max {metrics['score_max']}  min {metrics['score_min']}",
+    )
+    table.add_row(
+        "steps",
+        f"mean {metrics['steps_mean']:.2f}  max {metrics['steps_max']}  min {metrics['steps_min']}",
+    )
+    thresholds = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    reached = ", ".join(
+        f"{thr}: {int(metrics.get(f'reach_{thr}', 0))}/{games}" for thr in thresholds
+    )
+    table.add_row("reached", reached)
+    table.add_row("top tile", f"max {metrics['top_max']}  min {metrics['top_min']}")
+    return table
+
+
 def _format_summary_text(results_file: Path, title: str = "Benchmark Summary (client/server)") -> str:
     m = _collect_run_metrics(results_file)
-    lines: list[str] = []
-    lines.append("\n=== " + title + " ===")
-    games = int(m.get("games", 0) or 0)
-    if games == 0:
-        lines.append("games: 0")
-        return "\n".join(lines)
-    lines.append(f"games: {games}")
-    lines.append(
-        f"scores    -> mean: {m['score_mean']:.2f}  max: {m['score_max']}  min: {m['score_min']}"
-    )
-    lines.append(
-        f"steps     -> mean: {m['steps_mean']:.2f}  max: {m['steps_max']}  min: {m['steps_min']}"
-    )
-    thresholds = [1024, 2048, 4096, 8192, 16384, 32768]
-    lines.append(
-        "reached   -> "
-        + ", ".join(f"{thr}: {int(m.get(f'reach_{thr}', 0))}/{games}" for thr in thresholds)
-    )
-    lines.append(f"top tile  -> max: {m['top_max']}  min: {m['top_min']}")
-    return "\n".join(lines)
+    table = _build_summary_table(m, title)
+    console = Console(record=True)
+    console.print(table)
+    return console.export_text()
 
 
 def _write_grid_csv_summary(outdir: Path, rows: list[dict]) -> None:
@@ -220,6 +232,7 @@ def _write_grid_csv_summary(outdir: Path, rows: list[dict]) -> None:
         "reach_8192",
         "reach_16384",
         "reach_32768",
+        "reach_65536",
     ]
     path = outdir / "grid_summary.csv"
     with open(path, "w", encoding="utf-8") as fp:
@@ -442,9 +455,7 @@ def start_client(client_cfg: Path, release: bool) -> int:
 
 
 def summarize_results(results_file: Path) -> str:
-    text = _format_summary_text(results_file)
-    print(text)
-    return text
+    return _format_summary_text(results_file)
 
 
 def main() -> None:
@@ -608,7 +619,6 @@ def main() -> None:
                         header = f"[bench] Summary for {label}"
                         print("\n" + header)
                         text = _format_summary_text(res_file, title=f"Benchmark Summary (client/server) — {label}")
-                        print(text)
                         fp.write(header + "\n")
                         fp.write(text + "\n")
 

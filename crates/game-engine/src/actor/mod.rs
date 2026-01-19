@@ -1,15 +1,15 @@
 use crate::config;
 use crate::ds_writer::StepRow as DsStepRow;
 use crate::feeder::{FeederHandle, InferenceOutput};
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
-use twenty48_utils::engine as GameEngine;
-use twenty48_utils::engine::{Board, Move};
+use twenty48_utils::engine::Move;
+use twenty48_utils::engine::merge_reward_exps;
 
 pub mod strategies;
 
@@ -18,7 +18,7 @@ pub mod strategies;
 pub struct GameActor {
     pub game_id: u32,
     pub handle: FeederHandle,
-    pub board: Board,
+    pub board: PackedBoard,
     pub seed: u64,
     pub sampling: config::SamplingStrategy,
     pub head_order: config::HeadOrder,
@@ -74,6 +74,53 @@ pub struct GameResult {
     pub highest_tile: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PackedBoard {
+    packed: u64,
+    tile_65536_mask: u16,
+}
+
+impl PackedBoard {
+    pub fn empty() -> Self {
+        Self {
+            packed: 0,
+            tile_65536_mask: 0,
+        }
+    }
+
+    pub fn from_exps(exps: &[u8; 16]) -> Self {
+        let mut packed = 0u64;
+        let mut mask = 0u16;
+        for (i, &exp) in exps.iter().enumerate() {
+            let mut nib = exp;
+            if nib >= 16 {
+                mask |= 1 << i;
+                nib = 15;
+            }
+            let shift = (15 - i) * 4;
+            packed |= (nib as u64 & 0xF) << shift;
+        }
+        Self {
+            packed,
+            tile_65536_mask: mask,
+        }
+    }
+
+    pub fn to_exps(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for idx in 0..16 {
+            let shift = (15 - idx) * 4;
+            let nib = ((self.packed >> shift) & 0xF) as u8;
+            out[idx] = if (self.tile_65536_mask >> idx) & 1 == 1 {
+                16
+            } else {
+                nib
+            };
+        }
+        out
+    }
+}
+
 impl GameActor {
     pub fn new(
         game_id: u32,
@@ -88,9 +135,10 @@ impl GameActor {
     ) -> Self {
         // Initialize a fresh board with two random tiles
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut board: Board = Board::EMPTY;
-        board = board.with_random_tile(&mut rng);
-        board = board.with_random_tile(&mut rng);
+        let mut exps = [0u8; 16];
+        insert_random_tile(&mut exps, &mut rng);
+        insert_random_tile(&mut exps, &mut rng);
+        let board = PackedBoard::from_exps(&exps);
         Self {
             game_id,
             handle,
@@ -109,9 +157,10 @@ impl GameActor {
     pub async fn run(mut self) -> GameResult {
         let mut steps: u64 = 0;
         let mut seq: u64 = 0;
+        let mut score: u64 = 0;
         let mut rng = rand::rngs::StdRng::from_entropy();
 
-        while !self.board.is_game_over() {
+        while !is_game_over(self.board) {
             if self.cancel.is_cancelled() {
                 break;
             }
@@ -180,9 +229,17 @@ impl GameActor {
             };
 
             if let Some(m) = mv {
-                // Apply move and spawn new tile using the Board API
-                self.board = self.board.make_move(m, &mut rng);
-                steps += 1;
+                let before = self.board.to_exps();
+                let after = shift_exps(&before, m);
+                if after != before {
+                    score = score.saturating_add(merge_reward_exps(&before, m));
+                    let mut next = after;
+                    insert_random_tile(&mut next, &mut rng);
+                    self.board = PackedBoard::from_exps(&next);
+                    steps += 1;
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
@@ -193,30 +250,162 @@ impl GameActor {
             game_id: self.game_id,
             seed: self.seed,
             steps,
-            score: self.board.score(),
-            highest_tile: self.board.highest_tile() as u32,
+            score,
+            highest_tile: highest_tile(self.board),
         }
     }
 }
 
-fn board_to_exponents(b: Board, _map: config::BoardMapping) -> [u8; 16] {
-    // Canonical MSB-first mapping: cell i reads nibble (15 - i)
-    let raw = b.raw();
-    let mut out = [0u8; 16];
-    for idx in 0..16 {
-        let nib = 15 - idx;
-        out[idx] = ((raw >> (nib * 4)) & 0xF) as u8;
-    }
-    out
+fn board_to_exponents(b: PackedBoard, _map: config::BoardMapping) -> [u8; 16] {
+    b.to_exps()
 }
 
-fn legal_mask(board: Board, _order: config::HeadOrder) -> [bool; 4] {
+fn legal_mask(board: PackedBoard, _order: config::HeadOrder) -> [bool; 4] {
     // Produce mask in UDLR order
     let dirs = [Move::Up, Move::Down, Move::Left, Move::Right];
     let mut mask = [false; 4];
     for (i, &m) in dirs.iter().enumerate() {
-        let after = GameEngine::make_move(board, m);
-        mask[i] = after.raw() != board.raw();
+        let before = board.to_exps();
+        let after = shift_exps(&before, m);
+        mask[i] = after != before;
     }
     mask
+}
+
+fn is_game_over(board: PackedBoard) -> bool {
+    let exps = board.to_exps();
+    for dir in [Move::Up, Move::Down, Move::Left, Move::Right] {
+        if shift_exps(&exps, dir) != exps {
+            return false;
+        }
+    }
+    true
+}
+
+fn highest_tile(board: PackedBoard) -> u32 {
+    let max_exp = board
+        .to_exps()
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    if max_exp == 0 {
+        return 0;
+    }
+    let val = if max_exp < 64 {
+        1u64 << max_exp
+    } else {
+        u64::MAX
+    };
+    val.min(u32::MAX as u64) as u32
+}
+
+fn insert_random_tile<R: Rng + ?Sized>(board: &mut [u8; 16], rng: &mut R) {
+    let empty = board.iter().filter(|&&v| v == 0).count();
+    if empty == 0 {
+        return;
+    }
+    let mut index = rng.gen_range(0..empty);
+    for cell in board.iter_mut() {
+        if *cell != 0 {
+            continue;
+        }
+        if index == 0 {
+            *cell = if rng.gen_range(0..10) < 9 { 1 } else { 2 };
+            return;
+        }
+        index -= 1;
+    }
+}
+
+fn shift_exps(board: &[u8; 16], direction: Move) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    match direction {
+        Move::Left | Move::Right => {
+            for row in 0..4 {
+                let base = row * 4;
+                let line = [
+                    board[base],
+                    board[base + 1],
+                    board[base + 2],
+                    board[base + 3],
+                ];
+                let shifted = shift_line(line, direction);
+                out[base..base + 4].copy_from_slice(&shifted);
+            }
+        }
+        Move::Up | Move::Down => {
+            for col in 0..4 {
+                let line = [
+                    board[col],
+                    board[col + 4],
+                    board[col + 8],
+                    board[col + 12],
+                ];
+                let shifted = shift_line(line, direction);
+                out[col] = shifted[0];
+                out[col + 4] = shifted[1];
+                out[col + 8] = shifted[2];
+                out[col + 12] = shifted[3];
+            }
+        }
+    }
+    out
+}
+
+fn shift_line(line: [u8; 4], direction: Move) -> [u8; 4] {
+    let mut work = line;
+    if matches!(direction, Move::Right | Move::Down) {
+        work.reverse();
+    }
+    let shifted = shift_line_left(work);
+    if matches!(direction, Move::Right | Move::Down) {
+        let mut rev = shifted;
+        rev.reverse();
+        rev
+    } else {
+        shifted
+    }
+}
+
+fn shift_line_left(line: [u8; 4]) -> [u8; 4] {
+    let mut tiles: Vec<u8> = line.into_iter().filter(|&v| v != 0).collect();
+    let mut idx = 0usize;
+    while idx + 1 < tiles.len() {
+        if tiles[idx] == tiles[idx + 1] {
+            tiles[idx] = tiles[idx].saturating_add(1);
+            tiles.remove(idx + 1);
+        }
+        idx += 1;
+    }
+    let mut out = [0u8; 4];
+    for (i, v) in tiles.into_iter().enumerate() {
+        out[i] = v;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_board_tracks_65536_mask() {
+        let mut exps = [0u8; 16];
+        exps[5] = 16;
+        let packed = PackedBoard::from_exps(&exps);
+        assert_eq!(packed.tile_65536_mask, 1 << 5);
+        let round = packed.to_exps();
+        assert_eq!(round[5], 16);
+    }
+
+    #[test]
+    fn shift_exps_merges_to_65536() {
+        let mut exps = [0u8; 16];
+        exps[0] = 15;
+        exps[1] = 15;
+        let shifted = shift_exps(&exps, Move::Left);
+        assert_eq!(shifted[0], 16);
+        assert_eq!(merge_reward_exps(&exps, Move::Left), 1u64 << 16);
+    }
 }
