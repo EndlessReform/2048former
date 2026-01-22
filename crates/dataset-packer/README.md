@@ -8,6 +8,7 @@ Packing a directory of files:
 
 ```bash
 cargo run -p dataset-packer --release -- pack --input ../macroxue-2048-ai/selfplay_logs/d7_test_v1 --output datasets/raws/d7_test_v1 --overwrite --workers 24
+cargo run -p dataset-packer --release -- pack --input ../macroxue-2048-ai/selfplay_logs/d7_a --input ../macroxue-2048-ai/selfplay_logs/d7_b --output datasets/raws/d7_combo --overwrite --workers 24
 # Include cumulative reward in the packed schema:
 cargo run -p dataset-packer --release -- pack --input ../macroxue-2048-ai/selfplay_logs/d7_test_v1 --output datasets/raws/d7_test_v1 --overwrite --workers 24 --include-cumulative-reward
 # Compressed shards (steps-*.npy.zst):

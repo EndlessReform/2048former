@@ -28,9 +28,9 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct PackArgs {
-    /// Root directory containing *.meta.json[.gz] + *.jsonl.gz files
-    #[arg(long, value_name = "DIR")]
-    input: PathBuf,
+    /// Root directories containing *.meta.json[.gz] + *.jsonl.gz files
+    #[arg(long, value_name = "DIR", num_args = 1..)]
+    input: Vec<PathBuf>,
 
     /// Output directory for steps.npy, metadata.db, valuation_types.json
     #[arg(long, value_name = "DIR")]
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Pack(args) => {
             let options = PackOptions {
-                input_root: args.input,
+                input_roots: args.input,
                 output_dir: args.output,
                 rows_per_shard: args.shard_rows.filter(|&n| n > 0),
                 max_workers: args.workers,

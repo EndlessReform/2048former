@@ -198,17 +198,16 @@ def move_model_to_device(
     if device.type == "cuda":
         if use_fp32_master_weights:
             model = model.to(device=device, dtype=torch.float32)
-            # Workaround for PyTorch bug: RMSNorm doesn't dispatch to fused kernel
-            # when input dtype != weight dtype under autocast. Unlike LayerNorm,
-            # RMSNorm is not in autocast's eligible op list, so it can't auto-cast.
-            # This causes torch.compile to hang with fp32 master weights + bf16 autocast.
-            # Cast norm layers AND embeddings to bf16 so dtypes stay consistent.
-            # These small params don't benefit from fp32 master weights anyway.
-            # See: https://github.com/pytorch/pytorch/issues/167308
+            # Cast embeddings to bf16 for memory efficiency. Embeddings are large
+            # and don't suffer from bf16 precision issues since their updates
+            # are spread across many parameters (not concentrated around 1.0).
+            #
+            # NOTE: Do NOT cast RMSNorm/LayerNorm weights to bf16. Their weights
+            # are initialized to 1.0 and receive small gradient updates (~1e-3).
+            # In bf16, 1.0 - 0.001 rounds back to 1.0, so norm weights never
+            # update and remain stuck at their initial values.
             for module in model.modules():
-                if isinstance(
-                    module, (torch.nn.RMSNorm, torch.nn.LayerNorm, torch.nn.Embedding)
-                ):
+                if isinstance(module, torch.nn.Embedding):
                     module.to(dtype=torch.bfloat16)
             return model
         return model.to(device=device, dtype=torch.bfloat16)
@@ -378,7 +377,11 @@ def make_scheduler(
         if lr_cfg.name == "linear-decay-then-cosine":
             linear_end = int(lr_cfg.linear_steps or 0)
             linear_start = int(lr_cfg.linear_start_step)
-            inter_ratio = float(lr_cfg.intermediate_ratio if lr_cfg.intermediate_ratio is not None else 1.0)
+            inter_ratio = float(
+                lr_cfg.intermediate_ratio
+                if lr_cfg.intermediate_ratio is not None
+                else 1.0
+            )
 
             if step_idx < linear_start:
                 return 1.0
@@ -393,11 +396,17 @@ def make_scheduler(
             progress = min(step_idx - linear_end, cosine_steps)
             frac = float(progress) / float(cosine_steps)
             cosine_val = 0.5 * (1.0 + math.cos(math.pi * frac))
-            return lr_cfg.min_lr_ratio + (inter_ratio - lr_cfg.min_lr_ratio) * cosine_val
+            return (
+                lr_cfg.min_lr_ratio + (inter_ratio - lr_cfg.min_lr_ratio) * cosine_val
+            )
         if lr_cfg.name == "linear-decay-then-stable":
             linear_end = int(lr_cfg.linear_steps or 0)
             linear_start = int(lr_cfg.linear_start_step)
-            inter_ratio = float(lr_cfg.intermediate_ratio if lr_cfg.intermediate_ratio is not None else 1.0)
+            inter_ratio = float(
+                lr_cfg.intermediate_ratio
+                if lr_cfg.intermediate_ratio is not None
+                else 1.0
+            )
 
             if step_idx < linear_start:
                 return 1.0

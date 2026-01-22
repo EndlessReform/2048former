@@ -22,8 +22,8 @@ use super::types::{MetaRecord, ValuationEncoder};
 /// Configuration for packing raw Macroxue JSON logs into the training layout.
 #[derive(Clone, Debug)]
 pub struct PackOptions {
-    /// Root directory containing `*.meta.json[.gz]` and `*.jsonl.gz` files.
-    pub input_root: PathBuf,
+    /// Root directories containing `*.meta.json[.gz]` and `*.jsonl.gz` files.
+    pub input_roots: Vec<PathBuf>,
     /// Output directory for `steps-*.npy`, `metadata.db`, and `valuation_types.json`.
     pub output_dir: PathBuf,
     /// Maximum rows per shard (omit or `None` to emit a single `steps.npy`).
@@ -55,22 +55,18 @@ pub fn pack_dataset(opts: PackOptions) -> Result<PackSummary> {
     if opts.rows_per_shard == Some(0) {
         bail!("rows_per_shard must be > 0 when specified");
     }
-    if !opts.input_root.exists() {
-        bail!(
-            "input directory '{}' does not exist",
-            opts.input_root.display()
-        );
-    }
+    validate_input_roots(&opts.input_roots)?;
     fs::create_dir_all(&opts.output_dir)
         .with_context(|| format!("failed to create output dir {}", opts.output_dir.display()))?;
 
-    let runs = discover_runs(&opts.input_root)?;
+    let runs = discover_runs_multi(&opts.input_roots)?;
     if runs.is_empty() {
         bail!(
             "no .meta.json files found under {}",
-            opts.input_root.display()
+            format_input_roots(&opts.input_roots)
         );
     }
+    ensure_unique_seeds(&runs)?;
 
     info!("Discovered {} runs", runs.len());
     let pb = default_progress_bar(runs.len() as u64);
@@ -245,6 +241,124 @@ fn discover_runs(root: &Path) -> Result<Vec<RunInput>> {
     }
     runs.sort_by(|a, b| a.meta_path.cmp(&b.meta_path));
     Ok(runs)
+}
+
+fn discover_runs_multi(roots: &[PathBuf]) -> Result<Vec<RunInput>> {
+    let mut runs = Vec::new();
+    for root in roots {
+        runs.extend(discover_runs(root)?);
+    }
+    runs.sort_by(|a, b| a.meta_path.cmp(&b.meta_path));
+    Ok(runs)
+}
+
+fn validate_input_roots(roots: &[PathBuf]) -> Result<()> {
+    if roots.is_empty() {
+        bail!("at least one input directory is required");
+    }
+    let mut missing = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            missing.push(root);
+        }
+    }
+    if !missing.is_empty() {
+        let formatted = missing
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("input directories missing or not directories: {formatted}");
+    }
+    Ok(())
+}
+
+fn format_input_roots(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn ensure_unique_seeds(runs: &[RunInput]) -> Result<()> {
+    let mut seen = std::collections::HashMap::<u64, PathBuf>::new();
+    for run in runs {
+        let meta_content = read_json_text(&run.meta_path)?;
+        let meta: MetaRecord = serde_json::from_str(&meta_content)
+            .with_context(|| format!("failed to parse {}", run.meta_path.display()))?;
+        if let Some(prev) = seen.insert(meta.seed, run.meta_path.clone()) {
+            bail!(
+                "duplicate seed {} detected ({} and {}); overlapping seed+step is not allowed",
+                meta.seed,
+                prev.display(),
+                run.meta_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+
+    fn write_run(dir: &Path, name: &str, seed: u64) -> Result<()> {
+        let meta_path = dir.join(format!("{name}.meta.json"));
+        let mut meta = File::create(&meta_path)?;
+        writeln!(
+            meta,
+            "{{\"seed\":{seed},\"num_moves\":1,\"score\":0,\"max_tile\":2}}"
+        )?;
+        let steps_path = dir.join(format!("{name}.jsonl.gz"));
+        let _steps = File::create(&steps_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn discover_runs_across_multiple_roots() -> Result<()> {
+        let root_a = tempfile::tempdir()?;
+        let root_b = tempfile::tempdir()?;
+        write_run(root_a.path(), "a_run", 1)?;
+        write_run(root_b.path(), "b_run", 2)?;
+
+        let runs = discover_runs_multi(&vec![
+            root_a.path().to_path_buf(),
+            root_b.path().to_path_buf(),
+        ])?;
+        assert_eq!(runs.len(), 2);
+        assert!(runs.windows(2).all(|w| w[0].meta_path <= w[1].meta_path));
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_unique_seeds_errors_on_duplicates() -> Result<()> {
+        let root_a = tempfile::tempdir()?;
+        let root_b = tempfile::tempdir()?;
+        write_run(root_a.path(), "a_run", 42)?;
+        write_run(root_b.path(), "b_run", 42)?;
+
+        let runs = discover_runs_multi(&vec![
+            root_a.path().to_path_buf(),
+            root_b.path().to_path_buf(),
+        ])?;
+        let err = ensure_unique_seeds(&runs).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("duplicate seed"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_input_roots_errors_on_missing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let missing = root.path().join("nope");
+        let err = validate_input_roots(&[root.path().to_path_buf(), missing.clone()]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(&missing.display().to_string()));
+        Ok(())
+    }
 }
 
 fn is_meta_filename(name: &str) -> bool {
