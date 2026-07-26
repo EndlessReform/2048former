@@ -6,9 +6,10 @@ import numpy as np
 from torch.utils.data import Sampler
 
 from .shard_loader import ShardLoader, InMemoryShardPool
+from .dataset import SampleRef, SamplerCursor
 
 
-class ShardPoolSampler(Sampler[int]):
+class ShardPoolSampler(Sampler[int | SampleRef]):
     """Sample random steps from shards loaded sequentially into RAM.
 
     Strategy:
@@ -34,6 +35,7 @@ class ShardPoolSampler(Sampler[int]):
         run_ids: Optional[np.ndarray] = None,
         total_steps: Optional[int] = None,
         skip: int = 0,
+        resume_cursor: Optional[dict] = None,
     ):
         """
         Args:
@@ -57,15 +59,28 @@ class ShardPoolSampler(Sampler[int]):
         if self.skip > self._total_length:
             self.skip = self.skip % self._total_length if self._total_length > 0 else 0
         self._skip_remaining = self.skip
+        self._resume_cursor = SamplerCursor.from_dict(resume_cursor)
+        if resume_cursor is not None and self._resume_cursor is None:
+            raise ValueError("Invalid shard sampler resume cursor")
+        if self._resume_cursor is not None and self._resume_cursor.seed != self.seed:
+            raise ValueError("Sampler resume cursor seed does not match training seed")
+        if self._resume_cursor is not None:
+            self._skip_remaining = 0
 
-    def __iter__(self) -> Iterator[int]:
-        rng = np.random.default_rng(self.seed)
+    def __iter__(self) -> Iterator[int | SampleRef]:
         skip_remaining = self._skip_remaining
         self._skip_remaining = 0
 
-        for epoch in range(self.num_epochs):
+        resume_cursor = self._resume_cursor
+        self._resume_cursor = None
+        start_epoch = resume_cursor.epoch if resume_cursor else 0
+        start_shard = resume_cursor.shard if resume_cursor else 0
+        start_position = resume_cursor.position if resume_cursor else 0
+
+        for epoch in range(start_epoch, self.num_epochs):
             # Iterate through all shards sequentially
-            for shard_idx in range(len(self.loader.shards)):
+            first_shard = start_shard if epoch == start_epoch else 0
+            for shard_idx in range(first_shard, len(self.loader.shards)):
                 # Load shard fully into RAM
                 self.pool.load_shard_for_sampling(shard_idx)
                 shard_data = self.pool.current_shard
@@ -80,15 +95,38 @@ class ShardPoolSampler(Sampler[int]):
                 else:
                     eligible_indices = np.arange(len(shard_data))
 
-                # Shuffle the eligible indices for this shard
+                # Each shard permutation is independently reproducible, so a
+                # cursor can restart here without replaying earlier shards.
+                rng = np.random.default_rng(
+                    np.random.SeedSequence([self.seed, epoch, shard_idx])
+                )
                 rng.shuffle(eligible_indices)
 
                 # Yield all shuffled indices from this shard
-                for local_idx in eligible_indices:
+                first_position = (
+                    start_position
+                    if epoch == start_epoch and shard_idx == start_shard
+                    else 0
+                )
+                if first_position > len(eligible_indices):
+                    raise ValueError(
+                        "Sampler resume cursor position exceeds eligible shard rows"
+                    )
+                for position, local_idx in enumerate(eligible_indices):
+                    if position < first_position:
+                        continue
                     if skip_remaining > 0:
                         skip_remaining -= 1
                         continue
-                    yield int(local_idx + shard_offset)
+                    yield SampleRef(
+                        global_index=int(local_idx + shard_offset),
+                        next_cursor=SamplerCursor(
+                            seed=self.seed,
+                            epoch=epoch,
+                            shard=shard_idx,
+                            position=position + 1,
+                        ),
+                    )
 
     def __len__(self) -> int:
         if self._total_length == 0:

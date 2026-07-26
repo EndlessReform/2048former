@@ -330,9 +330,16 @@ def make_scheduler(
 ) -> tuple[Callable[[int], float], Callable[[float], float], dict]:
     """Return schedule scaling and apply functions plus schedule metadata."""
     lr_cfg = cfg.hyperparameters.lr_schedule
-    base_lrs = [
-        pg.get("lr", cfg.hyperparameters.learning_rate) for pg in optimizer.param_groups
-    ]
+    base_lrs = []
+    for param_group in optimizer.param_groups:
+        configured_lr = (
+            float(cfg.hyperparameters.muon_lr or 2e-2)
+            if param_group.get("use_muon", False)
+            else float(cfg.hyperparameters.learning_rate)
+        )
+        base_lr = float(param_group.get("initial_lr", configured_lr))
+        param_group["initial_lr"] = base_lr
+        base_lrs.append(base_lr)
 
     total_steps = max(total_steps, 0)
     warmup_steps = int(lr_cfg.warmup_steps or 0)

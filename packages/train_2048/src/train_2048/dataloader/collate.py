@@ -45,6 +45,36 @@ def _flip_settings(flip_augment: Optional[object]) -> tuple[str, Optional[int], 
     return str(mode), seed, allow_noop
 
 
+def _stateless_augmentation_choices(
+    keys: np.ndarray,
+    *,
+    seed: int,
+    choices: int,
+    allow_noop: bool,
+    domain: int,
+) -> np.ndarray:
+    """Map sampler cursor keys to deterministic per-row augmentation choices."""
+    values = np.asarray(keys, dtype=np.uint64)
+    if values.ndim != 2 or values.shape[1] != 3:
+        raise ValueError("augmentation keys must have shape [batch, 3]")
+    with np.errstate(over="ignore"):
+        mixed = (
+            np.uint64(seed)
+            ^ np.uint64(domain)
+            ^ values[:, 0] * np.uint64(0x9E3779B185EBCA87)
+            ^ values[:, 1] * np.uint64(0xC2B2AE3D27D4EB4F)
+            ^ values[:, 2] * np.uint64(0x165667B19E3779F9)
+        )
+        mixed ^= mixed >> np.uint64(30)
+        mixed *= np.uint64(0xBF58476D1CE4E5B9)
+        mixed ^= mixed >> np.uint64(27)
+        mixed *= np.uint64(0x94D049BB133111EB)
+        mixed ^= mixed >> np.uint64(31)
+    low = 0 if allow_noop else 1
+    width = choices - low
+    return (mixed % np.uint64(width) + np.uint64(low)).astype(np.int8)
+
+
 def make_collate_macroxue(
     dataset,
     tokenizer_path: str,
@@ -378,6 +408,7 @@ def make_collate_macroxue_worker_safe(
     flip_augment: Optional[object] = None,
     shard_loader: Optional[object] = None,
     shard_loader_kwargs: Optional[dict] = None,
+    augmentation_seed: Optional[int] = None,
 ) -> Callable:
     """Worker-safe collate that creates its own shard loader per worker.
 
@@ -469,7 +500,7 @@ def make_collate_macroxue_worker_safe(
             _flip_rng_holder[0] = make_flip_rng(flip_seed)
         return _flip_rng_holder[0]
 
-    def _collate(batch_indices):
+    def _collate(batch_indices, *, augmentation_keys=None):
         import numpy as _np
 
         loader = _get_loader()
@@ -491,11 +522,20 @@ def make_collate_macroxue_worker_safe(
         if rotation_mode != "none":
             if rotation_mode != "random_k":
                 raise ValueError(f"Unknown rotation_augment mode: {rotation_mode}")
-            rotation_k = sample_rotation_k(
-                len(idxs),
-                rng=_get_rotation_rng(),
-                allow_noop=rotation_allow_noop,
-            )
+            if augmentation_keys is None:
+                rotation_k = sample_rotation_k(
+                    len(idxs),
+                    rng=_get_rotation_rng(),
+                    allow_noop=rotation_allow_noop,
+                )
+            else:
+                rotation_k = _stateless_augmentation_choices(
+                    augmentation_keys,
+                    seed=int(rotation_seed if rotation_seed is not None else augmentation_seed or 0),
+                    choices=4,
+                    allow_noop=rotation_allow_noop,
+                    domain=0x524F5441,
+                )
             if _np.any(rotation_k != 0):
                 exps = rotate_board_exps(exps, rotation_k)
                 branch_evs = rotate_branch_udlr(branch_evs, rotation_k)
@@ -505,11 +545,20 @@ def make_collate_macroxue_worker_safe(
         if flip_mode != "none":
             if flip_mode != "random_axis":
                 raise ValueError(f"Unknown flip_augment mode: {flip_mode}")
-            flip_axis = sample_flip_axis(
-                len(idxs),
-                rng=_get_flip_rng(),
-                allow_noop=flip_allow_noop,
-            )
+            if augmentation_keys is None:
+                flip_axis = sample_flip_axis(
+                    len(idxs),
+                    rng=_get_flip_rng(),
+                    allow_noop=flip_allow_noop,
+                )
+            else:
+                flip_axis = _stateless_augmentation_choices(
+                    augmentation_keys,
+                    seed=int(flip_seed if flip_seed is not None else augmentation_seed or 0),
+                    choices=3,
+                    allow_noop=flip_allow_noop,
+                    domain=0x464C4950,
+                )
             if _np.any(flip_axis != 0):
                 exps = flip_board_exps(exps, flip_axis)
                 branch_evs = flip_branch_udlr(branch_evs, flip_axis)
@@ -587,6 +636,7 @@ def make_collate_steps_worker_safe(
     flip_augment: Optional[object] = None,
     shard_loader: Optional[object] = None,
     shard_loader_kwargs: Optional[dict] = None,
+    augmentation_seed: Optional[int] = None,
 ) -> Callable:
     """Worker-safe collate for regular steps datasets.
 
@@ -640,7 +690,7 @@ def make_collate_steps_worker_safe(
             _flip_rng_holder[0] = make_flip_rng(flip_seed)
         return _flip_rng_holder[0]
 
-    def _collate(batch_indices):
+    def _collate(batch_indices, *, augmentation_keys=None):
         import numpy as _np
 
         loader = _get_loader()
@@ -666,11 +716,20 @@ def make_collate_steps_worker_safe(
         if rotation_mode != "none":
             if rotation_mode != "random_k":
                 raise ValueError(f"Unknown rotation_augment mode: {rotation_mode}")
-            rotation_k = sample_rotation_k(
-                len(idxs),
-                rng=_get_rotation_rng(),
-                allow_noop=rotation_allow_noop,
-            )
+            if augmentation_keys is None:
+                rotation_k = sample_rotation_k(
+                    len(idxs),
+                    rng=_get_rotation_rng(),
+                    allow_noop=rotation_allow_noop,
+                )
+            else:
+                rotation_k = _stateless_augmentation_choices(
+                    augmentation_keys,
+                    seed=int(rotation_seed if rotation_seed is not None else augmentation_seed or 0),
+                    choices=4,
+                    allow_noop=rotation_allow_noop,
+                    domain=0x524F5441,
+                )
             if _np.any(rotation_k != 0):
                 exps_np = rotate_board_exps(exps_np, rotation_k)
                 evs = rotate_branch_udlr(evs, rotation_k)
@@ -680,11 +739,20 @@ def make_collate_steps_worker_safe(
         if flip_mode != "none":
             if flip_mode != "random_axis":
                 raise ValueError(f"Unknown flip_augment mode: {flip_mode}")
-            flip_axis = sample_flip_axis(
-                len(idxs),
-                rng=_get_flip_rng(),
-                allow_noop=flip_allow_noop,
-            )
+            if augmentation_keys is None:
+                flip_axis = sample_flip_axis(
+                    len(idxs),
+                    rng=_get_flip_rng(),
+                    allow_noop=flip_allow_noop,
+                )
+            else:
+                flip_axis = _stateless_augmentation_choices(
+                    augmentation_keys,
+                    seed=int(flip_seed if flip_seed is not None else augmentation_seed or 0),
+                    choices=3,
+                    allow_noop=flip_allow_noop,
+                    domain=0x464C4950,
+                )
             if _np.any(flip_axis != 0):
                 exps_np = flip_board_exps(exps_np, flip_axis)
                 evs = flip_branch_udlr(evs, flip_axis)

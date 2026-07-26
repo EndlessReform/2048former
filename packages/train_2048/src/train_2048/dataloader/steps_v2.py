@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from math import ceil
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import os
 
 import numpy as np
 from torch.utils.data import DataLoader
 
 from .shard_loader import ShardLoader, _read_npy_header
-from .dataset import ShardDataset
+from .dataset import SampleRef, ShardDataset
 from .metadata import MetadataDB
 from .samplers import ShardPoolSampler, BufferedShuffleSampler, SequentialSampler
 from .collate import make_collate_macroxue, make_collate_steps
@@ -33,6 +33,37 @@ class _ArrayLoader:
 
     def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
         return self.rows[global_indices]
+
+
+def _with_sampler_cursor(collate_fn: Callable) -> Callable:
+    """Attach the cursor returned with the last consumed item in a batch."""
+
+    def _collate(batch_items):
+        cursor = None
+        if batch_items and isinstance(batch_items[0], SampleRef):
+            if not all(isinstance(item, SampleRef) for item in batch_items):
+                raise TypeError("Mixed cursor and integer sample references")
+            cursor = batch_items[-1].next_cursor.as_dict()
+            augmentation_keys = np.array(
+                [
+                    (
+                        item.next_cursor.epoch,
+                        item.next_cursor.shard,
+                        item.next_cursor.position,
+                    )
+                    for item in batch_items
+                ],
+                dtype=np.uint64,
+            )
+            batch_items = [item.global_index for item in batch_items]
+            batch = collate_fn(batch_items, augmentation_keys=augmentation_keys)
+        else:
+            batch = collate_fn(batch_items)
+        if cursor is not None:
+            batch["_data_cursor"] = cursor
+        return batch
+
+    return _collate
 
 
 def _materialize_validation_rows(
@@ -88,6 +119,7 @@ def build_steps_dataloaders(
     train_num_steps: Optional[int] = None,
     num_epochs: Optional[int] = None,
     resume_skip_samples: int = 0,
+    resume_data_cursor: Optional[dict] = None,
     seed: int = 42,
     shuffle: bool = False,
     shuffle_buffer_size: int = 1_000_000,
@@ -267,6 +299,7 @@ def build_steps_dataloaders(
             flip_augment=flip_augment,
             shard_loader=pass_loader,
             shard_loader_kwargs=loader_kwargs,
+            augmentation_seed=seed,
         )
     else:
         from .collate import make_collate_steps_worker_safe
@@ -278,12 +311,17 @@ def build_steps_dataloaders(
             flip_augment=flip_augment,
             shard_loader=pass_loader,
             shard_loader_kwargs=loader_kwargs,
+            augmentation_seed=seed,
         )
 
     # Build training dataloader
     effective_batch_size = int(batch_size)
     loader_batch_size = int(physical_batch_size or batch_size)
     skip_samples = max(0, int(resume_skip_samples or 0))
+    if resume_data_cursor is not None:
+        if not shard_locality:
+            raise ValueError("A committed data cursor requires shard_locality=true")
+        skip_samples = 0
     if skip_samples > 0:
         skipped_steps = skip_samples / max(1, loader_batch_size)
         print(
@@ -350,6 +388,7 @@ def build_steps_dataloaders(
                 run_ids=train_run_ids,
                 total_steps=meta_train_steps,  # Trust metadata!
                 skip=skip_samples,
+                resume_cursor=resume_data_cursor,
             )
             # Dataset length is determined by sampler
             train_dataset = ShardDataset(shard_loader, len(train_sampler))
@@ -379,6 +418,7 @@ def build_steps_dataloaders(
                 run_ids=train_run_ids,
                 total_steps=meta_train_steps,  # Trust metadata!
                 skip=skip_samples,
+                resume_cursor=resume_data_cursor,
             )
             train_dataset = ShardDataset(shard_loader, len(train_sampler))
             sampler_info.update({
@@ -405,6 +445,7 @@ def build_steps_dataloaders(
                 run_ids=train_run_ids,
                 total_steps=meta_train_steps,  # Trust metadata!
                 skip=skip_samples,
+                resume_cursor=resume_data_cursor,
             )
             train_dataset = ShardDataset(shard_loader, len(train_sampler))
             sampler_info.update({
@@ -448,6 +489,7 @@ def build_steps_dataloaders(
         # This should never be reached due to safety check above
         raise RuntimeError("Unreachable: sequential training path should be blocked by safety check")
 
+    collate_fn = _with_sampler_cursor(collate_fn)
     prefetch_train = 8 if num_workers_train > 0 else None
     dl_train = DataLoader(
         train_dataset,

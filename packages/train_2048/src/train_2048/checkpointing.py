@@ -5,14 +5,56 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import json
+import os
+import random
 import time
 
+import numpy as np
 import torch
 from safetensors.torch import save_file as safe_save_file
 
 from .config import normalize_state_dict_keys
 
-CHECKPOINT_METADATA_VERSION = 2
+CHECKPOINT_METADATA_VERSION = 3
+
+
+def capture_runtime_state(*, grad_scaler: Optional[object] = None) -> Dict[str, Any]:
+    """Capture stochastic runtime state at a completed optimizer boundary."""
+    state: Dict[str, Any] = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_cpu_rng": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda_rng"] = torch.cuda.get_rng_state_all()
+    if grad_scaler is not None and hasattr(grad_scaler, "state_dict"):
+        state["grad_scaler"] = grad_scaler.state_dict()
+    return state
+
+
+def restore_runtime_state(
+    state: object,
+    *,
+    grad_scaler: Optional[object] = None,
+) -> bool:
+    """Restore stochastic runtime state from a resumable checkpoint."""
+    if not isinstance(state, dict):
+        return False
+    try:
+        random.setstate(state["python_random"])
+        np.random.set_state(state["numpy_random"])
+        torch.set_rng_state(state["torch_cpu_rng"])
+        if "torch_cuda_rng" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["torch_cuda_rng"])
+        if (
+            grad_scaler is not None
+            and "grad_scaler" in state
+            and hasattr(grad_scaler, "load_state_dict")
+        ):
+            grad_scaler.load_state_dict(state["grad_scaler"])
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+    return True
 
 
 @dataclass
@@ -33,6 +75,7 @@ def save_pt_bundle(
     resume_state: Optional[Dict[str, Any]] = None,
     dataset_metadata: Optional[Dict[str, Any]] = None,
     metadata_version: int = CHECKPOINT_METADATA_VERSION,
+    grad_scaler: Optional[object] = None,
 ) -> Path:
     """Persist a torch ``.pt`` bundle with weights, optimizer state, and metadata."""
 
@@ -54,8 +97,16 @@ def save_pt_bundle(
     if dataset_metadata is not None:
         payload["dataset"] = dataset_metadata
     if resume_state is not None:
-        payload["resume"] = resume_state
-    torch.save(payload, str(path))
+        payload["resume"] = dict(resume_state)
+        payload["resume"]["runtime_state"] = capture_runtime_state(
+            grad_scaler=grad_scaler
+        )
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        torch.save(payload, str(tmp_path))
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return path
 
 
@@ -179,6 +230,7 @@ def _save_stable_bundle(
     resume_state: Optional[Dict[str, Any]],
     dataset_metadata: Optional[Dict[str, Any]],
     metadata_version: int,
+    grad_scaler: Optional[object],
 ) -> None:
     """Write both safetensors and a .pt bundle for stable checkpoint.
 
@@ -197,6 +249,7 @@ def _save_stable_bundle(
             resume_state=resume_state,
             dataset_metadata=dataset_metadata,
             metadata_version=metadata_version,
+            grad_scaler=grad_scaler,
         )
     except Exception:
         pass
@@ -215,6 +268,7 @@ def maybe_save_stable(
     resume_state: Optional[Dict[str, Any]] = None,
     dataset_metadata: Optional[Dict[str, Any]] = None,
     metadata_version: int = CHECKPOINT_METADATA_VERSION,
+    grad_scaler: Optional[object] = None,
 ) -> None:
     if preflag.get("saved", False):
         return
@@ -230,6 +284,7 @@ def maybe_save_stable(
             resume_state=resume_state,
             dataset_metadata=dataset_metadata,
             metadata_version=metadata_version,
+            grad_scaler=grad_scaler,
         )
         preflag["saved"] = True
 
@@ -251,6 +306,7 @@ def maybe_save_best(
     resume_state: Optional[Dict[str, Any]] = None,
     dataset_metadata: Optional[Dict[str, Any]] = None,
     metadata_version: int = CHECKPOINT_METADATA_VERSION,
+    grad_scaler: Optional[object] = None,
 ):
     if cfg_checkpoint is None or cfg_checkpoint.save_best_every_steps is None or dl_val is None:
         return
@@ -273,6 +329,7 @@ def maybe_save_best(
                 resume_state=resume_state,
                 dataset_metadata=dataset_metadata,
                 metadata_version=metadata_version,
+                grad_scaler=grad_scaler,
             )
         except Exception as e:
             print(f"[ckpt] Failed to write best checkpoint at step {step}: {e}")
@@ -322,6 +379,7 @@ def maybe_save_pt_interval(
     resume_state: Optional[Dict[str, Any]] = None,
     dataset_metadata: Optional[Dict[str, Any]] = None,
     metadata_version: int = CHECKPOINT_METADATA_VERSION,
+    grad_scaler: Optional[object] = None,
 ) -> None:
     if interval is None or interval <= 0:
         return
@@ -338,6 +396,7 @@ def maybe_save_pt_interval(
             resume_state=resume_state,
             dataset_metadata=dataset_metadata,
             metadata_version=metadata_version,
+            grad_scaler=grad_scaler,
         )
         print(f"[ckpt] Saved step checkpoint: {path}")
     except Exception as e:
@@ -354,5 +413,7 @@ __all__ = [
     "dangerous_dump_pt",
     "maybe_resume_optimizer_from_init",
     "maybe_save_pt_interval",
+    "capture_runtime_state",
+    "restore_runtime_state",
     "ResumeState",
 ]

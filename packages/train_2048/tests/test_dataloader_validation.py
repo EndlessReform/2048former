@@ -45,7 +45,7 @@ def _write_tiny_pool(dataset_dir: Path) -> np.ndarray:
     return np.concatenate(all_rows)
 
 
-def _augmentation_config(mode: str, seed: int) -> object:
+def _augmentation_config(mode: str, seed: int | None) -> object:
     return type(
         "AugmentationConfig",
         (),
@@ -98,7 +98,10 @@ def test_validation_is_disjoint_filtered_and_deterministic(
     assert val_ids == {1, 3}
     assert train_ids.isdisjoint(val_ids)
 
-    sampled_train_indices = np.fromiter(dl_train.sampler, dtype=np.int64)
+    sampled_train_indices = np.array(
+        [ref.global_index for ref in dl_train.sampler],
+        dtype=np.int64,
+    )
     assert set(physical_rows["run_id"][sampled_train_indices].tolist()) == train_ids
 
     first_pass = list(dl_val)
@@ -155,3 +158,43 @@ def test_run_split_rejects_sampler_that_cannot_filter(tmp_path: Path) -> None:
             num_workers_train=0,
             shard_locality=False,
         )
+
+
+def _build_prefetch_loader(dataset_dir: Path, resume_cursor: dict | None = None):
+    dl_train, _, _, _ = build_steps_dataloaders(
+        str(dataset_dir),
+        "hard_move",
+        batch_size=2,
+        num_epochs=1,
+        num_workers_train=2,
+        mmap_mode=True,
+        shard_locality=True,
+        shard_cache_in_memory=False,
+        resume_data_cursor=resume_cursor,
+        rotation_augment=_augmentation_config("random_k", None),
+        flip_augment=_augmentation_config("random_axis", None),
+        seed=29,
+    )
+    return dl_train
+
+
+def test_committed_cursor_ignores_worker_prefetch(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "pool"
+    _write_tiny_pool(dataset_dir)
+
+    uninterrupted_loader = _build_prefetch_loader(dataset_dir)
+    uninterrupted = list(uninterrupted_loader)
+    expected_tokens = np.concatenate(
+        [batch["tokens"].numpy() for batch in uninterrupted],
+    )
+
+    interrupted_loader = _build_prefetch_loader(dataset_dir)
+    interrupted_iter = iter(interrupted_loader)
+    next(interrupted_iter)
+    committed_batch = next(interrupted_iter)
+    committed_cursor = committed_batch["_data_cursor"]
+
+    resumed_loader = _build_prefetch_loader(dataset_dir, committed_cursor)
+    resumed = list(resumed_loader)
+    resumed_tokens = np.concatenate([batch["tokens"].numpy() for batch in resumed])
+    assert np.array_equal(resumed_tokens, expected_tokens[4:])

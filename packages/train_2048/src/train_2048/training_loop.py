@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional
 from pathlib import Path
 import contextlib
+import signal
 import time
 
 import torch
@@ -12,10 +13,12 @@ from .checkpointing import (
     create_run_dir,
     dump_training_and_model_config,
     save_safetensors,
+    save_pt_bundle,
     maybe_save_stable,
     maybe_save_best,
     dangerous_dump_pt,
     maybe_save_pt_interval,
+    restore_runtime_state,
 )
 from .config import TrainingConfig
 from .objectives import make_objective
@@ -47,9 +50,12 @@ from .training_model import (
 )
 from .training_resume import (
     build_resume_state,
+    DataCursorTracker,
     extract_resume_metadata,
+    resolve_resume_data_cursor,
     resolve_resume_bundle_path,
     resolve_resume_skip_samples,
+    validate_resume_configuration,
     maybe_resume_optimizer_state,
 )
 
@@ -84,6 +90,7 @@ def run_training(
     apply_dropout_from_config(model, cfg.dropout)
     init_info = getattr(model, "_init_load_info", {})
     resume_payload_meta, resume_dataset_meta, resume_global_step_meta = extract_resume_metadata(init_info)
+    validate_resume_configuration(cfg, resume_payload_meta)
 
     resume_skip_samples = resolve_resume_skip_samples(
         cfg,
@@ -93,12 +100,22 @@ def run_training(
         resume_dataset_meta=resume_dataset_meta,
         resume_global_step_meta=resume_global_step_meta,
     )
+    resume_data_cursor = resolve_resume_data_cursor(
+        dataset_signature,
+        dataset_fingerprint,
+        resume_payload_meta=resume_payload_meta,
+        resume_dataset_meta=resume_dataset_meta,
+    )
+    if resume_data_cursor is not None:
+        resume_skip_samples = 0
+        print("[resume] Using committed data cursor; sample replay skipping disabled.")
 
     dl_train, dl_val, per_epoch_steps, dataloader_meta = init_datasets(
         cfg,
         target_mode,
         train_num_steps_override=cfg.dataset.num_steps,
         resume_skip_samples=resume_skip_samples,
+        resume_data_cursor=resume_data_cursor,
     )
 
     objective = make_objective(target_mode, tokenizer_path=cfg.dataset.resolved_tokenizer_path())
@@ -118,10 +135,28 @@ def run_training(
     bundle_path_for_resume, resolved_init_path = resolve_resume_bundle_path(init_info, cfg)
     resume_state = maybe_resume_optimizer_state(resolved_init_path, optimizer, bundle_path_for_resume)
 
+    exact_resume = int(resume_payload_meta.get("version", 0) or 0) >= 2
+    if exact_resume and (resume_state is None or not resume_state.optimizer_loaded):
+        raise RuntimeError(
+            "Exact restart checkpoint did not restore optimizer state; refusing "
+            "to continue with a fresh optimizer"
+        )
+
     if resume_state and resume_state.global_step is not None:
         print(f"[resume] Optimizer resumed; starting from global_step={resume_state.global_step}")
     elif resume_state is None and bundle_path_for_resume is not None:
         print("[resume] No optimizer state found in checkpoint; continuing with fresh optimizer.")
+
+    runtime_restored = restore_runtime_state(
+        resume_payload_meta.get("runtime_state"),
+        grad_scaler=grad_scaler,
+    )
+    if runtime_restored:
+        print("[resume] Restored Python, NumPy, Torch, CUDA, and scaler runtime state.")
+    elif exact_resume:
+        raise RuntimeError(
+            "Exact restart checkpoint is missing valid runtime RNG/scaler state"
+        )
 
     model.train()
 
@@ -134,7 +169,14 @@ def run_training(
         except Exception:
             global_step = 0
 
-    samples_consumed = int(resume_skip_samples)
+    if resume_data_cursor is not None or resume_skip_samples > 0:
+        try:
+            samples_consumed = int(resume_payload_meta.get("samples_consumed", 0))
+        except (TypeError, ValueError):
+            samples_consumed = int(resume_skip_samples)
+    else:
+        samples_consumed = 0
+    data_cursor_tracker = DataCursorTracker(resume_data_cursor)
 
     fixed_steps = int(cfg.dataset.num_steps or 0)
     if fixed_steps > 0:
@@ -182,9 +224,62 @@ def run_training(
     adaptive_cfg = getattr(cfg.batch, "adaptive", None)
     lr_schedule_name = getattr(cfg.hyperparameters.lr_schedule, "name", "constant")
     peak_lr = 0.0
+    if global_step >= int(sched_meta.get("warmup_steps", 0)):
+        peak_lr = float(
+            optimizer.param_groups[0].get(
+                "initial_lr",
+                cfg.hyperparameters.learning_rate,
+            )
+        )
     micro_batch_size = cfg.batch.physical_batch_size()
 
     total_planned_epoch_steps = steps_this_epoch if fixed_steps > 0 else per_epoch_steps
+
+    stop_signal: Optional[int] = None
+    previous_signal_handlers: dict[int, object] = {}
+
+    def _request_graceful_stop(signum: int, _frame) -> None:
+        nonlocal stop_signal
+        if stop_signal is not None:
+            raise KeyboardInterrupt
+        stop_signal = signum
+        print(
+            f"[train] Received signal {signum}; finishing the current optimizer "
+            "step before an atomic checkpoint."
+        )
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            previous_signal_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _request_graceful_stop)
+        except (OSError, ValueError):
+            previous_signal_handlers.pop(signum, None)
+
+    def _stop_after_checkpoint(step: int, resume_state_dict: dict) -> None:
+        if stop_signal is None:
+            return
+        interval = getattr(cfg.checkpoint, "save_pt_every_steps", None)
+        periodic_boundary = bool(
+            interval and int(interval) > 0 and step % int(interval) == 0
+        )
+        interrupted_path = (
+            run_ckpt_dir / f"model-step-{step:08d}.pt"
+            if periodic_boundary
+            else run_ckpt_dir / "model-interrupted.pt"
+        )
+        if not interrupted_path.is_file():
+            save_pt_bundle(
+                interrupted_path,
+                model=model,
+                optimizer=optimizer,
+                training_cfg=cfg,
+                global_step=step,
+                resume_state=resume_state_dict,
+                dataset_metadata=dataset_checkpoint_meta,
+                grad_scaler=grad_scaler,
+            )
+        print(f"[ckpt] Graceful-stop checkpoint: {interrupted_path}")
+        raise TrainingInterrupted(run_ckpt_dir, step)
 
     try:
         for epoch in range(epochs):
@@ -227,8 +322,15 @@ def run_training(
                     decay_steps=sched_meta["decay_steps"],
                     decay_start=sched_meta["decay_start_step"],
                     preflag=pre_decay_flag,
-                    resume_state=build_resume_state(global_step, samples_consumed, resume_skip_samples, cfg),
+                    resume_state=build_resume_state(
+                        global_step,
+                        samples_consumed,
+                        resume_skip_samples,
+                        cfg,
+                        data_cursor=data_cursor_tracker.committed,
+                    ),
                     dataset_metadata=dataset_checkpoint_meta,
+                    grad_scaler=grad_scaler,
                 )
                 lr_scale = scale_for_step(global_step)
                 lr_now = apply_lr(lr_scale)
@@ -252,6 +354,7 @@ def run_training(
                 else:
                     profile_context = contextlib.nullcontext()
                 with profile_context:
+                    data_cursor_tracker.begin_step()
                     for accum_idx in range(accum_steps):
                         zero_grad = accum_idx == 0
                         optimizer_step = accum_idx == (accum_steps - 1)
@@ -261,6 +364,8 @@ def run_training(
                         except StopIteration:
                             it = iter(dl_train)
                             batch = next(it)
+                        batch_data_cursor = batch.pop("_data_cursor", None)
+                        data_cursor_tracker.observe_microbatch(batch_data_cursor)
                         t1 = time.perf_counter()
                         metrics = objective.train_step(
                             model,
@@ -282,6 +387,16 @@ def run_training(
                         t2 = time.perf_counter()
                         total_data_time += (t1 - t0)
                         total_comp_time += (t2 - t1)
+                committed_data_cursor = data_cursor_tracker.commit_step()
+                completed_step = global_step + 1
+                completed_resume_state = build_resume_state(
+                    completed_step,
+                    samples_consumed,
+                    resume_skip_samples,
+                    cfg,
+                    data_cursor=committed_data_cursor,
+                )
+                _stop_after_checkpoint(completed_step, completed_resume_state)
                 if in_profile_step and profiler_active and profiler is not None:
                     profiler.step()
 
@@ -365,7 +480,13 @@ def run_training(
                     epoch=(None if fixed_steps > 0 else epoch),
                 )
                 global_step += 1
-                resume_state_dict = build_resume_state(global_step, samples_consumed, resume_skip_samples, cfg)
+                resume_state_dict = build_resume_state(
+                    global_step,
+                    samples_consumed,
+                    resume_skip_samples,
+                    cfg,
+                    data_cursor=committed_data_cursor,
+                )
                 maybe_save_pt_interval(
                     model=model,
                     run_dir=run_ckpt_dir,
@@ -375,6 +496,7 @@ def run_training(
                     interval=getattr(cfg.checkpoint, "save_pt_every_steps", None),
                     resume_state=resume_state_dict,
                     dataset_metadata=dataset_checkpoint_meta,
+                    grad_scaler=grad_scaler,
                 )
                 maybe_save_best(
                     model=model,
@@ -391,7 +513,9 @@ def run_training(
                     wandb_run=wandb_run,
                     resume_state=resume_state_dict,
                     dataset_metadata=dataset_checkpoint_meta,
+                    grad_scaler=grad_scaler,
                 )
+                _stop_after_checkpoint(global_step, resume_state_dict)
                 if profile_enabled and profiler_active and step_id == profile_end:
                     if profiler is not None:
                         profiler.stop()
@@ -447,6 +571,12 @@ def run_training(
             except Exception:
                 pass
         raise TrainingInterrupted(run_ckpt_dir, global_step) from exc
+    finally:
+        for signum, handler in previous_signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
 
 
 class TrainingInterrupted(RuntimeError):

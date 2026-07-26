@@ -126,6 +126,7 @@ def init_datasets(
     *,
     train_num_steps_override: Optional[int] = None,
     resume_skip_samples: int = 0,
+    resume_data_cursor: Optional[dict] = None,
 ) -> tuple[DataLoader, Optional[DataLoader], int, dict]:
     """Construct train/val dataloaders plus step metadata."""
     ev_tok = None
@@ -139,6 +140,7 @@ def init_datasets(
         physical_batch_size=cfg.batch.physical_batch_size(),
         train_num_steps=(cfg.dataset.num_steps if train_num_steps_override is None else train_num_steps_override),
         resume_skip_samples=resume_skip_samples,
+        resume_data_cursor=resume_data_cursor,
         seed=cfg.seed,
         shuffle_buffer_size=getattr(cfg.dataset, "shuffle_buffer_size", 1_000_000),
         shard_locality=getattr(cfg.dataset, "shard_locality", False),

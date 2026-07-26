@@ -69,6 +69,32 @@ Tests must compare uninterrupted and interrupted/resumed sample sequences with
 zero workers, worker prefetch, gradient accumulation, shard boundaries, epoch
 boundaries, and run filtering.
 
+Implementation status on `fix/dataloader-correctness`:
+
+- shard permutations derive independently from `(training seed, epoch, shard)`;
+- each queued sample carries a compact cursor for the next row, and the training
+  loop commits only the cursor returned by the completed optimizer step;
+- cursor tests advance the producer beyond consumed data and prove exact
+  continuation across shard and epoch boundaries;
+- a real two-worker, eight-batch-prefetch test proves exact continuation with
+  rotation and flip enabled;
+- rotation and flip are stateless functions of training seed and sample cursor,
+  so worker scheduling does not alter augmented inputs after restart;
+- resumable bundles include Python, NumPy, Torch CPU/CUDA, and gradient-scaler
+  state and are written to a temporary filename followed by atomic rename;
+- scheduler base learning rates survive optimizer serialization, avoiding
+  double decay after restart, with a configured-LR fallback for old bundles;
+- SIGINT/SIGTERM finishes the current optimizer step and writes one atomic
+  `model-interrupted.pt`, unless that step already wrote its configured periodic
+  checkpoint; a second signal aborts immediately;
+- tiny CPU dropout-model tests compare uninterrupted and resumed parameters
+  exactly.
+
+The combined validation/restart low-level baseline is 38 passing tests. CUDA RNG
+state is captured and restored in code; end-to-end CUDA parameter equivalence is
+not part of the low-write local suite and remains a short smoke test before the
+next production run.
+
 ## Flash-Wear Constraint
 
 Correctness tests use small temporary synthetic datasets and must not copy or
@@ -79,6 +105,10 @@ Production checkpoint cadence remains coarse and configurable. Lightweight
 metadata or cursor state must not trigger a full model checkpoint. Full bundles
 are written atomically only at intentional periodic, best-model,
 graceful-stop, or final boundaries.
+
+The restart implementation does not add periodic writes. Cursor state remains
+in memory between existing checkpoint boundaries. Tests constrain generated
+checkpoint fixtures to less than one megabyte.
 
 ## Deferred Feature Order
 

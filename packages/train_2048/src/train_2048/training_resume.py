@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -7,6 +8,44 @@ import torch
 
 from .checkpointing import ResumeState, maybe_resume_optimizer_from_init
 from .config import TrainingConfig
+
+
+@dataclass
+class DataCursorTracker:
+    """Track prefetched, pending, and optimizer-committed data positions."""
+
+    committed: Optional[dict] = None
+    _pending: Optional[dict] = None
+
+    def begin_step(self) -> None:
+        self._pending = self.committed
+
+    def observe_microbatch(self, cursor: object) -> None:
+        if isinstance(cursor, dict):
+            self._pending = cursor
+
+    def commit_step(self) -> Optional[dict]:
+        self.committed = self._pending
+        return self.committed
+
+
+def _dump_config_section(value: object) -> object:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return value
+
+
+def _restart_contract(cfg: TrainingConfig) -> dict:
+    return {
+        "training_seed": int(cfg.seed),
+        "target_steps": cfg.dataset.num_steps,
+        "learning_rate": float(cfg.hyperparameters.learning_rate),
+        "lr_schedule": _dump_config_section(cfg.hyperparameters.lr_schedule),
+        "optimizer": _dump_config_section(cfg.hyperparameters.optimizer),
+        "adaptive_batch": _dump_config_section(cfg.batch.adaptive),
+        "rotation_augment": _dump_config_section(cfg.dataset.rotation_augment),
+        "flip_augment": _dump_config_section(cfg.dataset.flip_augment),
+    }
 
 
 def extract_resume_metadata(init_info: dict[str, Any]) -> tuple[dict, dict, Optional[int]]:
@@ -66,6 +105,57 @@ def resolve_resume_skip_samples(
     return resume_skip_samples
 
 
+def resolve_resume_data_cursor(
+    dataset_signature: dict,
+    dataset_fingerprint: str,
+    *,
+    resume_payload_meta: dict,
+    resume_dataset_meta: dict,
+) -> Optional[dict]:
+    """Return a committed data cursor only when the dataset identity matches."""
+    fingerprint_loaded = resume_dataset_meta.get("fingerprint")
+    dataset_match = bool(fingerprint_loaded) and fingerprint_loaded == dataset_fingerprint
+    if fingerprint_loaded is None:
+        dataset_match = (
+            resume_dataset_meta.get("dataset_dir") == dataset_signature["dataset_dir"]
+        )
+    cursor = resume_payload_meta.get("data_cursor")
+    if isinstance(cursor, dict) and not dataset_match:
+        raise ValueError(
+            "Checkpoint data cursor does not match the configured dataset and run split"
+        )
+    return cursor if isinstance(cursor, dict) else None
+
+
+def validate_resume_configuration(
+    cfg: TrainingConfig,
+    resume_payload_meta: dict,
+) -> None:
+    """Reject incompatible settings for an exact cursor-based restart."""
+    if int(resume_payload_meta.get("version", 0) or 0) < 2:
+        return
+    expected = {
+        "effective_batch_size": int(cfg.batch.batch_size),
+        "micro_batch_size": int(cfg.batch.physical_batch_size()),
+        "grad_accum_steps": int(cfg.batch.grad_accum_steps()),
+    }
+    mismatches = [
+        f"{key}: checkpoint={resume_payload_meta.get(key)} current={value}"
+        for key, value in expected.items()
+        if int(resume_payload_meta.get(key, -1)) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "Exact restart configuration mismatch: " + "; ".join(mismatches)
+        )
+    checkpoint_contract = resume_payload_meta.get("restart_contract")
+    current_contract = _restart_contract(cfg)
+    if checkpoint_contract != current_contract:
+        raise ValueError(
+            "Exact restart training/sampling contract differs from the checkpoint"
+        )
+
+
 def resolve_resume_bundle_path(init_info: dict[str, Any], cfg: TrainingConfig) -> tuple[Optional[Path], str]:
     """Select the checkpoint bundle used to resume optimizer state when possible."""
     weight_type = init_info.get("weights_type", "unknown")
@@ -104,23 +194,37 @@ def maybe_resume_optimizer_state(
         return None
 
 
-def build_resume_state(global_step: int, samples_consumed: int, skip_samples: int, cfg: TrainingConfig) -> dict:
+def build_resume_state(
+    global_step: int,
+    samples_consumed: int,
+    skip_samples: int,
+    cfg: TrainingConfig,
+    *,
+    data_cursor: Optional[dict] = None,
+) -> dict:
     """Serialize resume data for checkpoint bundles."""
-    return {
-        "version": 1,
+    state = {
+        "version": 2,
         "global_step": int(global_step),
         "samples_consumed": int(samples_consumed),
         "skip_samples": int(skip_samples),
         "effective_batch_size": int(cfg.batch.batch_size),
         "micro_batch_size": int(cfg.batch.physical_batch_size()),
         "grad_accum_steps": int(cfg.batch.grad_accum_steps()),
+        "restart_contract": _restart_contract(cfg),
     }
+    if data_cursor is not None:
+        state["data_cursor"] = data_cursor
+    return state
 
 
 __all__ = [
     "extract_resume_metadata",
     "resolve_resume_skip_samples",
+    "resolve_resume_data_cursor",
+    "validate_resume_configuration",
     "resolve_resume_bundle_path",
     "maybe_resume_optimizer_state",
     "build_resume_state",
+    "DataCursorTracker",
 ]
