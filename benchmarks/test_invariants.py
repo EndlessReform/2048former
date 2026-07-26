@@ -69,7 +69,10 @@ def test_make_collate_steps_udlr_canonicalization() -> None:
 
     class _DummyEVTokenizer:
         def build_targets(self, *, evs: torch.Tensor, legal_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-            return {"branch_mask": legal_mask}
+            return {
+                "branch_bin_targets": torch.zeros_like(evs, dtype=torch.long),
+                "branch_mask": legal_mask,
+            }
 
     collate = make_collate_steps("binned_ev", ds, ev_tokenizer=_DummyEVTokenizer())
     out = collate(np.array([0, 1, 2], dtype=np.int64))

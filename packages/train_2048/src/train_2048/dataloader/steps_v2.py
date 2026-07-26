@@ -25,6 +25,58 @@ from .collate import make_collate_macroxue, make_collate_steps
 from ..tokenization.base import BoardCodec
 
 
+class _ArrayLoader:
+    """Serve a fixed in-memory row set through the collate loader interface."""
+
+    def __init__(self, rows: np.ndarray):
+        self.rows = rows
+
+    def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
+        return self.rows[global_indices]
+
+
+def _materialize_validation_rows(
+    shard_loader: ShardLoader,
+    val_run_ids: np.ndarray,
+    *,
+    total_samples: int,
+    seed: int,
+) -> tuple[np.ndarray, int, int]:
+    """Build a deterministic validation set from one held-out-bearing shard.
+
+    Shards in a source pool share the same generation algorithm and board depth,
+    so using the first shard containing held-out runs avoids a dataset-wide scan.
+    Sampling with replacement is used when the requested fixed validation set is
+    larger than the eligible rows in that shard.
+    """
+    if total_samples <= 0:
+        raise ValueError("total_samples must be positive")
+    if len(val_run_ids) == 0:
+        raise ValueError("validation run IDs must not be empty")
+
+    rng = np.random.default_rng(seed)
+    for shard_idx in range(len(shard_loader.shards)):
+        shard = shard_loader.load_shard(shard_idx)
+        try:
+            eligible_indices = np.flatnonzero(np.isin(shard["run_id"], val_run_ids))
+            if len(eligible_indices) == 0:
+                continue
+            replace = total_samples > len(eligible_indices)
+            selected = rng.choice(
+                eligible_indices,
+                size=total_samples,
+                replace=replace,
+            )
+            return shard[selected].copy(), shard_idx, len(eligible_indices)
+        finally:
+            shard_loader.unload_shard(shard_idx)
+
+    raise ValueError(
+        "No physical shard contains rows for the selected validation run IDs; "
+        "metadata and packed rows disagree"
+    )
+
+
 def build_steps_dataloaders(
     dataset_dir: str,
     target_mode: str,
@@ -176,6 +228,15 @@ def build_steps_dataloaders(
         f"[data] Run split: train={len(train_run_ids)} "
         f"val={0 if val_run_ids is None else len(val_run_ids)}"
     )
+
+    split_requested = run_sql is not None or (
+        val_run_ids is not None and len(val_run_ids) > 0
+    )
+    if split_requested and not shard_locality:
+        raise ValueError(
+            "Run-filtered training requires shard_locality=true; the streaming "
+            "and buffered samplers cannot enforce train_run_ids"
+        )
 
     # Get step counts from metadata (no scanning!)
     meta_train_steps = metadata.get_total_steps_for_runs(train_run_ids)
@@ -423,16 +484,8 @@ def build_steps_dataloaders(
 
     # Validation dataloader
     dl_val: Optional[DataLoader] = None
+    val_info: Dict[str, Any] = {}
     if val_run_ids is not None and len(val_run_ids) > 0:
-        num_workers_val = max(2, num_workers_train // 3)
-        val_first_shard_only = False
-        if has_decompress_cache and shard_locality and val_num_steps is not None and val_num_steps > 0:
-            val_first_shard_only = True
-            num_workers_val = 0
-            print(
-                "[data] Validation: using first shard only to avoid tmpfs overcommit"
-            )
-
         # Determine validation sample count
         max_val_steps = None
         if val_num_steps is not None and val_num_steps > 0:
@@ -441,77 +494,67 @@ def build_steps_dataloaders(
             planned_train_steps = train_num_steps if train_num_steps else ceil(meta_train_steps / effective_batch_size)
             max_val_steps = max(1, int(round(planned_train_steps * val_steps_pct)))
 
-        if max_val_steps:
-            total_val_samples = max_val_steps * loader_batch_size
-            print(f"[data] Validation: {max_val_steps} steps ({total_val_samples:,} samples)")
+        if max_val_steps is None:
+            raise ValueError(
+                "A validation run split requires val_num_steps or val_steps_pct; "
+                "uncapped validation cannot be materialized safely"
+            )
 
-            # Simple random sampling for validation
-            from .steps import StreamingRandomSampler
-            if val_first_shard_only:
-                shard0_len = shard_loader.shards[0].num_steps
-                rng = np.random.default_rng(seed + 1)
-                replace = total_val_samples > shard0_len
-                pick = rng.choice(shard0_len, size=total_val_samples, replace=replace)
-                shard0 = shard_loader.load_shard(0)
-                val_rows = shard0[pick].copy()
-                shard_loader.unload_shard(0)
+        total_val_samples = max_val_steps * loader_batch_size
+        print(f"[data] Validation: {max_val_steps} steps ({total_val_samples:,} samples)")
+        val_rows, val_shard_idx, eligible_val_rows = _materialize_validation_rows(
+            shard_loader,
+            val_run_ids,
+            total_samples=total_val_samples,
+            seed=seed + 1,
+        )
+        print(
+            f"[data] Validation: fixed held-out set from shard {val_shard_idx} "
+            f"({eligible_val_rows:,} eligible rows)"
+        )
+        val_loader = _ArrayLoader(val_rows)
+        val_dataset = ShardDataset(val_loader, len(val_rows))
+        val_sampler = SequentialSampler(len(val_rows))
 
-                class _ArrayLoader:
-                    def __init__(self, rows: np.ndarray):
-                        self.rows = rows
-
-                    def get_rows(self, global_indices: np.ndarray) -> np.ndarray:
-                        return self.rows[global_indices]
-
-                val_loader = _ArrayLoader(val_rows)
-                val_dataset = ShardDataset(val_loader, len(val_rows))
-                val_sampler = SequentialSampler(len(val_rows))
-            else:
-                val_sampler = StreamingRandomSampler(
-                    dataset_len=total_dataset_len,
-                    total_samples=total_val_samples,
-                    seed=seed + 1,
-                )
-                val_dataset = ShardDataset(shard_loader, total_val_samples)
+        # Validation is fixed and unaugmented. Keeping it in-process also avoids
+        # copying the materialized rows into worker processes.
+        if target_mode == "macroxue_tokens":
+            from .collate import make_collate_macroxue_worker_safe
+            val_collate = make_collate_macroxue_worker_safe(
+                dataset_dir,
+                tokenizer_path,
+                rotation_augment=None,
+                flip_augment=None,
+                shard_loader=val_loader,
+            )
         else:
-            # Use all val data
-            val_sampler = None
-            val_dataset = ShardDataset(shard_loader, total_dataset_len)
-
-        # Use same collate function
-        prefetch_val = 4 if num_workers_val > 0 else None
-        val_collate = collate_fn
-        if val_first_shard_only:
-            if target_mode == "macroxue_tokens":
-                from .collate import make_collate_macroxue_worker_safe
-                val_collate = make_collate_macroxue_worker_safe(
-                    dataset_dir,
-                    tokenizer_path,
-                    rotation_augment=rotation_augment,
-                    flip_augment=flip_augment,
-                    shard_loader=val_loader,
-                )
-            else:
-                from .collate import make_collate_steps_worker_safe
-                val_collate = make_collate_steps_worker_safe(
-                    dataset_dir,
-                    target_mode,
-                    ev_tokenizer=ev_tokenizer,
-                    rotation_augment=rotation_augment,
-                    flip_augment=flip_augment,
-                    shard_loader=val_loader,
-                )
+            from .collate import make_collate_steps_worker_safe
+            val_collate = make_collate_steps_worker_safe(
+                dataset_dir,
+                target_mode,
+                ev_tokenizer=ev_tokenizer,
+                rotation_augment=None,
+                flip_augment=None,
+                shard_loader=val_loader,
+            )
         dl_val = DataLoader(
             val_dataset,
             batch_size=loader_batch_size,
             shuffle=(val_sampler is None),
             sampler=val_sampler,
-            num_workers=num_workers_val,
+            num_workers=0,
             collate_fn=val_collate,
             pin_memory=True,
-            persistent_workers=True if num_workers_val > 0 else False,
-            prefetch_factor=prefetch_val,
+            persistent_workers=False,
+            prefetch_factor=None,
         )
+        val_info = {
+            "samples": int(total_val_samples),
+            "source_shard": int(val_shard_idx),
+            "eligible_rows_in_source_shard": int(eligible_val_rows),
+            "seed": int(seed + 1),
+            "augmentation": False,
+        }
 
     # Calculate per-epoch steps
     if train_num_steps is not None:
@@ -535,6 +578,7 @@ def build_steps_dataloaders(
         "resume_skip_samples": int(skip_applied),
         "train_num_steps": int(train_num_steps) if train_num_steps is not None else None,
         "num_epochs": int(num_epochs) if num_epochs is not None else None,
+        "validation": val_info,
     }
 
     return dl_train, dl_val, per_epoch_steps, metadata
