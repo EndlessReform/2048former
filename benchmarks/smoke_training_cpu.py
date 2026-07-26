@@ -183,7 +183,6 @@ def main() -> None:
             f"[smoke] Real pool: {args.dataset} | steps={args.steps} "
             f"batch={args.batch_size} | checkpoint={checkpoint_step}"
         )
-        _seed_everything(baseline_cfg.seed)
         baseline_final, baseline_step = run_training(baseline_cfg, "cpu")
         if baseline_step != args.steps:
             raise AssertionError(

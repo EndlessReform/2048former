@@ -12,23 +12,6 @@ from train_2048.training_loop import TrainingInterrupted, run_training
 console = Console()
 
 
-def _maybe_unlink_dataset(cfg) -> tuple[bool, str, Optional[str], Optional[str]]:
-    dataset_path = Path(cfg.dataset.resolved_dataset_dir())
-    if not dataset_path.exists():
-        return False, str(dataset_path), None, "dataset path does not exist"
-    if not dataset_path.is_symlink():
-        return False, str(dataset_path), None, "dataset path is not a symlink"
-    try:
-        target = str(dataset_path.resolve())
-    except Exception:
-        target = None
-    try:
-        dataset_path.unlink()
-        return True, str(dataset_path), target, None
-    except OSError as exc:
-        return False, str(dataset_path), target, str(exc)
-
-
 def main(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(description="Train 2048 transformer scaffold")
     parser.add_argument(
@@ -164,18 +147,10 @@ def main(argv: Optional[list[str]] = None):
             profile_end=args.profile_end,
         )
     except TrainingInterrupted as exc:
-        unlinked, ds_path, ds_target, ds_note = _maybe_unlink_dataset(cfg)
         lines = [
             "Training interrupted (Ctrl+C).",
             f"Checkpoint directory: {exc.run_dir}",
         ]
-        if unlinked:
-            if ds_target:
-                lines.append(f"Unlinked dataset symlink: {ds_path} -> {ds_target}")
-            else:
-                lines.append(f"Unlinked dataset symlink: {ds_path}")
-        elif ds_note:
-            lines.append(f"Dataset unlink skipped: {ds_note} ({ds_path})")
         console.print(
             Panel(
                 "\n".join(lines),
@@ -186,18 +161,10 @@ def main(argv: Optional[list[str]] = None):
         )
         raise SystemExit(130) from None
     except KeyboardInterrupt:
-        unlinked, ds_path, ds_target, ds_note = _maybe_unlink_dataset(cfg)
         lines = [
             "Training interrupted (Ctrl+C).",
             f"Checkpoint directory: {Path(cfg.checkpoint_dir).resolve()}",
         ]
-        if unlinked:
-            if ds_target:
-                lines.append(f"Unlinked dataset symlink: {ds_path} -> {ds_target}")
-            else:
-                lines.append(f"Unlinked dataset symlink: {ds_path}")
-        elif ds_note:
-            lines.append(f"Dataset unlink skipped: {ds_note} ({ds_path})")
         console.print(
             Panel(
                 "\n".join(lines),

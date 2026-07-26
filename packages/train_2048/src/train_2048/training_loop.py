@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import Optional
 from pathlib import Path
 import contextlib
+import random
 import signal
 import time
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -70,6 +72,12 @@ def run_training(
     profile_end: int = 10,
 ) -> tuple[Path, int]:
     """Run a training loop for the given configuration."""
+    random.seed(cfg.seed)
+    np.random.seed(int(cfg.seed) % (2**32))
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
     device = torch.device(device_str)
     use_fp32_master = use_fp32_master_weights(cfg, device)
     grad_scaler = init_grad_scaler(cfg, device, use_fp32_master_weights=use_fp32_master)

@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::sync::mpsc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -99,16 +99,15 @@ fn pack_dataset_with<T: StructuredRow + Send + Sync + Copy + 'static>(
         let encoder = encoder.clone();
         move || -> Result<()> {
             let process = || {
-                runs_vec
-                    .par_iter()
-                    .cloned()
-                    .enumerate()
-                    .for_each_with(tx_worker, |tx, (idx, run)| {
+                runs_vec.par_iter().cloned().enumerate().for_each_with(
+                    tx_worker,
+                    |tx, (idx, run)| {
                         let enc = encoder.clone();
                         let out = process_run_fn(run, idx as u32, &enc);
                         pb_worker.inc(1);
                         let _ = tx.send((idx as u32, out));
-                    });
+                    },
+                );
             };
             if let Some(n) = max_workers {
                 rayon::ThreadPoolBuilder::new()
@@ -160,9 +159,10 @@ fn pack_dataset_with<T: StructuredRow + Send + Sync + Copy + 'static>(
         }
     }
 
-    if let Err(err) = producer.join().unwrap_or_else(|_| {
-        Err(anyhow::anyhow!("pack worker thread panicked"))
-    }) {
+    if let Err(err) = producer
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("pack worker thread panicked")))
+    {
         if first_err.is_none() {
             first_err = Some(err);
         }
@@ -457,7 +457,13 @@ fn process_run_with_cumulative(
     })
 }
 
-fn warn_on_counts(run: &RunInput, run_id: u32, meta: &MetaRecord, steps: usize, observed_moves: bool) {
+fn warn_on_counts(
+    run: &RunInput,
+    run_id: u32,
+    meta: &MetaRecord,
+    steps: usize,
+    observed_moves: bool,
+) {
     if steps == 0 {
         warn!(
             "Run {} produced zero steps (meta path {})",
@@ -468,9 +474,7 @@ fn warn_on_counts(run: &RunInput, run_id: u32, meta: &MetaRecord, steps: usize, 
     if steps != meta.num_moves {
         warn!(
             "Run {}: step count mismatch meta {} vs parsed {}",
-            run_id,
-            meta.num_moves,
-            steps
+            run_id, meta.num_moves, steps
         );
     }
 

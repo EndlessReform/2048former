@@ -20,6 +20,7 @@ pub struct GameActor {
     pub handle: FeederHandle,
     pub board: PackedBoard,
     pub seed: u64,
+    rng: rand::rngs::StdRng,
     pub sampling: config::SamplingStrategy,
     pub head_order: config::HeadOrder,
     pub board_map: config::BoardMapping,
@@ -144,6 +145,7 @@ impl GameActor {
             handle,
             board,
             seed,
+            rng,
             sampling,
             head_order,
             board_map,
@@ -158,8 +160,6 @@ impl GameActor {
         let mut steps: u64 = 0;
         let mut seq: u64 = 0;
         let mut score: u64 = 0;
-        let mut rng = rand::rngs::StdRng::from_entropy();
-
         while !is_game_over(self.board) {
             if self.cancel.is_cancelled() {
                 break;
@@ -202,11 +202,11 @@ impl GameActor {
                     let outside_window =
                         (steps < start_gate) || (stop_gate.map(|s| steps >= s).unwrap_or(false));
                     if matches!(self.sampling.kind, config::SamplingStrategyKind::Argmax) {
-                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut self.rng, order)
                     } else if outside_window {
                         strategies::select_move_max_p1(&bins, &legal, order)
                     } else {
-                        strategies::select_move(&bins, &legal, &self.sampling, &mut rng, order)
+                        strategies::select_move(&bins, &legal, &self.sampling, &mut self.rng, order)
                     }
                 }
                 InferenceOutput::Argmax { head, .. } => {
@@ -234,7 +234,7 @@ impl GameActor {
                 if after != before {
                     score = score.saturating_add(merge_reward_exps(&before, m));
                     let mut next = after;
-                    insert_random_tile(&mut next, &mut rng);
+                    insert_random_tile(&mut next, &mut self.rng);
                     self.board = PackedBoard::from_exps(&next);
                     steps += 1;
                 } else {
@@ -283,12 +283,7 @@ fn is_game_over(board: PackedBoard) -> bool {
 }
 
 fn highest_tile(board: PackedBoard) -> u32 {
-    let max_exp = board
-        .to_exps()
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0);
+    let max_exp = board.to_exps().iter().copied().max().unwrap_or(0);
     if max_exp == 0 {
         return 0;
     }
@@ -336,12 +331,7 @@ fn shift_exps(board: &[u8; 16], direction: Move) -> [u8; 16] {
         }
         Move::Up | Move::Down => {
             for col in 0..4 {
-                let line = [
-                    board[col],
-                    board[col + 4],
-                    board[col + 8],
-                    board[col + 12],
-                ];
+                let line = [board[col], board[col + 4], board[col + 8], board[col + 12]];
                 let shifted = shift_line(line, direction);
                 out[col] = shifted[0];
                 out[col + 4] = shifted[1];
@@ -407,5 +397,22 @@ mod tests {
         let shifted = shift_exps(&exps, Move::Left);
         assert_eq!(shifted[0], 16);
         assert_eq!(merge_reward_exps(&exps, Move::Left), 1u64 << 16);
+    }
+
+    #[test]
+    fn seeded_tile_sequence_is_reproducible() {
+        fn sequence(seed: u64) -> Vec<[u8; 16]> {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut board = [0u8; 16];
+            let mut states = Vec::new();
+            for _ in 0..8 {
+                insert_random_tile(&mut board, &mut rng);
+                states.push(board);
+            }
+            states
+        }
+
+        assert_eq!(sequence(42), sequence(42));
+        assert_ne!(sequence(42), sequence(43));
     }
 }

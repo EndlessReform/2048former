@@ -102,16 +102,6 @@ class BranchCE(Objective):
         dl_train: Optional[DataLoader],
     ) -> torch.nn.Module:
         n_classes = self._resolve_expected_n_classes(cfg=cfg, dl_train=dl_train)
-        if n_classes is None and dl_train is not None:
-            try:
-                sample = next(iter(dl_train))
-                if isinstance(sample, dict):
-                    if "n_classes" in sample:
-                        n_classes = int(sample["n_classes"])
-                    elif "n_bins" in sample:
-                        n_classes = int(sample["n_bins"])
-            except Exception:
-                n_classes = None
 
         self._expected_n_classes = n_classes
         self._agreement_index = self._resolve_agreement_index(n_classes)

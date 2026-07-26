@@ -96,9 +96,15 @@ Implementation status on `fix/dataloader-correctness`:
 - DataLoader generators are isolated from the model RNG so constructing a new
   iterator after resume cannot shift dropout;
 - full project bundles explicitly opt out of PyTorch's tensor-only loader,
-  allowing optimizer and NumPy RNG state to be reopened on current PyTorch.
+  allowing optimizer and NumPy RNG state to be reopened on current PyTorch;
+- fresh runs seed Python, NumPy, Torch CPU, and Torch CUDA before model or data
+  initialization, so `training.seed` governs more than sampler order;
+- objective setup derives head widths from configuration/tokenizer metadata and
+  never probes the one-shot resumable training iterator;
+- interrupt handling preserves configured dataset symlinks and limits shutdown
+  mutation to the intended atomic checkpoint.
 
-The combined validation/restart baseline is 40 passing low-level tests plus the
+The combined validation/restart baseline is 41 passing low-level tests plus the
 real-data CPU integration test. Its 10-step and 100-step forms both complete in
 about one second here, generate about 0.55 MiB of temporary checkpoint data in
 `/dev/shm`, and remove it afterward. CUDA RNG state is captured and restored in
@@ -132,3 +138,12 @@ With both phases green, deferred feature work proceeds in this order:
 5. Restore operational tmpfs cleanup independently.
 
 Exact sampler restart is Phase 2, not deferred experimental work.
+
+## Known Baseline Debt
+
+- The dataset packer's ordered parallel writer can accumulate an unbounded
+  out-of-order result map when an early run is much slower than later runs.
+  This behavior already exists on `master`; repair it with the weighted-merge
+  work, where packer memory and provenance are reviewed together.
+- CUDA/TransformerEngine parameter equivalence and a real compressed
+  multi-shard restart remain pre-production smoke tests rather than local CI.
