@@ -5,7 +5,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
+from train_2048.config import DatasetConfig
 from train_2048.dataloader.steps_v2 import build_steps_dataloaders
 
 
@@ -158,6 +160,28 @@ def test_run_split_rejects_sampler_that_cannot_filter(tmp_path: Path) -> None:
             num_workers_train=0,
             shard_locality=False,
         )
+
+
+def test_loader_iteration_does_not_advance_model_rng(tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "pool"
+    _write_tiny_pool(dataset_dir)
+
+    torch.manual_seed(1234)
+    expected = torch.rand(8)
+    torch.manual_seed(1234)
+    dl_train, dl_val, _, _ = _build(dataset_dir)
+    next(iter(dl_train))
+    assert dl_val is not None
+    next(iter(dl_val))
+    actual = torch.rand(8)
+
+    assert torch.equal(actual, expected)
+
+
+def test_dataset_workers_must_be_non_negative() -> None:
+    assert DatasetConfig(num_workers_train=0).num_workers_train == 0
+    with pytest.raises(ValueError, match="num_workers_train must be >= 0"):
+        DatasetConfig(num_workers_train=-1)
 
 
 def _build_prefetch_loader(dataset_dir: Path, resume_cursor: dict | None = None):

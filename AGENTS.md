@@ -17,7 +17,15 @@ For Rust commands, use `--locked` when running `cargo` to avoid lockfile/network
 Follow Python 3.12+, four-space indentation, and type hints for every public function. Adhere to PEP 8 and PEP 257; keep functions small and pure where feasible. Modules use snake_case, classes PascalCase, functions and variables snake_case. Prefer explicit `from train_2048 import …` imports over relative wildcards, and add short comments only when clarifying non-obvious logic.
 
 ## Testing Guidelines
-There is no formal test suite yet. Smoke-test gameplay with the Rust orchestrator (see `crates/game-engine/README.md`) and capture moves per second, score, and highest tile. Use `benchmarks/bench_client_server.py` for repeatable latency or quality comparisons. When proposing new checks, mirror existing benchmark patterns or add a `tests/` module with pytest-style names aligned to the corresponding package path.
+Run the low-level suite with `uv run --locked python -m pytest packages/train_2048/tests benchmarks/test_invariants.py -q`. Smoke-test gameplay with the Rust orchestrator (see `crates/game-engine/README.md`) and use `benchmarks/bench_client_server.py` for repeatable latency or quality comparisons.
+
+### CPU training integration smoke
+
+Run `uv run --locked benchmarks/smoke_training_cpu.py`. It trains a one-layer model for 10 steps at batch size 32 on the real 9.7 MiB `datasets/raws/d6_test_v2` SQLite + NPY pool, validates once, resumes from step 5, and requires exact equality with the uninterrupted final weights. It uses zero DataLoader workers, two CPU threads, no compile, no W&B, and temporary checkpoints in `/dev/shm` that are deleted after success, so it neither touches the GPU nor writes checkpoints to flash.
+
+Use `--steps 100` for the longer bounded variant. The script rejects more than 100 steps or batch sizes over 256. Pass `--work-dir /tmp/train-2048-smoke-debug` only when artifacts must be retained for inspection; the directory must not already exist.
+
+This is the preferred integration gate for changes to dataloading, collation, objectives, the training loop, validation, checkpointing, or exact resume. It uses production code and real rows, not mocks. It does not exercise compressed multi-shard pools, CUDA/TransformerEngine, distributed training, or scientific convergence.
 
 Notes on pytest in this repo:
 - Running `uv run pytest` hit missing deps (numpy/pytest) because it used a different env; `uv run --locked python -m pytest ...` worked once deps were present.

@@ -56,7 +56,9 @@ def _resolve_init_path(init_dir: str, init_info: Dict[str, Any]) -> Path:
 def _load_pt_bundle(path: Path) -> Tuple[Optional[Dict[str, torch.Tensor]], Dict[str, Any], Dict[str, Any]]:
     """Return (state_dict, encoder_config, bundle_meta) extracted from a saved .pt bundle."""
 
-    bundle = torch.load(str(path), map_location="cpu")
+    # Project checkpoints include optimizer and RNG metadata in addition to tensors.
+    # They are trusted local artifacts, so PyTorch's weights-only loader is unsuitable.
+    bundle = torch.load(str(path), map_location="cpu", weights_only=False)
     if not isinstance(bundle, dict):
         return None, {}, {}
 

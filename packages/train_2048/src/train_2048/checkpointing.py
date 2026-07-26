@@ -135,7 +135,8 @@ def maybe_resume_optimizer_from_init(
         if not pt.is_file():
             continue
         try:
-            bundle = torch.load(str(pt), map_location="cpu")
+            # Full project bundles contain optimizer and RNG state and are trusted inputs.
+            bundle = torch.load(str(pt), map_location="cpu", weights_only=False)
         except Exception as e:
             print(f"[resume] Failed to load checkpoint bundle {pt}: {e}")
             return None

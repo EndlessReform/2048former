@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 import os
 
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
 
 from .shard_loader import ShardLoader, _read_npy_header
@@ -491,6 +492,7 @@ def build_steps_dataloaders(
 
     collate_fn = _with_sampler_cursor(collate_fn)
     prefetch_train = 8 if num_workers_train > 0 else None
+    train_generator = torch.Generator().manual_seed(seed)
     dl_train = DataLoader(
         train_dataset,
         batch_size=loader_batch_size,
@@ -501,6 +503,7 @@ def build_steps_dataloaders(
         pin_memory=True,
         persistent_workers=True if num_workers_train > 0 else False,
         prefetch_factor=prefetch_train,
+        generator=train_generator,
     )
 
     print(
@@ -579,6 +582,7 @@ def build_steps_dataloaders(
                 flip_augment=None,
                 shard_loader=val_loader,
             )
+        val_generator = torch.Generator().manual_seed(seed + 1)
         dl_val = DataLoader(
             val_dataset,
             batch_size=loader_batch_size,
@@ -588,6 +592,7 @@ def build_steps_dataloaders(
             collate_fn=val_collate,
             pin_memory=True,
             persistent_workers=False,
+            generator=val_generator,
             prefetch_factor=None,
         )
         val_info = {

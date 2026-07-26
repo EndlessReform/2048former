@@ -9,7 +9,7 @@ fixes without the unfinished feature bundle.
 
 Do not begin a serious training run until both phases below are complete.
 
-## Phase 1: Validation Correctness
+## Phase 1: Validation Correctness (Complete)
 
 Establish a trustworthy validation path before evaluating annealing,
 weighted-dataset, reannotation, or learning-rate experiments.
@@ -35,8 +35,9 @@ Implementation status on `fix/dataloader-correctness`:
   samplers cannot enforce `train_run_ids`;
 - uncapped validation rejects the configuration instead of scanning or
   materializing an entire production pool;
-- the low-level baseline is 25 passing tests using only kilobyte-scale temporary
-  files.
+- low-level tests cover the split, filtering, fixed ordering, disabled
+  augmentation, bounded materialization, and unsupported-mode failures using
+  only kilobyte-scale temporary files.
 
 For the normal compressed, tmpfs-backed, shard-local training path, validation
 may materialize a fixed filtered subset from one shard. This is scientifically
@@ -44,7 +45,7 @@ acceptable because all shards in a source pool are generated with the same
 algorithm and board depth. The selected rows must still be filtered by held-out
 run ID; "first shard" alone is not a validation split.
 
-## Phase 2: Exact Restart
+## Phase 2: Exact Restart (Complete)
 
 Frequent interruption makes restart behavior part of the sampling protocol.
 DataLoader prefetch advances the sampler producer beyond batches consumed by
@@ -88,12 +89,21 @@ Implementation status on `fix/dataloader-correctness`:
   `model-interrupted.pt`, unless that step already wrote its configured periodic
   checkpoint; a second signal aborts immediately;
 - tiny CPU dropout-model tests compare uninterrupted and resumed parameters
-  exactly.
+  exactly;
+- a real-data CPU integration test trains a one-layer model on the 9.7 MiB
+  `d6_test_v2` SQLite + NPY pool, validates, resumes from its midpoint bundle,
+  and requires bit-identical final parameters;
+- DataLoader generators are isolated from the model RNG so constructing a new
+  iterator after resume cannot shift dropout;
+- full project bundles explicitly opt out of PyTorch's tensor-only loader,
+  allowing optimizer and NumPy RNG state to be reopened on current PyTorch.
 
-The combined validation/restart low-level baseline is 38 passing tests. CUDA RNG
-state is captured and restored in code; end-to-end CUDA parameter equivalence is
-not part of the low-write local suite and remains a short smoke test before the
-next production run.
+The combined validation/restart baseline is 40 passing low-level tests plus the
+real-data CPU integration test. Its 10-step and 100-step forms both complete in
+about one second here, generate about 0.55 MiB of temporary checkpoint data in
+`/dev/shm`, and remove it afterward. CUDA RNG state is captured and restored in
+code; end-to-end CUDA parameter equivalence is not part of the low-write local
+suite and remains a short smoke test before the next production run.
 
 ## Flash-Wear Constraint
 
@@ -112,7 +122,7 @@ checkpoint fixtures to less than one megabyte.
 
 ## Deferred Feature Order
 
-After both phases establish a green baseline:
+With both phases green, deferred feature work proceeds in this order:
 
 1. Separate interrupted-run resume from starting a new phase from weights.
 2. Restore and repair weighted merge, including emitted-row metadata and source

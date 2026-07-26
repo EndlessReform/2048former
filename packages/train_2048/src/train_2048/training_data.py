@@ -157,7 +157,7 @@ def init_datasets(
         val_sql_params=cfg.dataset.val_sql_params,
         val_run_pct=cfg.dataset.val_run_pct,
         val_split_seed=cfg.dataset.val_split_seed,
-        num_workers_train=12,
+        num_workers_train=cfg.dataset.num_workers_train,
         mmap_mode=cfg.dataset.mmap_mode,
         rotation_augment=getattr(cfg.dataset, "rotation_augment", None),
         flip_augment=getattr(cfg.dataset, "flip_augment", None),

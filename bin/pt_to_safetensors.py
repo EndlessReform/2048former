@@ -15,7 +15,7 @@ from train_2048.config import normalize_state_dict_keys
 
 
 def _load_bundle(path: Path) -> Dict[str, object]:
-    bundle = torch.load(str(path), map_location="cpu")
+    bundle = torch.load(str(path), map_location="cpu", weights_only=False)
     if not isinstance(bundle, dict):
         raise ValueError(f"Expected dict payload in {path}, found {type(bundle)!r}")
     if "model" not in bundle:

@@ -91,6 +91,8 @@ class DatasetConfig(BaseModel):
     # slices as needed. This is useful for very large datasets that would
     # otherwise exhaust RAM.
     mmap_mode: bool = False
+    # DataLoader workers. Set to 0 for deterministic, low-overhead CPU smoke runs.
+    num_workers_train: int = 12
     # Shuffling strategy for full-dataset epochs (when num_steps is None):
     # - If False, iterate sequentially (fast, minimal memory)
     # - If True, use buffered shuffle to avoid materializing a full permutation
@@ -141,6 +143,14 @@ class DatasetConfig(BaseModel):
         if v < 0:
             raise ValueError("dataset.val_every must be >= 0 (0 disables)")
         return v
+
+    @field_validator("num_workers_train")
+    @classmethod
+    def _workers_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("dataset.num_workers_train must be >= 0")
+        return v
+
     @field_validator("val_steps_pct")
     @classmethod
     def _val_steps_pct_range(cls, v: float) -> float:
